@@ -1,4 +1,4 @@
 {
-  "server": "local",
+  "server": "local3001",
   "module-path": "./harness-rs"
 }

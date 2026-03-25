@@ -1,6 +1,6 @@
 # Orchestrator
 
-Monitor and drive Claude or Codex agents running in biome_term panes, working toward goals managed by the harness.
+Monitor and drive Claude or Codex agents running in biome_term panes, working toward goals managed by the Rust `harness`.
 
 **Notes:**
 - When spawning Codex agents, always use `--dangerously-bypass-approvals-and-sandbox` (not `--full-auto` or `--approval-mode`).
@@ -8,10 +8,11 @@ Monitor and drive Claude or Codex agents running in biome_term panes, working to
 
 ## Config
 
-- Harness: `python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db`
+- Harness: `/home/sdancer/orchestrator/harness`
+- Filesystem scan helper: `python /home/sdancer/orchestrator/fs-check.py --db /home/sdancer/orchestrator/fs-check.db`
 - biome_term: `http://localhost:3000`
 
-If `$ARGUMENTS` is provided, treat it as the harness DB path instead of the default.
+If `$ARGUMENTS` is provided, treat it as the harness server or database override instead of the default.
 
 ## Steps
 
@@ -19,7 +20,7 @@ If `$ARGUMENTS` is provided, treat it as the harness DB path instead of the defa
 
    ```bash
    # Harness-registered agents
-   python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db agents
+   /home/sdancer/orchestrator/harness agents
 
    # All biome_term panes
    curl -s http://localhost:3000/panes
@@ -63,7 +64,7 @@ If `$ARGUMENTS` is provided, treat it as the harness DB path instead of the defa
 3. **Run the harness cycle** to poll, resolve goals, decide and execute actions:
 
    ```bash
-   python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db run-once --execute
+   /home/sdancer/orchestrator/harness run-once-biome --execute
    ```
 
    This handles registered agents automatically: sends follow-up prompts to idle agents, corrective prompts to stuck agents, restarts dead agents, cross-pollinates facts, and queues artifact indexing.
@@ -72,7 +73,7 @@ If `$ARGUMENTS` is provided, treat it as the harness DB path instead of the defa
    - Report their name, id, and classified status
    - If stuck or dead, suggest registering them:
      ```bash
-     python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db agent-add <name> \
+     /home/sdancer/orchestrator/harness agent-add <name> \
        --biome-pane-id <uuid> --workdir <path> --default-task "<task description>"
      ```
    - Optionally send a generic nudge to stuck unmanaged panes:
@@ -85,7 +86,7 @@ If `$ARGUMENTS` is provided, treat it as the harness DB path instead of the defa
 5. **Cross-pollinate and index**:
    - Read the screen captures from step 2. If any agent has produced a significant finding (completed a task, generated output, found a result), share it with related agents by setting facts:
      ```bash
-     python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db fact-set <key> <value>
+     /home/sdancer/orchestrator/harness fact-set <key> <value>
      ```
    - Index significant new files with `mcp__openviking__add_resource`.
 
@@ -114,7 +115,7 @@ curl -s -X POST http://localhost:3000/panes/<uuid>/input \
   -H 'Content-Type: application/json' -d '{"data":"<base64>"}'
 
 # Register with harness
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db agent-add my-agent \
+/home/sdancer/orchestrator/harness agent-add my-agent \
   --biome-pane-id <uuid> --workdir /path/to/project \
   --default-task "Continue the task"
 ```
@@ -130,7 +131,7 @@ printf 'cd /path/to/project && codex --dangerously-bypass-approvals-and-sandbox 
 curl -s -X POST http://localhost:3000/panes/<uuid>/input \
   -H 'Content-Type: application/json' -d '{"data":"<base64>"}'
 
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db agent-add codex-agent \
+/home/sdancer/orchestrator/harness agent-add codex-agent \
   --biome-pane-id <uuid> --workdir /path/to/project \
   --default-task "Continue the codex task"
 ```
@@ -189,29 +190,29 @@ print(message.content[0].text)
 
 ```bash
 # Add a top-level goal
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db goal-add \
+/home/sdancer/orchestrator/harness goal-add \
   <goal_key> "<title>" --priority 10 --success-fact-key <fact_key>
 
 # Add a sub-goal assigned to an agent
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db sub-goal-add \
+/home/sdancer/orchestrator/harness sub-goal-add \
   <sub_goal_key> <goal_key> <agent_name> "<title>" \
   --instruction-text "<prompt when idle>" \
   --stuck-guidance-text "<prompt when stuck>" \
   --success-fact-key <fact_key> --priority 10
 
 # Set a fact
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db fact-set <key> <value>
+/home/sdancer/orchestrator/harness fact-set <key> <value>
 
 # View full state
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db summary --verbose
+/home/sdancer/orchestrator/harness summary
 
 # Register an agent
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db agent-add <name> \
+/home/sdancer/orchestrator/harness agent-add <name> \
   --biome-pane-id <uuid> --workdir <path> --default-task "<text>"
 
 # Deregister an agent
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db agent-remove <name>
+/home/sdancer/orchestrator/harness agent-remove <name>
 
 # Cancel a goal
-python /home/sdancer/orchestrate/harness.py --db /home/sdancer/orchestrate/orchestrate.db goal-remove <goal_key>
+/home/sdancer/orchestrator/harness goal-remove <goal_key>
 ```

@@ -1,8 +1,9 @@
+use std::io::Write;
 use std::process::{Command, ExitCode};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(name = "harness")]
@@ -10,15 +11,15 @@ use serde_json::{json, Map, Value};
 struct Cli {
     #[arg(long, default_value = "harness")]
     database: String,
-    #[arg(long)]
-    server: Option<String>,
+    #[arg(long, default_value = "http://127.0.0.1:3001")]
+    server: String,
     #[command(subcommand)]
     command: Commands,
 }
 
 struct CliContext {
     database: String,
-    server: Option<String>,
+    server: String,
 }
 
 #[derive(Subcommand)]
@@ -240,7 +241,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("{err:#}");
+            let _ = writeln!(&mut std::io::stderr().lock(), "{err:#}");
             ExitCode::from(1)
         }
     }
@@ -253,24 +254,21 @@ fn run() -> Result<()> {
         server: cli.server,
     };
     match cli.command {
-        Commands::Build => run_status(Command::new("spacetime").args(["build", "-p", "harness"])),
+        Commands::Build => run_status(Command::new("spacetime").args(["build", "-p", "harness-rs"])),
         Commands::SeedAgents => call_reducer(&context, "seed_agents", None),
         Commands::BootstrapKnownGoals => call_reducer(&context, "bootstrap_known_goals", None),
-        Commands::Agents => sql(&context, "SELECT * FROM agents ORDER BY name"),
-        Commands::Goals => sql(&context, "SELECT * FROM goals ORDER BY priority, goal_key"),
-        Commands::SubGoals => sql(
-            &context,
-            "SELECT * FROM sub_goals ORDER BY goal_key, owner_agent, priority, sub_goal_key",
-        ),
+        Commands::Agents => sql(&context, "SELECT * FROM agents"),
+        Commands::Goals => sql(&context, "SELECT * FROM goals"),
+        Commands::SubGoals => sql(&context, "SELECT * FROM sub_goals"),
         Commands::Facts => sql(
             &context,
-            "SELECT fact_key, value_json, confidence, source_type, source_ref, updated_at FROM facts ORDER BY fact_key",
+            "SELECT fact_key, value_json, confidence, source_type, source_ref, updated_at FROM facts",
         ),
         Commands::Summary => {
-            sql(&context, "SELECT name, status, current_goal_key, current_sub_goal_key, last_seen_at, last_capture_preview FROM agents ORDER BY name")?;
-            sql(&context, "SELECT goal_key, status, priority, success_fact_key FROM goals ORDER BY priority, goal_key")?;
-            sql(&context, "SELECT sub_goal_key, goal_key, owner_agent, status, priority FROM sub_goals ORDER BY goal_key, priority, sub_goal_key")?;
-            sql(&context, "SELECT id, agent_name, action_type, status, reason FROM actions ORDER BY id DESC LIMIT 10")
+            sql(&context, "SELECT name, status, current_goal_key, current_sub_goal_key, last_seen_at, last_capture_preview FROM agents")?;
+            sql(&context, "SELECT goal_key, status, priority, success_fact_key FROM goals")?;
+            sql(&context, "SELECT sub_goal_key, goal_key, owner_agent, status, priority FROM sub_goals")?;
+            sql(&context, "SELECT id, agent_name, action_type, status, reason FROM actions LIMIT 10")
         }
         Commands::DecideActions => call_reducer(&context, "decide_actions", None),
         Commands::ResolveActiveSubGoals => call_reducer(&context, "resolve_active_sub_goals", None),
@@ -323,12 +321,12 @@ fn run() -> Result<()> {
             Some(vec![json!({
                 "goal_key": args.goal_key,
                 "title": args.title,
-                "detail": args.detail,
-                "status": args.status,
-                "priority": args.priority,
-                "depends_on_goal_key": args.depends_on_goal_key,
-                "success_fact_key": args.success_fact_key,
-                "metadata_json": "{}"
+                "detail": some_json_string(args.detail),
+                "status": some_json_string(args.status),
+                "priority": some_json_u32(args.priority),
+                "depends_on_goal_key": optional_json_string(args.depends_on_goal_key),
+                "success_fact_key": optional_json_string(args.success_fact_key),
+                "metadata_json": some_json_string("{}".to_string())
             })]),
         ),
         Commands::GoalUpdate(args) => call_reducer(
@@ -477,9 +475,7 @@ fn call_procedure(cli: &CliContext, procedure: &str, args: Vec<Value>) -> Result
 fn run_call(cli: &CliContext, name: &str, args: Vec<Value>) -> Result<()> {
     let mut command = Command::new("spacetime");
     command.arg("call");
-    if let Some(server) = cli.server.as_deref() {
-        command.args(["--server", server]);
-    }
+    command.args(["--server", &cli.server, "--yes", "--no-config"]);
     command.arg(&cli.database);
     command.arg(name);
     for arg in args {
@@ -491,9 +487,7 @@ fn run_call(cli: &CliContext, name: &str, args: Vec<Value>) -> Result<()> {
 fn sql(cli: &CliContext, query: &str) -> Result<()> {
     let mut command = Command::new("spacetime");
     command.arg("sql");
-    if let Some(server) = cli.server.as_deref() {
-        command.args(["--server", server]);
-    }
+    command.args(["--server", &cli.server, "--yes", "--no-config"]);
     command.arg(&cli.database);
     command.arg(query);
     run_status(&mut command)
@@ -510,16 +504,19 @@ fn run_status(command: &mut Command) -> Result<()> {
 
 fn optional_json_string(value: Option<String>) -> Value {
     match value {
-        Some(value) => Value::String(value),
-        None => Value::Null,
+        Some(value) => some_json_string(value),
+        None => none_json(),
     }
 }
 
-#[allow(dead_code)]
-fn compact_object(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
-    let mut object = Map::new();
-    for (key, value) in entries {
-        object.insert(key.to_string(), value);
-    }
-    Value::Object(object)
+fn some_json_string(value: String) -> Value {
+    json!({ "some": value })
+}
+
+fn some_json_u32(value: u32) -> Value {
+    json!({ "some": value })
+}
+
+fn none_json() -> Value {
+    json!({ "none": {} })
 }

@@ -1,6 +1,6 @@
 # Harness
 
-This module ports the SQLite state layer from [`harness.py`](/home/sdancer/orchestrator/harness.py) to SpacetimeDB while keeping the same core entities:
+This module replaces the old Python harness with a Rust SpacetimeDB module while keeping the same core entities:
 
 - `agents`
 - `goals`
@@ -72,4 +72,4 @@ spacetime call orchestrator-harness run_once_biome \
 
 ## Notes
 
-This Rust module now owns the biome polling and biome prompt-dispatch path. The remaining host-side gap is filesystem walking and external command indexing; those can be ported next if you want the artifact scan/index loop inside the module too.
+This Rust module now owns the harness behavior. The remaining Python helper is [`fs-check.py`](/home/sdancer/orchestrator/fs-check.py), which is only for standalone filesystem scanning and derived file facts.

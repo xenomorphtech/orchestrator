@@ -201,14 +201,14 @@ Queue indexing for significant new artifacts.
 Bootstrap agents and an example workflow:
 
 ```bash
-python harness.py --db orchestrate.db seed-agents
-python harness.py --db orchestrate.db bootstrap-known-goals
+./harness seed-agents
+./harness bootstrap-known-goals
 ```
 
 Add a new top-level goal dynamically:
 
 ```bash
-python harness.py --db orchestrate.db goal-add \
+./harness goal-add \
   orchestrator.collect_more_sessions \
   "Collect more session captures" \
   --detail "Gather additional live captures for validation" \
@@ -219,7 +219,7 @@ python harness.py --db orchestrate.db goal-add \
 Attach a sub-goal to an agent:
 
 ```bash
-python harness.py --db orchestrate.db sub-goal-add \
+./harness sub-goal-add \
   agent_c.collect_more_sessions \
   orchestrator.collect_more_sessions \
   agent_c \
@@ -233,19 +233,19 @@ python harness.py --db orchestrate.db sub-goal-add \
 Cancel a goal without deleting history:
 
 ```bash
-python harness.py --db orchestrate.db goal-remove orchestrator.collect_more_sessions
+./harness goal-remove orchestrator.collect_more_sessions
 ```
 
 Hard-delete a goal and its sub-goals:
 
 ```bash
-python harness.py --db orchestrate.db goal-remove orchestrator.collect_more_sessions --delete --cascade
+./harness goal-remove orchestrator.collect_more_sessions --delete --cascade
 ```
 
 Run the loop once:
 
 ```bash
-python harness.py --db orchestrate.db run-once --execute
+./harness run-once-biome --execute
 ```
 
 ---
