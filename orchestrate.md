@@ -40,6 +40,26 @@ If `$ARGUMENTS` is provided, treat it as the harness DB path instead of the defa
    - **working**: spinner characters visible or keywords (thinking, analyzing, processing, working, running)
    - **stuck (stale)**: no output change for 10+ minutes (compare to previous cycle)
 
+   **Auto-continue idle agents**: When an idle agent's last output describes a clear next step or task (e.g. "The next useful move is to...", "Next step is to...", "I'm going to..."), send a short continuation nudge like `Continue.` or `Continue. <one-line summary of their stated next step>` — do NOT re-explain what they already said. Only add cross-pollination context if another agent produced a finding that changes their plan. If the agent's stated next step was already superseded by another agent's work (e.g. they say "search donor logs" but another agent already did that and found nothing), redirect them instead.
+
+   **Context and compaction**: Both Claude Code and Codex (GPT-5.4) agents have automatic context compaction. Low context % does NOT mean the agent is exhausted — compaction will reclaim space and the agent will keep working. Always nudge idle agents regardless of context %, as long as they have remaining work. Do not skip agents just because they show low context.
+
+   **Context refresh for low-context agents** (use sparingly — compaction usually handles this): When an agent is idle and context is low (roughly ≤20%), but they still have productive work to do:
+   1. Send: `Summarize your current goal, what you've accomplished, and the exact next 2-3 tasks to continue. Be concise.`
+   2. Wait for the agent to reply with its summary.
+   3. Read the summary from the screen.
+   4. Send `/clear` to reset the agent's context window.
+   5. After the clear, inject the goal and tasks back:
+      ```
+      You are continuing work on: <goal from summary>
+      Accomplished so far: <key accomplishments from summary>
+      Your next tasks:
+      1. <task 1 from summary>
+      2. <task 2 from summary>
+      Continue with task 1.
+      ```
+   This gives the agent a fresh context window while preserving continuity. Only do this for agents that have clear remaining work — don't refresh agents that are effectively done.
+
 3. **Run the harness cycle** to poll, resolve goals, decide and execute actions:
 
    ```bash
@@ -57,9 +77,9 @@ If `$ARGUMENTS` is provided, treat it as the harness DB path instead of the defa
      ```
    - Optionally send a generic nudge to stuck unmanaged panes:
      ```bash
-     printf 'Continue from where you left off. If stuck on an error, try a different approach.\n' | base64
+     B64=$(printf 'Continue from where you left off. If stuck on an error, try a different approach.\r' | base64 -w0)
      curl -s -X POST http://localhost:3000/panes/<id>/input \
-       -H 'Content-Type: application/json' -d '{"data":"<base64>"}'
+       -H 'Content-Type: application/json' -d "{\"data\":\"$B64\"}"
      ```
 
 5. **Cross-pollinate and index**:
@@ -133,10 +153,22 @@ curl -s -X DELETE http://localhost:3000/panes/<uuid>
 
 ### Send input to a pane
 
+Use the helper script — it resolves names, appends `\r`, and base64-encodes automatically:
+
 ```bash
-printf 'your prompt here\n' | base64
+/home/sdancer/orchestrate/send.sh <pane-name-or-id> "your prompt here"
+
+# Examples:
+/home/sdancer/orchestrate/send.sh native_harness "Continue."
+/home/sdancer/orchestrate/send.sh aion2-protocol "Continue. Fix the decode regression."
+/home/sdancer/orchestrate/send.sh ecf38525 "Continue."
+```
+
+Manual equivalent (if send.sh is unavailable):
+```bash
+B64=$(printf 'your prompt here\r' | base64 -w0)
 curl -s -X POST http://localhost:3000/panes/<uuid>/input \
-  -H 'Content-Type: application/json' -d '{"data":"<base64>"}'
+  -H 'Content-Type: application/json' -d "{\"data\":\"$B64\"}"
 ```
 
 ### Anthropic SDK (programmatic, non-pane)

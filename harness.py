@@ -845,6 +845,8 @@ def poll_agents(conn: sqlite3.Connection) -> None:
     rows = conn.execute("SELECT * FROM agents ORDER BY name").fetchall()
     now = utcnow()
     for row in rows:
+        if row["status"] == "paused":
+            continue
         capture = capture_agent(row)
         status = classify_capture(capture, row["last_capture_hash"], row["last_seen_at"])
         content = capture or ""
@@ -946,7 +948,7 @@ def derive_artifact_facts(conn: sqlite3.Connection) -> None:
 def resolve_goal_states(conn: sqlite3.Connection) -> None:
     goals = conn.execute("SELECT * FROM goals ORDER BY priority, goal_key").fetchall()
     for goal in goals:
-        if goal["status"] == "cancelled":
+        if goal["status"] in ("cancelled", "paused"):
             continue
         if fact_is_true(conn, goal["success_fact_key"]):
             new_status = "done"
@@ -966,7 +968,7 @@ def resolve_sub_goal_states(conn: sqlite3.Connection) -> None:
         "SELECT sg.*, g.status AS parent_goal_status, g.priority AS parent_goal_priority FROM sub_goals sg JOIN goals g ON g.goal_key = sg.goal_key ORDER BY g.priority, sg.priority, sg.sub_goal_key"
     ).fetchall()
     for sub_goal in sub_goals:
-        if sub_goal["status"] == "cancelled":
+        if sub_goal["status"] in ("cancelled", "paused"):
             continue
         if fact_is_true(conn, sub_goal["success_fact_key"]):
             new_status = "done"
@@ -1135,6 +1137,8 @@ def decide_actions(conn: sqlite3.Connection) -> None:
     for agent in agents:
         name = agent["name"]
         status = agent["status"]
+        if status == "paused":
+            continue
         preview = agent["last_capture_preview"] or ""
         if status == "dead":
             queue_action(conn, "restart_agent", {"task": current_task_prompt(conn, name)}, "Agent appears dead", name)
@@ -1321,7 +1325,7 @@ def build_parser() -> argparse.ArgumentParser:
     goal_add.add_argument("goal_key")
     goal_add.add_argument("title")
     goal_add.add_argument("--detail", default="")
-    goal_add.add_argument("--status", default="pending", choices=["pending", "active", "blocked", "done", "cancelled"])
+    goal_add.add_argument("--status", default="pending", choices=["pending", "active", "blocked", "done", "cancelled", "paused"])
     goal_add.add_argument("--priority", type=int, default=50)
     goal_add.add_argument("--depends-on-goal-key")
     goal_add.add_argument("--success-fact-key")
@@ -1330,7 +1334,7 @@ def build_parser() -> argparse.ArgumentParser:
     goal_update.add_argument("goal_key")
     goal_update.add_argument("--title")
     goal_update.add_argument("--detail")
-    goal_update.add_argument("--status", choices=["pending", "active", "blocked", "done", "cancelled"])
+    goal_update.add_argument("--status", choices=["pending", "active", "blocked", "done", "cancelled", "paused"])
     goal_update.add_argument("--priority", type=int)
     goal_update.add_argument("--depends-on-goal-key")
     goal_update.add_argument("--success-fact-key")
@@ -1344,7 +1348,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     goal_set = sub.add_parser("goal-set")
     goal_set.add_argument("goal_key")
-    goal_set.add_argument("status", choices=["pending", "active", "blocked", "done", "cancelled"])
+    goal_set.add_argument("status", choices=["pending", "active", "blocked", "done", "cancelled", "paused"])
 
     sub_goal_add = sub.add_parser("sub-goal-add")
     sub_goal_add.add_argument("sub_goal_key")
@@ -1352,7 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub_goal_add.add_argument("owner_agent")
     sub_goal_add.add_argument("title")
     sub_goal_add.add_argument("--detail", default="")
-    sub_goal_add.add_argument("--status", default="pending", choices=["pending", "active", "blocked", "done", "cancelled"])
+    sub_goal_add.add_argument("--status", default="pending", choices=["pending", "active", "blocked", "done", "cancelled", "paused"])
     sub_goal_add.add_argument("--priority", type=int, default=50)
     sub_goal_add.add_argument("--depends-on-sub-goal-key")
     sub_goal_add.add_argument("--success-fact-key")
@@ -1365,7 +1369,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub_goal_update.add_argument("--owner-agent")
     sub_goal_update.add_argument("--title")
     sub_goal_update.add_argument("--detail")
-    sub_goal_update.add_argument("--status", choices=["pending", "active", "blocked", "done", "cancelled"])
+    sub_goal_update.add_argument("--status", choices=["pending", "active", "blocked", "done", "cancelled", "paused"])
     sub_goal_update.add_argument("--priority", type=int)
     sub_goal_update.add_argument("--depends-on-sub-goal-key")
     sub_goal_update.add_argument("--success-fact-key")
@@ -1382,7 +1386,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub_goal_set = sub.add_parser("sub-goal-set")
     sub_goal_set.add_argument("sub_goal_key")
-    sub_goal_set.add_argument("status", choices=["pending", "active", "blocked", "done", "cancelled"])
+    sub_goal_set.add_argument("status", choices=["pending", "active", "blocked", "done", "cancelled", "paused"])
 
     agent_add = sub.add_parser("agent-add")
     agent_add.add_argument("name")
