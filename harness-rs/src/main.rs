@@ -3,13 +3,14 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use reqwest::blocking::Client;
 use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(name = "harness")]
 #[command(about = "Rust CLI for the harness SpacetimeDB module")]
 struct Cli {
-    #[arg(long, default_value = "harness")]
+    #[arg(long, default_value = "orchestrator-harness")]
     database: String,
     #[arg(long, default_value = "http://127.0.0.1:3001")]
     server: String,
@@ -20,6 +21,7 @@ struct Cli {
 struct CliContext {
     database: String,
     server: String,
+    client: Client,
 }
 
 #[derive(Subcommand)]
@@ -252,6 +254,7 @@ fn run() -> Result<()> {
     let context = CliContext {
         database: cli.database,
         server: cli.server,
+        client: Client::new(),
     };
     match cli.command {
         Commands::Build => run_status(Command::new("spacetime").args(["build", "-p", "harness-rs"])),
@@ -309,10 +312,10 @@ fn run() -> Result<()> {
             Some(vec![json!({
                 "fact_key": args.key,
                 "value_json": args.value,
-                "confidence": args.confidence,
-                "source_type": args.source_type,
-                "source_ref": args.source_ref,
-                "metadata_json": "{}"
+                "confidence": json!({"some": args.confidence}),
+                "source_type": some_json_string(args.source_type),
+                "source_ref": optional_json_string(args.source_ref),
+                "metadata_json": some_json_string("{}".to_string())
             })]),
         ),
         Commands::GoalAdd(args) => call_reducer(
@@ -326,7 +329,8 @@ fn run() -> Result<()> {
                 "priority": some_json_u32(args.priority),
                 "depends_on_goal_key": optional_json_string(args.depends_on_goal_key),
                 "success_fact_key": optional_json_string(args.success_fact_key),
-                "metadata_json": some_json_string("{}".to_string())
+                "metadata_json": some_json_string("{}".to_string()),
+                "completion_report": null
             })]),
         ),
         Commands::GoalUpdate(args) => call_reducer(
@@ -335,13 +339,14 @@ fn run() -> Result<()> {
             Some(vec![
                 Value::String(args.goal_key),
                 json!({
-                    "title": args.title,
-                    "detail": args.detail,
-                    "status": args.status,
-                    "priority": args.priority,
-                    "depends_on_goal_key": args.depends_on_goal_key,
-                    "success_fact_key": args.success_fact_key,
-                    "metadata_json": null,
+                    "title": optional_json_string(args.title),
+                    "detail": optional_json_string(args.detail),
+                    "status": optional_json_string(args.status),
+                    "priority": optional_json_u32(args.priority),
+                    "depends_on_goal_key": optional_json_string(args.depends_on_goal_key),
+                    "success_fact_key": optional_json_string(args.success_fact_key),
+                    "metadata_json": none_json(),
+                    "completion_report": none_json(),
                     "clear_depends": args.clear_depends,
                     "clear_success_fact": args.clear_success_fact
                 }),
@@ -362,13 +367,14 @@ fn run() -> Result<()> {
             Some(vec![
                 Value::String(args.goal_key),
                 json!({
-                    "title": null,
-                    "detail": null,
-                    "status": args.status,
-                    "priority": null,
-                    "depends_on_goal_key": null,
-                    "success_fact_key": null,
-                    "metadata_json": null,
+                    "title": none_json(),
+                    "detail": none_json(),
+                    "status": some_json_string(args.status),
+                    "priority": none_json(),
+                    "depends_on_goal_key": none_json(),
+                    "success_fact_key": none_json(),
+                    "metadata_json": none_json(),
+                    "completion_report": none_json(),
                     "clear_depends": false,
                     "clear_success_fact": false
                 }),
@@ -382,14 +388,16 @@ fn run() -> Result<()> {
                 "goal_key": args.goal_key,
                 "owner_agent": args.owner_agent,
                 "title": args.title,
-                "detail": args.detail,
-                "status": args.status,
-                "priority": args.priority,
-                "depends_on_sub_goal_key": args.depends_on_sub_goal_key,
-                "success_fact_key": args.success_fact_key,
-                "instruction_text": args.instruction_text,
-                "stuck_guidance_text": args.stuck_guidance_text,
-                "metadata_json": "{}"
+                "detail": some_json_string(args.detail),
+                "status": some_json_string(args.status),
+                "priority": some_json_u32(args.priority),
+                "depends_on_sub_goal_key": optional_json_string(args.depends_on_sub_goal_key),
+                "blocked_by": none_json(),
+                "success_fact_key": optional_json_string(args.success_fact_key),
+                "instruction_text": optional_json_string(args.instruction_text),
+                "stuck_guidance_text": optional_json_string(args.stuck_guidance_text),
+                "metadata_json": some_json_string("{}".to_string()),
+                "completion_report": null
             })]),
         ),
         Commands::SubGoalUpdate(args) => call_reducer(
@@ -398,21 +406,24 @@ fn run() -> Result<()> {
             Some(vec![
                 Value::String(args.sub_goal_key),
                 json!({
-                    "goal_key": args.goal_key,
-                    "owner_agent": args.owner_agent,
-                    "title": args.title,
-                    "detail": args.detail,
-                    "status": args.status,
-                    "priority": args.priority,
-                    "depends_on_sub_goal_key": args.depends_on_sub_goal_key,
-                    "success_fact_key": args.success_fact_key,
-                    "instruction_text": args.instruction_text,
-                    "stuck_guidance_text": args.stuck_guidance_text,
-                    "metadata_json": null,
+                    "goal_key": optional_json_string(args.goal_key),
+                    "owner_agent": optional_json_string(args.owner_agent),
+                    "title": optional_json_string(args.title),
+                    "detail": optional_json_string(args.detail),
+                    "status": optional_json_string(args.status),
+                    "priority": optional_json_u32(args.priority),
+                    "depends_on_sub_goal_key": optional_json_string(args.depends_on_sub_goal_key),
+                    "success_fact_key": optional_json_string(args.success_fact_key),
+                    "instruction_text": optional_json_string(args.instruction_text),
+                    "stuck_guidance_text": optional_json_string(args.stuck_guidance_text),
+                    "metadata_json": none_json(),
+                    "blocked_by": none_json(),
+                    "completion_report": none_json(),
                     "clear_depends": args.clear_depends,
                     "clear_success_fact": args.clear_success_fact,
                     "clear_instruction": args.clear_instruction,
-                    "clear_stuck_guidance": args.clear_stuck_guidance
+                    "clear_stuck_guidance": args.clear_stuck_guidance,
+                    "clear_blocked_by": false
                 }),
             ]),
         ),
@@ -427,21 +438,24 @@ fn run() -> Result<()> {
             Some(vec![
                 Value::String(args.sub_goal_key),
                 json!({
-                    "goal_key": null,
-                    "owner_agent": null,
-                    "title": null,
-                    "detail": null,
-                    "status": args.status,
-                    "priority": null,
-                    "depends_on_sub_goal_key": null,
-                    "success_fact_key": null,
-                    "instruction_text": null,
-                    "stuck_guidance_text": null,
-                    "metadata_json": null,
+                    "goal_key": none_json(),
+                    "owner_agent": none_json(),
+                    "title": none_json(),
+                    "detail": none_json(),
+                    "status": some_json_string(args.status),
+                    "priority": none_json(),
+                    "depends_on_sub_goal_key": none_json(),
+                    "success_fact_key": none_json(),
+                    "instruction_text": none_json(),
+                    "stuck_guidance_text": none_json(),
+                    "metadata_json": none_json(),
+                    "blocked_by": none_json(),
+                    "completion_report": none_json(),
                     "clear_depends": false,
                     "clear_success_fact": false,
                     "clear_instruction": false,
-                    "clear_stuck_guidance": false
+                    "clear_stuck_guidance": false,
+                    "clear_blocked_by": false
                 }),
             ]),
         ),
@@ -473,28 +487,171 @@ fn call_procedure(cli: &CliContext, procedure: &str, args: Vec<Value>) -> Result
 }
 
 fn run_call(cli: &CliContext, name: &str, args: Vec<Value>) -> Result<()> {
-    let mut command = Command::new("spacetime");
-    command.arg("call");
-    command.args(["--server", &cli.server, "--yes", "--no-config"]);
-    command.arg(&cli.database);
-    command.arg(name);
-    for arg in args {
-        command.arg(arg.to_string());
+    let url = format!("{}/v1/database/{}/call/{}", cli.server, cli.database, name);
+    let body = Value::Array(args).to_string();
+    let resp = cli
+        .client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .with_context(|| format!("failed to call reducer {name}"))?;
+
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(anyhow!("call {name} failed (HTTP {status}): {text}"));
     }
-    run_status(&mut command)
+
+    if !text.is_empty() {
+        if let Ok(json) = serde_json::from_str::<Value>(&text) {
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        } else {
+            println!("{text}");
+        }
+    }
+    Ok(())
 }
 
 fn sql(cli: &CliContext, query: &str) -> Result<()> {
-    let mut command = Command::new("spacetime");
-    command.arg("sql");
-    command.args(["--server", &cli.server, "--yes", "--no-config"]);
-    command.arg(&cli.database);
-    command.arg(query);
-    run_status(&mut command)
+    let url = format!("{}/v1/database/{}/sql", cli.server, cli.database);
+    let resp = cli
+        .client
+        .post(&url)
+        .body(query.to_string())
+        .send()
+        .with_context(|| format!("failed to run SQL: {query}"))?;
+
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(anyhow!("SQL failed (HTTP {status}): {text}"));
+    }
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    if let Ok(json) = serde_json::from_str::<Value>(&text) {
+        print_sql_result(&json);
+    } else {
+        println!("{text}");
+    }
+    Ok(())
 }
 
+fn print_sql_result(json: &Value) {
+    let empty = vec![];
+    let results = json.as_array().unwrap_or(&empty);
+    for result in results {
+        let schema = result
+            .get("schema")
+            .and_then(|s| s.get("elements"))
+            .and_then(|e| e.as_array());
+        let rows = result.get("rows").and_then(|r| r.as_array());
+
+        match (schema, rows) {
+            (Some(schema), Some(rows)) => {
+                let columns: Vec<String> = schema
+                    .iter()
+                    .filter_map(|e| {
+                        let name = e.get("name")?;
+                        // SpacetimeDB wraps column names as {"some": "col_name"}
+                        if let Some(s) = name.as_str() {
+                            Some(s.to_string())
+                        } else {
+                            name.get("some").and_then(|s| s.as_str()).map(|s| s.to_string())
+                        }
+                    })
+                    .collect();
+
+                if columns.is_empty() {
+                    continue;
+                }
+                if rows.is_empty() {
+                    println!("(0 rows)");
+                    continue;
+                }
+
+                let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+                // Cap column widths to keep output readable
+                let max_width: usize = 60;
+                let string_rows: Vec<Vec<String>> = rows
+                    .iter()
+                    .filter_map(|row| row.as_array())
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(i, val)| {
+                                let s = format_cell(val);
+                                if i < widths.len() {
+                                    widths[i] = widths[i].max(s.len());
+                                }
+                                s
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                for w in &mut widths {
+                    *w = (*w).min(max_width);
+                }
+
+                // header
+                let header: Vec<String> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let w = widths.get(i).copied().unwrap_or(0);
+                        format!("{:w$}", &c[..c.len().min(w)], w = w)
+                    })
+                    .collect();
+                println!(" {}", header.join(" | "));
+
+                // separator
+                let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+                println!("-{}-", sep.join("-+-"));
+
+                // rows
+                for row in &string_rows {
+                    let cells: Vec<String> = row
+                        .iter()
+                        .enumerate()
+                        .map(|(i, val)| {
+                            format!("{:w$}", val, w = widths.get(i).copied().unwrap_or(0))
+                        })
+                        .collect();
+                    println!(" {}", cells.join(" | "));
+                }
+                println!("({} rows)", string_rows.len());
+                println!();
+            }
+            _ => {
+                if let Ok(pretty) = serde_json::to_string_pretty(result) {
+                    println!("{pretty}");
+                }
+            }
+        }
+    }
+}
+
+fn format_cell(val: &Value) -> String {
+    match val {
+        Value::Null => "NULL".to_string(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => val.to_string(),
+    }
+}
+
+// Kept for Build command only
 fn run_status(command: &mut Command) -> Result<()> {
-    let status = command.status().with_context(|| format!("failed to run {:?}", command))?;
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run {:?}", command))?;
     if status.success() {
         Ok(())
     } else {
@@ -505,6 +662,13 @@ fn run_status(command: &mut Command) -> Result<()> {
 fn optional_json_string(value: Option<String>) -> Value {
     match value {
         Some(value) => some_json_string(value),
+        None => none_json(),
+    }
+}
+
+fn optional_json_u32(value: Option<u32>) -> Value {
+    match value {
+        Some(value) => some_json_u32(value),
         None => none_json(),
     }
 }

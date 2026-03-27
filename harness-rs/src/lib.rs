@@ -42,6 +42,7 @@ pub struct GoalInput {
     pub depends_on_goal_key: Option<String>,
     pub success_fact_key: Option<String>,
     pub metadata_json: Option<String>,
+    pub completion_report: Option<String>,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -53,6 +54,7 @@ pub struct GoalPatch {
     pub depends_on_goal_key: Option<String>,
     pub success_fact_key: Option<String>,
     pub metadata_json: Option<String>,
+    pub completion_report: Option<String>,
     pub clear_depends: bool,
     pub clear_success_fact: bool,
 }
@@ -67,10 +69,12 @@ pub struct SubGoalInput {
     pub status: Option<String>,
     pub priority: Option<u32>,
     pub depends_on_sub_goal_key: Option<String>,
+    pub blocked_by: Option<String>,
     pub success_fact_key: Option<String>,
     pub instruction_text: Option<String>,
     pub stuck_guidance_text: Option<String>,
     pub metadata_json: Option<String>,
+    pub completion_report: Option<String>,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -82,14 +86,17 @@ pub struct SubGoalPatch {
     pub status: Option<String>,
     pub priority: Option<u32>,
     pub depends_on_sub_goal_key: Option<String>,
+    pub blocked_by: Option<String>,
     pub success_fact_key: Option<String>,
     pub instruction_text: Option<String>,
     pub stuck_guidance_text: Option<String>,
     pub metadata_json: Option<String>,
+    pub completion_report: Option<String>,
     pub clear_depends: bool,
     pub clear_success_fact: bool,
     pub clear_instruction: bool,
     pub clear_stuck_guidance: bool,
+    pub clear_blocked_by: bool,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -193,6 +200,7 @@ pub struct Goal {
     pub depends_on_goal_key: Option<String>,
     pub success_fact_key: Option<String>,
     pub metadata_json: String,
+    pub completion_report: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -213,10 +221,13 @@ pub struct SubGoal {
     #[index(btree)]
     pub priority: u32,
     pub depends_on_sub_goal_key: Option<String>,
+    /// Comma-separated list of goal_keys or sub_goal_keys that must be "done" before this unblocks.
+    pub blocked_by: Option<String>,
     pub success_fact_key: Option<String>,
     pub instruction_text: Option<String>,
     pub stuck_guidance_text: Option<String>,
     pub metadata_json: String,
+    pub completion_report: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -830,6 +841,7 @@ fn bootstrap_goals() -> Vec<GoalInput> {
             depends_on_goal_key: None,
             success_fact_key: Some("oracle.indexed".to_string()),
             metadata_json: None,
+            completion_report: None,
         },
         GoalInput {
             goal_key: "orchestrator.recover_crypto".to_string(),
@@ -840,6 +852,7 @@ fn bootstrap_goals() -> Vec<GoalInput> {
             depends_on_goal_key: None,
             success_fact_key: Some("crypto.algorithm_identified".to_string()),
             metadata_json: None,
+            completion_report: None,
         },
         GoalInput {
             goal_key: "orchestrator.validate_capture_path".to_string(),
@@ -850,6 +863,7 @@ fn bootstrap_goals() -> Vec<GoalInput> {
             depends_on_goal_key: None,
             success_fact_key: Some("hybrid.capture_tested".to_string()),
             metadata_json: None,
+            completion_report: None,
         },
     ]
 }
@@ -869,6 +883,8 @@ fn bootstrap_sub_goals() -> Vec<SubGoalInput> {
             instruction_text: Some("If you have finished the oracle implementation, run it now and capture the results.".to_string()),
             stuck_guidance_text: Some("If the build is complete, run the oracle now and record the output.".to_string()),
             metadata_json: None,
+            blocked_by: None,
+            completion_report: None,
         },
         SubGoalInput {
             sub_goal_key: "oracle.index_results".to_string(),
@@ -883,6 +899,8 @@ fn bootstrap_sub_goals() -> Vec<SubGoalInput> {
             instruction_text: Some("The oracle appears tested. Save significant results to VikingDB via `mcp openviking add_resource` and note what you indexed.".to_string()),
             stuck_guidance_text: None,
             metadata_json: None,
+            blocked_by: None,
+            completion_report: None,
         },
         SubGoalInput {
             sub_goal_key: "crypto.static_analysis".to_string(),
@@ -897,6 +915,8 @@ fn bootstrap_sub_goals() -> Vec<SubGoalInput> {
             instruction_text: Some("Keep advancing the crypto analysis. Hook sub_20bb48 and sub_2070a8 deeper with Capstone if needed. Binary: output/decrypted/nmsscr.dec.".to_string()),
             stuck_guidance_text: Some("Try hooking sub_20bb48 and sub_2070a8 deeper with Capstone. Binary: output/decrypted/nmsscr.dec.".to_string()),
             metadata_json: None,
+            blocked_by: None,
+            completion_report: None,
         },
         SubGoalInput {
             sub_goal_key: "crypto.unicorn_emulation".to_string(),
@@ -911,6 +931,8 @@ fn bootstrap_sub_goals() -> Vec<SubGoalInput> {
             instruction_text: Some("Static analysis appears complete. Try Unicorn emulation of the crypto function using nmss_emu.py. Binary: output/decrypted/nmsscr.dec. Capture any concrete inputs, outputs, or recovered constants.".to_string()),
             stuck_guidance_text: None,
             metadata_json: None,
+            blocked_by: None,
+            completion_report: None,
         },
         SubGoalInput {
             sub_goal_key: "crypto.identify_algorithm".to_string(),
@@ -925,6 +947,8 @@ fn bootstrap_sub_goals() -> Vec<SubGoalInput> {
             instruction_text: Some("Turn the recovered behavior into a concrete algorithm description with evidence, constants, and any validation runs.".to_string()),
             stuck_guidance_text: None,
             metadata_json: None,
+            blocked_by: None,
+            completion_report: None,
         },
         SubGoalInput {
             sub_goal_key: "hybrid.capture_script".to_string(),
@@ -939,6 +963,8 @@ fn bootstrap_sub_goals() -> Vec<SubGoalInput> {
             instruction_text: Some("Keep iterating on the capture script. If crypto remains unresolved, use a stub to validate the session capture path.".to_string()),
             stuck_guidance_text: Some("If crypto is not solved yet, stub the computation and validate the capture path anyway.".to_string()),
             metadata_json: None,
+            blocked_by: None,
+            completion_report: None,
         },
         SubGoalInput {
             sub_goal_key: "hybrid.capture_test".to_string(),
@@ -953,6 +979,8 @@ fn bootstrap_sub_goals() -> Vec<SubGoalInput> {
             instruction_text: Some("The capture script appears ready. Test it now; if crypto is not solved yet, stub the computation and validate that capture works.".to_string()),
             stuck_guidance_text: None,
             metadata_json: None,
+            blocked_by: None,
+            completion_report: None,
         },
     ]
 }
@@ -995,6 +1023,7 @@ fn upsert_goal_internal(ctx: &ReducerContext, input: GoalInput) -> Result<(), St
         depends_on_goal_key: opt_text(input.depends_on_goal_key),
         success_fact_key: opt_text(input.success_fact_key),
         metadata_json: json_or_empty(input.metadata_json),
+        completion_report: input.completion_report.or_else(|| existing.as_ref().and_then(|r| r.completion_report.clone())),
         created_at: existing
             .as_ref()
             .map(|row| row.created_at.clone())
@@ -1014,6 +1043,16 @@ fn upsert_sub_goal_internal(ctx: &ReducerContext, input: SubGoalInput) -> Result
     }
     let timestamp = now(ctx);
     let existing = ctx.db.sub_goals().sub_goal_key().find(&input.sub_goal_key);
+    // Validate blocked_by references (comma-separated goal_keys or sub_goal_keys)
+    if let Some(ref blocked_by) = input.blocked_by {
+        for dep_key in blocked_by.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let goal_exists = ctx.db.goals().goal_key().find(&dep_key.to_string()).is_some();
+            let sub_goal_exists = ctx.db.sub_goals().sub_goal_key().find(&dep_key.to_string()).is_some();
+            if !goal_exists && !sub_goal_exists {
+                return Err(format!("blocked_by references unknown key: {dep_key}"));
+            }
+        }
+    }
     let row = SubGoal {
         sub_goal_key: input.sub_goal_key.clone(),
         goal_key: input.goal_key,
@@ -1023,10 +1062,12 @@ fn upsert_sub_goal_internal(ctx: &ReducerContext, input: SubGoalInput) -> Result
         status: input.status.unwrap_or_else(|| "pending".to_string()),
         priority: input.priority.unwrap_or(50),
         depends_on_sub_goal_key: opt_text(input.depends_on_sub_goal_key),
+        blocked_by: opt_text(input.blocked_by),
         success_fact_key: opt_text(input.success_fact_key),
         instruction_text: opt_text(input.instruction_text),
         stuck_guidance_text: opt_text(input.stuck_guidance_text),
         metadata_json: json_or_empty(input.metadata_json),
+        completion_report: input.completion_report.or_else(|| existing.as_ref().and_then(|r| r.completion_report.clone())),
         created_at: existing
             .as_ref()
             .map(|row| row.created_at.clone())
@@ -1158,6 +1199,7 @@ pub fn goal_update(ctx: &ReducerContext, goal_key: String, patch: GoalPatch) -> 
             patch.success_fact_key.or(current.success_fact_key)
         },
         metadata_json: patch.metadata_json.or(Some(current.metadata_json)),
+        completion_report: patch.completion_report.or(current.completion_report),
     };
     upsert_goal_internal(ctx, next)?;
     log_event(ctx, None, "goal.updated", goal_key, None);
@@ -1209,6 +1251,7 @@ pub fn goal_remove(ctx: &ReducerContext, goal_key: String, delete: bool, cascade
                 depends_on_goal_key: None,
                 success_fact_key: None,
                 metadata_json: None,
+                completion_report: None,
                 clear_depends: false,
                 clear_success_fact: false,
             },
@@ -1277,6 +1320,12 @@ pub fn sub_goal_update(ctx: &ReducerContext, sub_goal_key: String, patch: SubGoa
             patch.stuck_guidance_text.or(current.stuck_guidance_text)
         },
         metadata_json: patch.metadata_json.or(Some(current.metadata_json)),
+        blocked_by: if patch.clear_blocked_by {
+            None
+        } else {
+            patch.blocked_by.or(current.blocked_by)
+        },
+        completion_report: patch.completion_report.or(current.completion_report),
     };
     upsert_sub_goal_internal(ctx, next)?;
     log_event(ctx, Some(owner), "sub_goal.updated", sub_goal_key, None);
@@ -1503,6 +1552,20 @@ pub fn resolve_sub_goal_states(ctx: &ReducerContext) {
             } else {
                 "pending".to_string()
             }
+        } else if let Some(ref blocked_by) = sub_goal.blocked_by {
+            // Check all blocked_by references — all must be "done" to unblock
+            let all_done = blocked_by
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .all(|dep_key| {
+                    let goal_done = ctx.db.goals().goal_key().find(&dep_key.to_string())
+                        .map(|g| g.status == "done").unwrap_or(false);
+                    let sub_goal_done = ctx.db.sub_goals().sub_goal_key().find(&dep_key.to_string())
+                        .map(|sg| sg.status == "done").unwrap_or(false);
+                    goal_done || sub_goal_done
+                });
+            if all_done { "pending".to_string() } else { "blocked".to_string() }
         } else {
             "pending".to_string()
         };

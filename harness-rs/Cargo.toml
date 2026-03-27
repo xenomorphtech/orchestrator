@@ -7,6 +7,13 @@ edition = "2024"
 name = "orchestrator_harness"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "harness"
+required-features = ["cli"]
+
+[features]
+cli = ["dep:reqwest"]
+
 [dependencies]
 spacetimedb = { version = "2.1.0", features = ["unstable"] }
 log = "0.4"
@@ -17,3 +24,4 @@ serde_json = "1"
 sha2 = "0.10"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking"], optional = true }
