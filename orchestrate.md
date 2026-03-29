@@ -10,7 +10,7 @@ Monitor and drive Claude or Codex agents running in biome_term panes, working to
 
 - Harness: `/home/sdancer/orchestrator/harness`
 - Filesystem scan helper: `python /home/sdancer/orchestrator/fs-check.py --db /home/sdancer/orchestrator/fs-check.db`
-- biome_term: `http://localhost:3000`
+- biome_term: `http://localhost:3021`
 
 If `$ARGUMENTS` is provided, treat it as the harness server or database override instead of the default.
 
@@ -23,7 +23,7 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
    /home/sdancer/orchestrator/harness agents
 
    # All biome_term panes
-   curl -s http://localhost:3000/panes
+   curl -s http://localhost:3021/panes
    ```
 
    Cross-reference: any biome_term pane whose `name` or `id` does not appear in harness output is "unmanaged". Note these separately.
@@ -31,7 +31,7 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
 2. **Capture and classify each agent** by reading its screen via biome_term:
 
    ```bash
-   curl -s http://localhost:3000/panes/<id>/screen
+   curl -s http://localhost:3021/panes/<id>/screen
    ```
 
    Classify from the `rows[]` array:
@@ -78,9 +78,7 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
      ```
    - Optionally send a generic nudge to stuck unmanaged panes:
      ```bash
-     B64=$(printf 'Continue from where you left off. If stuck on an error, try a different approach.\r' | base64 -w0)
-     curl -s -X POST http://localhost:3000/panes/<id>/input \
-       -H 'Content-Type: application/json' -d "{\"data\":\"$B64\"}"
+     /home/sdancer/orchestrator/harness send <name-or-id> "Continue from where you left off. If stuck on an error, try a different approach."
      ```
 
 5. **Cross-pollinate and index**:
@@ -98,21 +96,16 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
 
 ```bash
 # Create pane
-curl -s -X POST http://localhost:3000/panes \
+curl -s -X POST http://localhost:3021/panes \
   -H 'Content-Type: application/json' \
   -d '{"name":"my-agent","cols":220,"rows":50}'
 # Response: {"id":"<uuid>","name":"my-agent","cols":220,"rows":50}
 
-# Start Claude (replace <uuid> with the id from above)
-printf 'cd /path/to/project && claude --dangerously-skip-permissions\n' | base64
-# Then send:
-curl -s -X POST http://localhost:3000/panes/<uuid>/input \
-  -H 'Content-Type: application/json' -d '{"data":"<base64>"}'
+# Start Claude
+/home/sdancer/orchestrator/harness send my-agent "cd /path/to/project && claude --dangerously-skip-permissions"
 
 # Wait ~5s for Claude to initialize, then send task
-printf 'Your task prompt here\n' | base64
-curl -s -X POST http://localhost:3000/panes/<uuid>/input \
-  -H 'Content-Type: application/json' -d '{"data":"<base64>"}'
+/home/sdancer/orchestrator/harness send my-agent "Your task prompt here"
 
 # Register with harness
 /home/sdancer/orchestrator/harness agent-add my-agent \
@@ -123,13 +116,12 @@ curl -s -X POST http://localhost:3000/panes/<uuid>/input \
 ### Spawn a Codex agent in biome_term
 
 ```bash
-curl -s -X POST http://localhost:3000/panes \
+curl -s -X POST http://localhost:3021/panes \
   -H 'Content-Type: application/json' \
   -d '{"name":"codex-agent","cols":220,"rows":50}'
 
-printf 'cd /path/to/project && codex --dangerously-bypass-approvals-and-sandbox "your task"\n' | base64
-curl -s -X POST http://localhost:3000/panes/<uuid>/input \
-  -H 'Content-Type: application/json' -d '{"data":"<base64>"}'
+/home/sdancer/orchestrator/harness send codex-agent \
+  'cd /path/to/project && codex --dangerously-bypass-approvals-and-sandbox "your task"'
 
 /home/sdancer/orchestrator/harness agent-add codex-agent \
   --biome-pane-id <uuid> --workdir /path/to/project \
@@ -140,36 +132,32 @@ curl -s -X POST http://localhost:3000/panes/<uuid>/input \
 
 ```bash
 # List all panes
-curl -s http://localhost:3000/panes
+curl -s http://localhost:3021/panes
 
 # Get current screen (VT100-rendered rows)
-curl -s http://localhost:3000/panes/<uuid>/screen
+curl -s http://localhost:3021/panes/<uuid>/screen
 
 # Get event log since sequence N
-curl -s "http://localhost:3000/panes/<uuid>/events?after=0"
+curl -s "http://localhost:3021/panes/<uuid>/events?after=0"
 
 # Kill a pane
-curl -s -X DELETE http://localhost:3000/panes/<uuid>
+curl -s -X DELETE http://localhost:3021/panes/<uuid>
 ```
 
 ### Send input to a pane
 
-Use the helper script — it resolves names, appends `\r`, and base64-encodes automatically:
+Use `harness send` — it resolves pane names, sends the text, waits briefly, then sends the carriage return:
 
 ```bash
-/home/sdancer/orchestrate/send.sh <pane-name-or-id> "your prompt here"
+/home/sdancer/orchestrator/harness send <pane-name-or-id> "your prompt here"
 
 # Examples:
-/home/sdancer/orchestrate/send.sh native_harness "Continue."
-/home/sdancer/orchestrate/send.sh aion2-protocol "Continue. Fix the decode regression."
-/home/sdancer/orchestrate/send.sh ecf38525 "Continue."
-```
+/home/sdancer/orchestrator/harness send vampir-api "Continue."
+/home/sdancer/orchestrator/harness send g4-scaffold "Continue. Fix the build error."
+/home/sdancer/orchestrator/harness send 3d94116f "Continue."
 
-Manual equivalent (if send.sh is unavailable):
-```bash
-B64=$(printf 'your prompt here\r' | base64 -w0)
-curl -s -X POST http://localhost:3000/panes/<uuid>/input \
-  -H 'Content-Type: application/json' -d "{\"data\":\"$B64\"}"
+# Custom delay before carriage return (default 150ms):
+/home/sdancer/orchestrator/harness send --delay 300 vampir-api "long prompt here"
 ```
 
 ### Anthropic SDK (programmatic, non-pane)

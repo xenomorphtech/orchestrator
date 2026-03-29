@@ -1,28 +1,7 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use spacetimedb::{
-    http::{Body, Request, Timeout},
-    ProcedureContext, ReducerContext, SpacetimeType, Table, TimeDuration,
-};
+use spacetimedb::{ReducerContext, SpacetimeType, Table};
 
 const DEFAULT_PROJECT_DIR: &str = "/home/sdancer/games/nmss";
 const DEFAULT_TMUX_SESSION: &str = "nmss";
-const DEFAULT_BIOME_TERM_URL: &str = "http://localhost:3000";
-const POLL_SCROLLBACK_LINES: usize = 20;
-const REPEAT_STUCK_SECONDS: i64 = 600;
-const BIOME_HTTP_TIMEOUT_MS: u64 = 500;
-const SPINNER_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒";
-const STUCK_PATTERNS: [&str; 7] = [
-    "traceback",
-    "exception",
-    "error:",
-    "permission denied",
-    "command not found",
-    "no such file",
-    "segmentation fault",
-];
 
 #[derive(Clone, Debug, SpacetimeType)]
 pub struct AgentInput {
@@ -134,38 +113,6 @@ pub struct AgentPollInput {
     pub status: String,
     pub last_capture_hash: Option<String>,
     pub last_capture_preview: Option<String>,
-}
-
-#[derive(Clone, Debug, SpacetimeType)]
-pub struct PollSummary {
-    pub agent_name: String,
-    pub status: String,
-    pub content_hash: String,
-}
-
-#[derive(Clone, Debug, SpacetimeType)]
-pub struct PendingActionSummary {
-    pub action_id: u64,
-    pub status: String,
-    pub result_text: String,
-}
-
-#[derive(Clone)]
-struct AgentRuntime {
-    name: String,
-    biome_pane_id: String,
-    last_seen_at: Option<String>,
-    last_capture_hash: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct BiomeScreen {
-    rows: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct BiomePaneCreated {
-    id: String,
 }
 
 #[derive(Clone)]
@@ -316,77 +263,6 @@ fn json_or_empty(value: Option<String>) -> String {
 
 fn opt_text(value: Option<String>) -> Option<String> {
     value.and_then(|v| if v.is_empty() { None } else { Some(v) })
-}
-
-fn biome_base_url(base_url: Option<&str>) -> String {
-    base_url.unwrap_or(DEFAULT_BIOME_TERM_URL).trim_end_matches('/').to_string()
-}
-
-fn nonempty_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-        .collect()
-}
-
-fn hash_text(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn looks_idle(text: &str) -> bool {
-    let lines = nonempty_lines(text);
-    let Some(tail) = lines.last() else {
-        return false;
-    };
-    tail.starts_with('❯') || tail == ">" || tail.ends_with(" ❯")
-}
-
-fn looks_working(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    ["thinking", "analyzing", "processing", "working", "running"]
-        .iter()
-        .any(|token| lower.contains(token))
-        || text.chars().any(|ch| SPINNER_CHARS.contains(ch))
-}
-
-fn looks_stuck(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    STUCK_PATTERNS.iter().any(|pattern| lower.contains(pattern))
-}
-
-fn classify_capture(text: Option<&str>, previous_hash: Option<&str>, previous_seen_at: Option<&str>) -> String {
-    let Some(text) = text else {
-        return "dead".to_string();
-    };
-    if looks_stuck(text) {
-        return "stuck".to_string();
-    }
-    if looks_idle(text) {
-        return "idle".to_string();
-    }
-    if looks_working(text) {
-        return "working".to_string();
-    }
-    let current_hash = hash_text(text);
-    if let (Some(previous_hash), Some(previous_seen_at)) = (previous_hash, previous_seen_at) {
-        if current_hash == previous_hash
-            && DateTime::parse_from_rfc3339(previous_seen_at)
-                .ok()
-                .map(|then| Utc::now().signed_duration_since(then.with_timezone(&Utc)).num_seconds() >= REPEAT_STUCK_SECONDS)
-                .unwrap_or(false)
-        {
-            return "stuck".to_string();
-        }
-    }
-    "working".to_string()
 }
 
 fn fact_is_true(ctx: &ReducerContext, fact_key: &Option<String>) -> bool {
@@ -672,140 +548,6 @@ fn decide_actions_internal(ctx: &ReducerContext) {
     queue_index_actions_internal(ctx);
 }
 
-fn biome_request(
-    ctx: &mut ProcedureContext,
-    method: &str,
-    url: String,
-    body: Option<String>,
-) -> Result<spacetimedb::http::Response<Body>, String> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(url)
-        .extension(Timeout::from(TimeDuration::from_micros(
-            (BIOME_HTTP_TIMEOUT_MS * 1_000) as i64,
-        )));
-    if body.is_some() {
-        builder = builder.header("Content-Type", "application/json");
-    }
-    let request = builder
-        .body(body.map(Body::from).unwrap_or_else(Body::empty))
-        .map_err(|err| err.to_string())?;
-    ctx.http.send(request).map_err(|err| err.to_string())
-}
-
-fn biome_screen(
-    ctx: &mut ProcedureContext,
-    base_url: &str,
-    pane_id: &str,
-    lines: usize,
-) -> Result<String, String> {
-    let response = biome_request(ctx, "GET", format!("{base_url}/panes/{pane_id}/screen"), None)?;
-    if !response.status().is_success() {
-        return Err(format!("biome screen failed with {}", response.status()));
-    }
-    let body = response.into_body().into_string().map_err(|err| err.to_string())?;
-    let screen: BiomeScreen = serde_json::from_str(&body).map_err(|err| err.to_string())?;
-    let len = screen.rows.len();
-    let start = len.saturating_sub(lines);
-    Ok(screen.rows[start..].join("\n"))
-}
-
-fn biome_send_text(ctx: &mut ProcedureContext, base_url: &str, pane_id: &str, text: &str) -> Result<(), String> {
-    let payload = serde_json::json!({
-        "data": BASE64_STANDARD.encode(format!("{text}\r").as_bytes())
-    });
-    let response = biome_request(
-        ctx,
-        "POST",
-        format!("{base_url}/panes/{pane_id}/input"),
-        Some(payload.to_string()),
-    )?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("biome input failed with {}", response.status()))
-    }
-}
-
-fn biome_create_pane(ctx: &mut ProcedureContext, base_url: &str, agent_name: &str) -> Result<String, String> {
-    let response = biome_request(
-        ctx,
-        "POST",
-        format!("{base_url}/panes"),
-        Some(
-            serde_json::json!({
-                "name": agent_name,
-                "cols": 220,
-                "rows": 50
-            })
-            .to_string(),
-        ),
-    )?;
-    if !response.status().is_success() {
-        return Err(format!("biome create pane failed with {}", response.status()));
-    }
-    let body = response.into_body().into_string().map_err(|err| err.to_string())?;
-    let created: BiomePaneCreated = serde_json::from_str(&body).map_err(|err| err.to_string())?;
-    Ok(created.id)
-}
-
-fn biome_delete_pane(ctx: &mut ProcedureContext, base_url: &str, pane_id: &str) -> Result<(), String> {
-    let response = biome_request(ctx, "DELETE", format!("{base_url}/panes/{pane_id}"), None)?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("biome delete pane failed with {}", response.status()))
-    }
-}
-
-fn apply_agent_poll(ctx: &ReducerContext, agent_name: &str, capture: Option<String>, previous_hash: Option<String>, previous_seen_at: Option<String>) -> PollSummary {
-    let status = classify_capture(capture.as_deref(), previous_hash.as_deref(), previous_seen_at.as_deref());
-    let content = capture.unwrap_or_default();
-    let content_hash = if content.is_empty() {
-        String::new()
-    } else {
-        hash_text(&content)
-    };
-    let preview = nonempty_lines(&content)
-        .into_iter()
-        .rev()
-        .take(3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut agent = require_agent(ctx, agent_name).expect("agent should still exist during poll apply");
-    agent.status = status.clone();
-    agent.last_seen_at = Some(now(ctx));
-    agent.last_capture_hash = Some(content_hash.clone());
-    agent.last_capture_preview = if preview.is_empty() { None } else { Some(preview.clone()) };
-    ctx.db.agents().name().update(agent);
-    ctx.db.observations().insert(Observation {
-        id: 0,
-        agent_name: agent_name.to_string(),
-        kind: "biome_capture".to_string(),
-        content,
-        content_hash: content_hash.clone(),
-        created_at: now(ctx),
-    });
-    log_event(
-        ctx,
-        Some(agent_name.to_string()),
-        "agent.polled",
-        format!("status={status}"),
-        if preview.is_empty() {
-            None
-        } else {
-            Some(format!("{{\"preview\":{}}}", serde_json_escape(&preview)))
-        },
-    );
-    PollSummary {
-        agent_name: agent_name.to_string(),
-        status,
-        content_hash,
-    }
-}
 
 fn default_agents() -> Vec<AgentInput> {
     vec![
@@ -1646,185 +1388,19 @@ pub fn decide_actions(ctx: &ReducerContext) {
     decide_actions_internal(ctx);
 }
 
-#[spacetimedb::procedure]
-pub fn poll_agents_biome(
-    ctx: &mut ProcedureContext,
-    base_url: Option<String>,
-    lines: Option<u32>,
-) -> Result<Vec<PollSummary>, String> {
-    let base_url = biome_base_url(base_url.as_deref());
-    let lines = lines.map(|value| value as usize).unwrap_or(POLL_SCROLLBACK_LINES);
-    let agents = ctx.try_with_tx(|tx| {
-        Ok::<_, String>(
-            tx.db
-                .agents()
-                .iter()
-                .filter(|agent| agent.status != "paused")
-                .filter_map(|agent| {
-                    agent.biome_pane_id.clone().map(|biome_pane_id| AgentRuntime {
-                        name: agent.name,
-                        biome_pane_id,
-                        last_seen_at: agent.last_seen_at,
-                        last_capture_hash: agent.last_capture_hash,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
-    })?;
-
-    let mut summaries = Vec::with_capacity(agents.len());
-    for agent in agents {
-        let capture = biome_screen(ctx, &base_url, &agent.biome_pane_id, lines).ok();
-        let summary = ctx.try_with_tx(|tx| {
-            Ok::<_, String>(apply_agent_poll(
-                tx,
-                &agent.name,
-                capture.clone(),
-                agent.last_capture_hash.clone(),
-                agent.last_seen_at.clone(),
-            ))
-        })?;
-        summaries.push(summary);
-    }
-    Ok(summaries)
-}
-
-#[spacetimedb::procedure]
-pub fn send_prompt_biome(
-    ctx: &mut ProcedureContext,
-    agent_name: String,
-    text: String,
-    base_url: Option<String>,
-) -> Result<String, String> {
-    let base_url = biome_base_url(base_url.as_deref());
-    let pane_id = ctx.try_with_tx(|tx| {
-        Ok::<_, String>(
-            require_agent(tx, &agent_name)?
-                .biome_pane_id
-                .ok_or_else(|| format!("agent {agent_name} has no biome_pane_id"))?,
-        )
-    })?;
-    biome_send_text(ctx, &base_url, &pane_id, &text)?;
-    Ok("sent".to_string())
-}
-
-#[spacetimedb::procedure]
-pub fn execute_pending_actions_biome(
-    ctx: &mut ProcedureContext,
-    base_url: Option<String>,
-    limit: Option<u32>,
-) -> Result<Vec<PendingActionSummary>, String> {
-    let base_url = biome_base_url(base_url.as_deref());
-    let limit = limit.unwrap_or(10) as usize;
-    let actions = ctx.try_with_tx(|tx| {
-        let mut rows: Vec<_> = tx.db.actions().iter().filter(|row| row.status == "pending").collect();
-        rows.sort_by_key(|row| row.id);
-        Ok::<_, String>(rows.into_iter().take(limit).collect::<Vec<_>>())
-    })?;
-
-    let mut results = Vec::new();
-    for action in actions {
-        let (status, result_text) = match action.action_type.as_str() {
-            "send_prompt" => {
-                let agent_name = action
-                    .agent_name
-                    .clone()
-                    .ok_or_else(|| format!("action {} missing agent_name", action.id))?;
-                let pane_id = ctx.try_with_tx(|tx| {
-                    Ok::<_, String>(
-                        require_agent(tx, &agent_name)?
-                            .biome_pane_id
-                            .ok_or_else(|| format!("agent {agent_name} has no biome_pane_id"))?,
-                    )
-                })?;
-                let payload: serde_json::Value =
-                    serde_json::from_str(&action.payload_json).map_err(|err| err.to_string())?;
-                let text = payload
-                    .get("text")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| format!("action {} missing payload.text", action.id))?;
-                match biome_send_text(ctx, &base_url, &pane_id, text) {
-                    Ok(()) => ("done".to_string(), "sent".to_string()),
-                    Err(err) => ("failed".to_string(), err),
-                }
-            }
-            "restart_agent" => {
-                let agent_name = action
-                    .agent_name
-                    .clone()
-                    .ok_or_else(|| format!("action {} missing agent_name", action.id))?;
-                let (agent, default_task_text) = ctx.try_with_tx(|tx| {
-                    Ok::<_, String>((
-                        require_agent(tx, &agent_name)?,
-                        current_task_prompt(tx, &agent_name),
-                    ))
-                })?;
-                let task = serde_json::from_str::<serde_json::Value>(&action.payload_json)
-                    .ok()
-                    .and_then(|value| value.get("task").and_then(|value| value.as_str()).map(str::to_string))
-                    .unwrap_or(default_task_text);
-                let old_pane = agent.biome_pane_id.clone();
-                if let Some(old_pane) = old_pane.as_deref() {
-                    let _ = biome_delete_pane(ctx, &base_url, old_pane);
-                }
-                match biome_create_pane(ctx, &base_url, &agent_name) {
-                    Ok(new_pane_id) => {
-                        let workdir = agent.workdir.unwrap_or_else(|| "~".to_string());
-                        let boot = format!("cd {workdir} && claude --dangerously-skip-permissions");
-                        let send_result = biome_send_text(ctx, &base_url, &new_pane_id, &boot)
-                            .and_then(|_| biome_send_text(ctx, &base_url, &new_pane_id, &task));
-                        let _ = ctx.try_with_tx(|tx| {
-                            let mut row = require_agent(tx, &agent_name)?;
-                            row.biome_pane_id = Some(new_pane_id.clone());
-                            tx.db.agents().name().update(row);
-                            Ok::<_, String>(())
-                        });
-                        match send_result {
-                            Ok(()) => (
-                                "done".to_string(),
-                                format!("restarted with new biome pane {new_pane_id}"),
-                            ),
-                            Err(err) => ("failed".to_string(), err),
-                        }
-                    }
-                    Err(err) => ("failed".to_string(), err),
-                }
-            }
-            _ => (
-                "failed".to_string(),
-                format!("unsupported biome action type: {}", action.action_type),
-            ),
-        };
-
-        ctx.try_with_tx(|tx| action_complete(tx, action.id, status.clone(), Some(result_text.clone())))?;
-        results.push(PendingActionSummary {
-            action_id: action.id,
-            status,
-            result_text,
-        });
-    }
-
-    Ok(results)
-}
-
-#[spacetimedb::procedure]
-pub fn run_once_biome(
-    ctx: &mut ProcedureContext,
-    base_url: Option<String>,
-    lines: Option<u32>,
-    execute: Option<bool>,
-    limit: Option<u32>,
-) -> Result<Vec<PendingActionSummary>, String> {
-    let _ = poll_agents_biome(ctx, base_url.clone(), lines)?;
-    ctx.try_with_tx(|tx| {
-        decide_actions_internal(tx);
-        Ok::<_, String>(())
-    })?;
-    if execute.unwrap_or(false) {
-        execute_pending_actions_biome(ctx, base_url, limit)
-    } else {
-        Ok(Vec::new())
-    }
+#[spacetimedb::reducer]
+pub fn agent_update_pane_id(ctx: &ReducerContext, agent_name: String, biome_pane_id: String) -> Result<(), String> {
+    let mut agent = require_agent(ctx, &agent_name)?;
+    agent.biome_pane_id = Some(biome_pane_id.clone());
+    ctx.db.agents().name().update(agent);
+    log_event(
+        ctx,
+        Some(agent_name),
+        "agent.pane_updated",
+        format!("biome_pane_id={biome_pane_id}"),
+        None,
+    );
+    Ok(())
 }
 
 fn serde_json_escape(text: &str) -> String {

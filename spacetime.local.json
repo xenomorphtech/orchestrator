@@ -1,4 +1,5 @@
 {
   "server": "local3001",
-  "module-path": "./harness-rs"
+  "module-path": "./harness-rs",
+  "database": "c200b70ed29ce3715b85a86635489a6704cde7365e85fa45dfae21ffa7b87a77"
 }

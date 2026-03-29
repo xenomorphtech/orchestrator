@@ -2,9 +2,26 @@ use std::io::Write;
 use std::process::{Command, ExitCode};
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use reqwest::blocking::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+const DEFAULT_BIOME_TERM_URL: &str = "http://127.0.0.1:3021";
+const REPEAT_STUCK_SECONDS: i64 = 600;
+const SPINNER_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒";
+const STUCK_PATTERNS: [&str; 7] = [
+    "traceback",
+    "exception",
+    "error:",
+    "permission denied",
+    "command not found",
+    "no such file",
+    "segmentation fault",
+];
 
 #[derive(Parser)]
 #[command(name = "harness")]
@@ -14,14 +31,10 @@ struct Cli {
     database: String,
     #[arg(long, default_value = "http://127.0.0.1:3001")]
     server: String,
+    #[arg(long, default_value = DEFAULT_BIOME_TERM_URL)]
+    biome_url: String,
     #[command(subcommand)]
     command: Commands,
-}
-
-struct CliContext {
-    database: String,
-    server: String,
-    client: Client,
 }
 
 #[derive(Subcommand)]
@@ -51,28 +64,30 @@ enum Commands {
     SubGoalSet(SubGoalSetArgs),
     AgentAdd(AgentAddArgs),
     AgentRemove(AgentRemoveArgs),
+    Send(SendArgs),
+}
+
+struct CliContext {
+    database: String,
+    server: String,
+    biome_url: String,
+    client: Client,
 }
 
 #[derive(Args)]
 struct PollBiomeArgs {
-    #[arg(long)]
-    base_url: Option<String>,
     #[arg(long, default_value_t = 20)]
     lines: u32,
 }
 
 #[derive(Args)]
 struct ExecuteBiomeArgs {
-    #[arg(long)]
-    base_url: Option<String>,
     #[arg(long, default_value_t = 10)]
     limit: u32,
 }
 
 #[derive(Args)]
 struct RunOnceBiomeArgs {
-    #[arg(long)]
-    base_url: Option<String>,
     #[arg(long, default_value_t = 20)]
     lines: u32,
     #[arg(long)]
@@ -239,6 +254,518 @@ struct AgentRemoveArgs {
     delete: bool,
 }
 
+#[derive(Args)]
+struct SendArgs {
+    /// Pane name or UUID
+    pane: String,
+    /// Text to send
+    text: String,
+    /// Delay in ms before sending the trailing carriage return (default 150)
+    #[arg(long, default_value_t = 150)]
+    delay: u64,
+}
+
+// ── Biome term HTTP helpers ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct BiomeScreen {
+    rows: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct BiomePaneCreated {
+    id: String,
+}
+
+fn biome_screen(client: &Client, base_url: &str, pane_id: &str, lines: usize) -> Result<String> {
+    let resp = client
+        .get(format!("{base_url}/panes/{pane_id}/screen"))
+        .timeout(std::time::Duration::from_millis(2000))
+        .send()
+        .with_context(|| format!("biome screen request for {pane_id}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("biome screen failed with {}", resp.status()));
+    }
+    let screen: BiomeScreen = resp.json().context("parsing biome screen")?;
+    let len = screen.rows.len();
+    let start = len.saturating_sub(lines);
+    Ok(screen.rows[start..].join("\n"))
+}
+
+fn biome_send_raw(client: &Client, base_url: &str, pane_id: &str, data: &[u8]) -> Result<()> {
+    let payload = json!({ "data": BASE64_STANDARD.encode(data) });
+    let resp = client
+        .post(format!("{base_url}/panes/{pane_id}/input"))
+        .json(&payload)
+        .timeout(std::time::Duration::from_millis(2000))
+        .send()
+        .with_context(|| format!("biome send for {pane_id}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(anyhow!("biome input failed with {}", resp.status()))
+    }
+}
+
+fn biome_send_text(client: &Client, base_url: &str, pane_id: &str, text: &str) -> Result<()> {
+    biome_send_raw(client, base_url, pane_id, format!("{text}\r").as_bytes())
+}
+
+fn biome_send_text_delayed(client: &Client, base_url: &str, pane_id: &str, text: &str, delay_ms: u64) -> Result<()> {
+    biome_send_raw(client, base_url, pane_id, text.as_bytes())?;
+    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    biome_send_raw(client, base_url, pane_id, b"\r")
+}
+
+fn biome_resolve_pane(client: &Client, base_url: &str, name_or_id: &str) -> Result<String> {
+    // If it looks like a UUID, use it directly
+    if name_or_id.contains('-') && name_or_id.len() > 30 {
+        return Ok(name_or_id.to_string());
+    }
+    // Otherwise resolve by name
+    let resp = client
+        .get(format!("{base_url}/panes"))
+        .timeout(std::time::Duration::from_millis(2000))
+        .send()
+        .context("listing panes")?;
+    let panes: Vec<Value> = resp.json().context("parsing panes list")?;
+    for pane in &panes {
+        if pane.get("name").and_then(|v| v.as_str()) == Some(name_or_id) {
+            return pane
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow!("pane {name_or_id} has no id"));
+        }
+    }
+    // Try prefix match on id
+    for pane in &panes {
+        if let Some(id) = pane.get("id").and_then(|v| v.as_str()) {
+            if id.starts_with(name_or_id) {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    Err(anyhow!("no pane matching '{name_or_id}'"))
+}
+
+fn biome_create_pane(client: &Client, base_url: &str, name: &str) -> Result<String> {
+    let resp = client
+        .post(format!("{base_url}/panes"))
+        .json(&json!({"name": name, "cols": 220, "rows": 50}))
+        .timeout(std::time::Duration::from_millis(2000))
+        .send()
+        .context("biome create pane")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("biome create pane failed with {}", resp.status()));
+    }
+    let created: BiomePaneCreated = resp.json().context("parsing pane create response")?;
+    Ok(created.id)
+}
+
+fn biome_delete_pane(client: &Client, base_url: &str, pane_id: &str) -> Result<()> {
+    let resp = client
+        .delete(format!("{base_url}/panes/{pane_id}"))
+        .timeout(std::time::Duration::from_millis(2000))
+        .send()
+        .with_context(|| format!("biome delete pane {pane_id}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(anyhow!("biome delete pane failed with {}", resp.status()))
+    }
+}
+
+// ── Capture classification (ported from lib.rs) ─────────────────────────
+
+fn nonempty_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect()
+}
+
+fn hash_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn looks_idle(text: &str) -> bool {
+    let lines = nonempty_lines(text);
+    let Some(tail) = lines.last() else {
+        return false;
+    };
+    tail.starts_with('❯') || tail == ">" || tail.ends_with(" ❯")
+}
+
+fn looks_working(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["thinking", "analyzing", "processing", "working", "running"]
+        .iter()
+        .any(|token| lower.contains(token))
+        || text.chars().any(|ch| SPINNER_CHARS.contains(ch))
+}
+
+fn looks_stuck(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    STUCK_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn classify_capture(
+    text: Option<&str>,
+    previous_hash: Option<&str>,
+    previous_seen_at: Option<&str>,
+) -> String {
+    let Some(text) = text else {
+        return "dead".to_string();
+    };
+    if looks_stuck(text) {
+        return "stuck".to_string();
+    }
+    if looks_idle(text) {
+        return "idle".to_string();
+    }
+    if looks_working(text) {
+        return "working".to_string();
+    }
+    let current_hash = hash_text(text);
+    if let (Some(previous_hash), Some(previous_seen_at)) = (previous_hash, previous_seen_at) {
+        if current_hash == previous_hash
+            && DateTime::parse_from_rfc3339(previous_seen_at)
+                .ok()
+                .map(|then| {
+                    Utc::now()
+                        .signed_duration_since(then.with_timezone(&Utc))
+                        .num_seconds()
+                        >= REPEAT_STUCK_SECONDS
+                })
+                .unwrap_or(false)
+        {
+            return "stuck".to_string();
+        }
+    }
+    "working".to_string()
+}
+
+// ── SQL query helpers ───────────────────────────────────────────────────
+
+/// Execute SQL and return raw parsed JSON array of result sets.
+fn sql_query(cli: &CliContext, query: &str) -> Result<Vec<Value>> {
+    let url = format!("{}/v1/database/{}/sql", cli.server, cli.database);
+    let resp = cli
+        .client
+        .post(&url)
+        .body(query.to_string())
+        .send()
+        .with_context(|| format!("failed to run SQL: {query}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!("SQL failed (HTTP {status}): {text}"));
+    }
+    let json: Value = serde_json::from_str(&text).context("parsing SQL response")?;
+    Ok(json.as_array().cloned().unwrap_or_default())
+}
+
+/// Extract rows from the first result set as Vec<Vec<Value>> (column-indexed arrays).
+fn sql_rows(cli: &CliContext, query: &str) -> Result<Vec<Vec<Value>>> {
+    let results = sql_query(cli, query)?;
+    let Some(first) = results.first() else {
+        return Ok(Vec::new());
+    };
+    let rows = first
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.as_array().cloned())
+        .collect())
+}
+
+/// Decode a BSATN optional value: [0, x] → Some(x), [1, []] → None, other → as-is.
+fn bsatn_unwrap(val: &Value) -> Option<String> {
+    match val {
+        Value::Null => None,
+        Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        Value::Array(arr) if arr.len() == 2 => match arr[0].as_u64() {
+            Some(0) => {
+                let inner = &arr[1];
+                match inner {
+                    Value::String(s) => Some(s.clone()),
+                    _ => Some(inner.to_string()),
+                }
+            }
+            Some(1) => None,
+            _ => Some(val.to_string()),
+        },
+        _ => Some(val.to_string()),
+    }
+}
+
+fn bsatn_unwrap_or(val: &Value, default: &str) -> String {
+    bsatn_unwrap(val).unwrap_or_else(|| default.to_string())
+}
+
+// ── Biome-aware CLI commands ────────────────────────────────────────────
+
+fn cmd_poll_biome(cli: &CliContext, lines: u32) -> Result<()> {
+    let lines = lines as usize;
+    // Fetch agents with biome pane IDs that aren't paused
+    let rows = sql_rows(
+        cli,
+        "SELECT name, biome_pane_id, last_seen_at, last_capture_hash FROM agents",
+    )?;
+
+    let mut results: Vec<Value> = Vec::new();
+
+    for row in &rows {
+        let name = bsatn_unwrap_or(&row[0], "");
+        let pane_id = match bsatn_unwrap(&row[1]) {
+            Some(id) if !id.is_empty() => id,
+            _ => continue,
+        };
+        let last_seen_at = bsatn_unwrap(&row[2]);
+        let last_capture_hash = bsatn_unwrap(&row[3]);
+
+        // Read screen from biome_term
+        let capture = biome_screen(&cli.client, &cli.biome_url, &pane_id, lines).ok();
+
+        // Classify
+        let status = classify_capture(
+            capture.as_deref(),
+            last_capture_hash.as_deref(),
+            last_seen_at.as_deref(),
+        );
+
+        let content = capture.unwrap_or_default();
+        let content_hash = if content.is_empty() {
+            String::new()
+        } else {
+            hash_text(&content)
+        };
+        let preview_lines: Vec<_> = nonempty_lines(&content);
+        let preview: String = preview_lines
+            .iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Record poll result in SpacetimeDB via agent_poll_record reducer
+        call_reducer_silent(
+            cli,
+            "agent_poll_record",
+            Some(vec![json!({
+                "agent_name": name,
+                "status": status,
+                "last_capture_hash": if content_hash.is_empty() { none_json() } else { some_json_string(content_hash.clone()) },
+                "last_capture_preview": if preview.is_empty() { none_json() } else { some_json_string(preview.clone()) }
+            })]),
+        )?;
+
+        // Also record observation
+        if !content.is_empty() {
+            let _ = call_reducer_silent(
+                cli,
+                "observation_add",
+                Some(vec![
+                    Value::String(name.clone()),
+                    Value::String("biome_capture".to_string()),
+                    Value::String(content),
+                    Value::String(content_hash.clone()),
+                ]),
+            );
+        }
+
+        results.push(json!({
+            "agent": name,
+            "status": status,
+            "content_hash": content_hash,
+            "preview": preview,
+        }));
+    }
+
+    println!("{}", serde_json::to_string_pretty(&results)?);
+    Ok(())
+}
+
+fn cmd_execute_biome(cli: &CliContext, limit: u32) -> Result<()> {
+    let limit = limit as usize;
+    // Fetch pending actions
+    let rows = sql_rows(
+        cli,
+        "SELECT id, agent_name, action_type, payload_json, reason FROM actions WHERE status = 'pending'",
+    )?;
+
+    let mut results: Vec<Value> = Vec::new();
+
+    for row in rows.into_iter().take(limit) {
+        let action_id = row[0].as_u64().unwrap_or(0);
+        let agent_name = bsatn_unwrap(&row[1]);
+        let action_type = bsatn_unwrap_or(&row[2], "");
+        let payload_json_str = bsatn_unwrap_or(&row[3], "{}");
+
+        let (status, result_text) = match action_type.as_str() {
+            "send_prompt" | "restart_agent" => {
+                match agent_name.as_deref().filter(|s| !s.is_empty()) {
+                    None => ("failed".to_string(), format!("action {action_id} missing agent_name")),
+                    Some(agent_name) if action_type == "send_prompt" => {
+                        match get_agent_pane_id(cli, agent_name)? {
+                            None => ("failed".to_string(), format!("agent {agent_name} has no biome_pane_id")),
+                            Some(pane_id) => {
+                                let payload: Value = serde_json::from_str(&payload_json_str)
+                                    .unwrap_or_else(|_| json!({}));
+                                let text = payload
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                match biome_send_text(&cli.client, &cli.biome_url, &pane_id, text) {
+                                    Ok(()) => ("done".to_string(), "sent".to_string()),
+                                    Err(err) => ("failed".to_string(), format!("{err:#}")),
+                                }
+                            }
+                        }
+                    }
+                    Some(agent_name) => {
+                        execute_restart_agent(cli, agent_name, &payload_json_str)
+                    }
+                }
+            }
+            _ => (
+                "failed".to_string(),
+                format!("unsupported action type: {action_type}"),
+            ),
+        };
+
+        // Record result via action_complete reducer
+        call_reducer_silent(
+            cli,
+            "action_complete",
+            Some(vec![
+                json!(action_id),
+                Value::String(status.clone()),
+                some_json_string(result_text.clone()),
+            ]),
+        )?;
+
+        results.push(json!({
+            "action_id": action_id,
+            "status": status,
+            "result": result_text,
+        }));
+    }
+
+    println!("{}", serde_json::to_string_pretty(&results)?);
+    Ok(())
+}
+
+fn cmd_run_once_biome(cli: &CliContext, lines: u32, execute: bool, limit: u32) -> Result<()> {
+    cmd_poll_biome(cli, lines)?;
+    call_reducer_silent(cli, "decide_actions", None)?;
+    if execute {
+        cmd_execute_biome(cli, limit)?;
+    }
+    Ok(())
+}
+
+fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &str) -> (String, String) {
+    // Get agent's workdir and current pane
+    let agent_info = match sql_rows(
+        cli,
+        &format!(
+            "SELECT biome_pane_id, workdir, default_task FROM agents WHERE name = '{}'",
+            agent_name.replace('\'', "''")
+        ),
+    ) {
+        Ok(rows) if !rows.is_empty() => rows.into_iter().next().unwrap(),
+        Ok(_) => return ("failed".to_string(), format!("agent {agent_name} not found")),
+        Err(err) => return ("failed".to_string(), format!("{err:#}")),
+    };
+
+    let old_pane_id = bsatn_unwrap(&agent_info[0]);
+    let workdir = bsatn_unwrap(&agent_info[1]).unwrap_or_else(|| "~".to_string());
+    let default_task = bsatn_unwrap_or(&agent_info[2], "Continue the current task.");
+
+    // Extract task from payload, fall back to default_task
+    let task = serde_json::from_str::<Value>(payload_json_str)
+        .ok()
+        .and_then(|v| v.get("task").and_then(|t| t.as_str()).map(str::to_string))
+        .unwrap_or(default_task);
+
+    // Delete old pane
+    if let Some(old_pane) = old_pane_id.as_deref() {
+        let _ = biome_delete_pane(&cli.client, &cli.biome_url, old_pane);
+    }
+
+    // Create new pane
+    let new_pane_id = match biome_create_pane(&cli.client, &cli.biome_url, agent_name) {
+        Ok(id) => id,
+        Err(err) => return ("failed".to_string(), format!("{err:#}")),
+    };
+
+    // Boot Claude
+    let boot = format!("cd {workdir} && claude --dangerously-skip-permissions");
+    if let Err(err) = biome_send_text(&cli.client, &cli.biome_url, &new_pane_id, &boot) {
+        return ("failed".to_string(), format!("boot send failed: {err:#}"));
+    }
+
+    // Send task
+    if let Err(err) = biome_send_text(&cli.client, &cli.biome_url, &new_pane_id, &task) {
+        return ("failed".to_string(), format!("task send failed: {err:#}"));
+    }
+
+    // Update agent's pane ID in DB
+    let _ = call_reducer_silent(
+        cli,
+        "agent_update_pane_id",
+        Some(vec![
+            Value::String(agent_name.to_string()),
+            Value::String(new_pane_id.clone()),
+        ]),
+    );
+
+    (
+        "done".to_string(),
+        format!("restarted with new biome pane {new_pane_id}"),
+    )
+}
+
+fn get_agent_pane_id(cli: &CliContext, agent_name: &str) -> Result<Option<String>> {
+    let rows = sql_rows(
+        cli,
+        &format!(
+            "SELECT biome_pane_id FROM agents WHERE name = '{}'",
+            agent_name.replace('\'', "''")
+        ),
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|v| bsatn_unwrap(v))
+        .filter(|s| !s.is_empty()))
+}
+
+// ── Core CLI infrastructure ─────────────────────────────────────────────
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -251,9 +778,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let biome_url = cli.biome_url.trim_end_matches('/').to_string();
     let context = CliContext {
         database: cli.database,
         server: cli.server,
+        biome_url,
         client: Client::new(),
     };
     match cli.command {
@@ -275,32 +804,11 @@ fn run() -> Result<()> {
         }
         Commands::DecideActions => call_reducer(&context, "decide_actions", None),
         Commands::ResolveActiveSubGoals => call_reducer(&context, "resolve_active_sub_goals", None),
-        Commands::PollBiome(args) => call_procedure(
-            &context,
-            "poll_agents_biome",
-            vec![
-                optional_json_string(args.base_url),
-                Value::Number(args.lines.into()),
-            ],
-        ),
-        Commands::ExecuteBiome(args) => call_procedure(
-            &context,
-            "execute_pending_actions_biome",
-            vec![
-                optional_json_string(args.base_url),
-                Value::Number(args.limit.into()),
-            ],
-        ),
-        Commands::RunOnceBiome(args) => call_procedure(
-            &context,
-            "run_once_biome",
-            vec![
-                optional_json_string(args.base_url),
-                Value::Number(args.lines.into()),
-                Value::Bool(args.execute),
-                Value::Number(args.limit.into()),
-            ],
-        ),
+        Commands::PollBiome(args) => cmd_poll_biome(&context, args.lines),
+        Commands::ExecuteBiome(args) => cmd_execute_biome(&context, args.limit),
+        Commands::RunOnceBiome(args) => {
+            cmd_run_once_biome(&context, args.lines, args.execute, args.limit)
+        }
         Commands::QueuePrompt(args) => call_reducer(
             &context,
             "queue_prompt",
@@ -312,7 +820,7 @@ fn run() -> Result<()> {
             Some(vec![json!({
                 "fact_key": args.key,
                 "value_json": args.value,
-                "confidence": json!({"some": args.confidence}),
+                "confidence": some_json_f64(args.confidence),
                 "source_type": some_json_string(args.source_type),
                 "source_ref": optional_json_string(args.source_ref),
                 "metadata_json": some_json_string("{}".to_string())
@@ -475,18 +983,24 @@ fn run() -> Result<()> {
             "agent_remove",
             Some(vec![Value::String(args.name), Value::Bool(args.delete)]),
         ),
+        Commands::Send(args) => {
+            let pane_id = biome_resolve_pane(&context.client, &context.biome_url, &args.pane)?;
+            biome_send_text_delayed(&context.client, &context.biome_url, &pane_id, &args.text, args.delay)?;
+            println!("sent to {pane_id}");
+            Ok(())
+        }
     }
 }
 
 fn call_reducer(cli: &CliContext, reducer: &str, args: Option<Vec<Value>>) -> Result<()> {
-    run_call(cli, reducer, args.unwrap_or_default())
+    run_call(cli, reducer, args.unwrap_or_default(), true)
 }
 
-fn call_procedure(cli: &CliContext, procedure: &str, args: Vec<Value>) -> Result<()> {
-    run_call(cli, procedure, args)
+fn call_reducer_silent(cli: &CliContext, reducer: &str, args: Option<Vec<Value>>) -> Result<()> {
+    run_call(cli, reducer, args.unwrap_or_default(), false)
 }
 
-fn run_call(cli: &CliContext, name: &str, args: Vec<Value>) -> Result<()> {
+fn run_call(cli: &CliContext, name: &str, args: Vec<Value>, print: bool) -> Result<()> {
     let url = format!("{}/v1/database/{}/call/{}", cli.server, cli.database, name);
     let body = Value::Array(args).to_string();
     let resp = cli
@@ -504,7 +1018,7 @@ fn run_call(cli: &CliContext, name: &str, args: Vec<Value>) -> Result<()> {
         return Err(anyhow!("call {name} failed (HTTP {status}): {text}"));
     }
 
-    if !text.is_empty() {
+    if print && !text.is_empty() {
         if let Ok(json) = serde_json::from_str::<Value>(&text) {
             println!("{}", serde_json::to_string_pretty(&json)?);
         } else {
@@ -643,6 +1157,12 @@ fn format_cell(val: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
+        // BSATN sum-type: [0, value] = Some(value), [1, []] = None
+        Value::Array(arr) if arr.len() == 2 => match arr[0].as_u64() {
+            Some(0) => format_cell(&arr[1]),
+            Some(1) => "(none)".to_string(),
+            _ => val.to_string(),
+        },
         _ => val.to_string(),
     }
 }
@@ -681,6 +1201,10 @@ fn some_json_u32(value: u32) -> Value {
     json!({ "some": value })
 }
 
+fn some_json_f64(value: f64) -> Value {
+    json!({ "some": value })
+}
+
 fn none_json() -> Value {
-    json!({ "none": {} })
+    json!({ "none": [] })
 }
