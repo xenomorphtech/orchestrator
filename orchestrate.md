@@ -5,6 +5,7 @@ Monitor and drive Claude or Codex agents running in biome_term panes, working to
 **Notes:**
 - When spawning Codex agents, always use `--dangerously-bypass-approvals-and-sandbox` (not `--full-auto` or `--approval-mode`).
 - Codex agents often need to be nudged to continue — if idle, send a follow-up prompt. They tend to stop and wait more than Claude agents.
+- Codex always shows a `›` prompt at the bottom of the screen even while working — do NOT use the prompt character alone to detect idle state. Always check for `Working (` in the rows above the prompt first, and check `idle_seconds` from the panes API.
 
 ## Config
 
@@ -34,11 +35,11 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
    curl -s http://localhost:3021/panes/<id>/screen
    ```
 
-   Classify from the `rows[]` array:
+   Classify from the `rows[]` array and pane metadata:
    - **dead**: pane has `terminated: true`, or HTTP 404
-   - **stuck**: last 20 rows contain error patterns (traceback, exception, "error:", permission denied, segmentation fault, command not found)
-   - **idle**: last non-empty row starts with or ends with prompt char (`>`)
-   - **working**: spinner characters visible or keywords (thinking, analyzing, processing, working, running)
+   - **working**: `idle_seconds == 0` from the panes API, OR the string "Working (" appears anywhere in the last 20 rows (Codex working indicator), OR spinner characters / keywords (thinking, analyzing, processing, Hatching, running) appear in the last 20 rows
+   - **stuck**: last 20 rows contain error patterns (traceback, exception, "error:", permission denied, segmentation fault, command not found) AND agent is NOT also showing working indicators
+   - **idle**: `idle_seconds > 0` AND last non-empty row starts with or ends with prompt char (`❯` or `›`) AND no "Working" keyword in last 20 rows
    - **stuck (stale)**: no output change for 10+ minutes (compare to previous cycle)
 
    **Auto-continue idle agents**: When an idle agent's last output describes a clear next step or task (e.g. "The next useful move is to...", "Next step is to...", "I'm going to..."), send a short continuation nudge like `Continue.` or `Continue. <one-line summary of their stated next step>` — do NOT re-explain what they already said. Only add cross-pollination context if another agent produced a finding that changes their plan. If the agent's stated next step was already superseded by another agent's work (e.g. they say "search donor logs" but another agent already did that and found nothing), redirect them instead.
