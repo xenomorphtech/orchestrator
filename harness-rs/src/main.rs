@@ -65,6 +65,10 @@ enum Commands {
     AgentAdd(AgentAddArgs),
     AgentRemove(AgentRemoveArgs),
     Send(SendArgs),
+    /// Update a sub-goal's completion report and optionally set status/facts
+    Checkpoint(CheckpointArgs),
+    /// Set supervisor heartbeat facts for a domain
+    Heartbeat(HeartbeatArgs),
 }
 
 struct CliContext {
@@ -78,12 +82,18 @@ struct CliContext {
 struct PollBiomeArgs {
     #[arg(long, default_value_t = 20)]
     lines: u32,
+    /// Only poll agents whose metadata_json.domain matches
+    #[arg(long)]
+    domain: Option<String>,
 }
 
 #[derive(Args)]
 struct ExecuteBiomeArgs {
     #[arg(long, default_value_t = 10)]
     limit: u32,
+    /// Only execute actions for agents whose metadata_json.domain matches
+    #[arg(long)]
+    domain: Option<String>,
 }
 
 #[derive(Args)]
@@ -94,6 +104,9 @@ struct RunOnceBiomeArgs {
     execute: bool,
     #[arg(long, default_value_t = 10)]
     limit: u32,
+    /// Scope poll/decide/execute to agents whose metadata_json.domain matches
+    #[arg(long)]
+    domain: Option<String>,
 }
 
 #[derive(Args)]
@@ -112,6 +125,9 @@ struct FactSetArgs {
     source_type: String,
     #[arg(long)]
     source_ref: Option<String>,
+    /// JSON metadata (e.g. '{"domain":"nmss"}')
+    #[arg(long)]
+    metadata: Option<String>,
 }
 
 #[derive(Args)]
@@ -128,6 +144,9 @@ struct GoalAddArgs {
     depends_on_goal_key: Option<String>,
     #[arg(long)]
     success_fact_key: Option<String>,
+    /// JSON metadata (e.g. '{"domain":"nmss"}')
+    #[arg(long)]
+    metadata: Option<String>,
 }
 
 #[derive(Args)]
@@ -186,6 +205,9 @@ struct SubGoalAddArgs {
     instruction_text: Option<String>,
     #[arg(long)]
     stuck_guidance_text: Option<String>,
+    /// JSON metadata (e.g. '{"domain":"nmss","restart_policy":"one_for_one"}')
+    #[arg(long)]
+    metadata: Option<String>,
 }
 
 #[derive(Args)]
@@ -245,6 +267,9 @@ struct AgentAddArgs {
     default_task: Option<String>,
     #[arg(long)]
     tmux_target: Option<String>,
+    /// JSON metadata (e.g. '{"domain":"nmss","backend":"claude","role":"worker"}')
+    #[arg(long)]
+    metadata: Option<String>,
 }
 
 #[derive(Args)]
@@ -263,6 +288,30 @@ struct SendArgs {
     /// Delay in ms before sending the trailing carriage return (default 150)
     #[arg(long, default_value_t = 150)]
     delay: u64,
+}
+
+#[derive(Args)]
+struct CheckpointArgs {
+    /// Sub-goal key to checkpoint
+    sub_goal_key: String,
+    /// Completion report text
+    #[arg(long)]
+    report: String,
+    /// Optionally set status (e.g. "done", "blocked", "failed")
+    #[arg(long)]
+    status: Option<String>,
+    /// Set facts as key=value pairs (repeatable)
+    #[arg(long = "fact", value_name = "KEY=VALUE")]
+    facts: Vec<String>,
+}
+
+#[derive(Args)]
+struct HeartbeatArgs {
+    /// Domain name (sets <domain>.supervisor.status and .last_heartbeat)
+    domain: String,
+    /// Optional status override (default: "alive")
+    #[arg(long, default_value = "alive")]
+    status: String,
 }
 
 // ── Biome term HTTP helpers ─────────────────────────────────────────────
@@ -402,12 +451,15 @@ fn looks_idle(text: &str) -> bool {
     let Some(tail) = lines.last() else {
         return false;
     };
-    tail.starts_with('❯') || tail == ">" || tail.ends_with(" ❯")
+    tail.starts_with('❯') || tail.starts_with('›') || tail == ">" || tail.ends_with(" ❯")
 }
 
 fn looks_working(text: &str) -> bool {
+    // Check entire captured text (all lines) for working indicators.
+    // Codex shows "Working (Xm Xs ...)" several lines above the bottom prompt.
+    // Claude Code shows "Thinking" similarly.
     let lower = text.to_ascii_lowercase();
-    ["thinking", "analyzing", "processing", "working", "running"]
+    ["thinking", "analyzing", "processing", "working (", "working", "running"]
         .iter()
         .any(|token| lower.contains(token))
         || text.chars().any(|ch| SPINNER_CHARS.contains(ch))
@@ -429,11 +481,13 @@ fn classify_capture(
     if looks_stuck(text) {
         return "stuck".to_string();
     }
-    if looks_idle(text) {
-        return "idle".to_string();
-    }
+    // Check working BEFORE idle: Codex agents show a › prompt at the bottom
+    // even while actively working, with "Working (...)" a few lines above.
     if looks_working(text) {
         return "working".to_string();
+    }
+    if looks_idle(text) {
+        return "idle".to_string();
     }
     let current_hash = hash_text(text);
     if let (Some(previous_hash), Some(previous_seen_at)) = (previous_hash, previous_seen_at) {
@@ -521,14 +575,39 @@ fn bsatn_unwrap_or(val: &Value, default: &str) -> String {
     bsatn_unwrap(val).unwrap_or_else(|| default.to_string())
 }
 
-// ── Biome-aware CLI commands ────────────────────────────────────────────
+// ── Domain filtering helper ────────────────────────────────────────────
 
-fn cmd_poll_biome(cli: &CliContext, lines: u32) -> Result<()> {
-    let lines = lines as usize;
-    // Fetch agents with biome pane IDs that aren't paused
+fn metadata_matches_domain(metadata_json: &str, domain: &str) -> bool {
+    serde_json::from_str::<Value>(metadata_json)
+        .ok()
+        .and_then(|v| v.get("domain").and_then(|d| d.as_str()).map(|d| d == domain))
+        .unwrap_or(false)
+}
+
+/// Look up an agent's metadata_json by name.
+fn get_agent_metadata(cli: &CliContext, agent_name: &str) -> Result<String> {
     let rows = sql_rows(
         cli,
-        "SELECT name, biome_pane_id, last_seen_at, last_capture_hash FROM agents",
+        &format!(
+            "SELECT metadata_json FROM agents WHERE name = '{}'",
+            agent_name.replace('\'', "''")
+        ),
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .map(|v| bsatn_unwrap_or(v, "{}"))
+        .unwrap_or_else(|| "{}".to_string()))
+}
+
+// ── Biome-aware CLI commands ────────────────────────────────────────────
+
+fn cmd_poll_biome(cli: &CliContext, lines: u32, domain: Option<&str>) -> Result<()> {
+    let lines = lines as usize;
+    // Fetch agents with biome pane IDs
+    let rows = sql_rows(
+        cli,
+        "SELECT name, biome_pane_id, last_seen_at, last_capture_hash, metadata_json FROM agents",
     )?;
 
     let mut results: Vec<Value> = Vec::new();
@@ -541,6 +620,14 @@ fn cmd_poll_biome(cli: &CliContext, lines: u32) -> Result<()> {
         };
         let last_seen_at = bsatn_unwrap(&row[2]);
         let last_capture_hash = bsatn_unwrap(&row[3]);
+        let metadata = bsatn_unwrap_or(&row[4], "{}");
+
+        // Domain filter: skip agents not in the requested domain
+        if let Some(domain) = domain {
+            if !metadata_matches_domain(&metadata, domain) {
+                continue;
+            }
+        }
 
         // Read screen from biome_term
         let capture = biome_screen(&cli.client, &cli.biome_url, &pane_id, lines).ok();
@@ -608,7 +695,7 @@ fn cmd_poll_biome(cli: &CliContext, lines: u32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_execute_biome(cli: &CliContext, limit: u32) -> Result<()> {
+fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>) -> Result<()> {
     let limit = limit as usize;
     // Fetch pending actions
     let rows = sql_rows(
@@ -623,6 +710,16 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32) -> Result<()> {
         let agent_name = bsatn_unwrap(&row[1]);
         let action_type = bsatn_unwrap_or(&row[2], "");
         let payload_json_str = bsatn_unwrap_or(&row[3], "{}");
+
+        // Domain filter: skip actions for agents outside the requested domain
+        if let Some(domain) = domain {
+            if let Some(ref aname) = agent_name {
+                let meta = get_agent_metadata(cli, aname).unwrap_or_else(|_| "{}".to_string());
+                if !metadata_matches_domain(&meta, domain) {
+                    continue;
+                }
+            }
+        }
 
         let (status, result_text) = match action_type.as_str() {
             "send_prompt" | "restart_agent" => {
@@ -649,6 +746,9 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32) -> Result<()> {
                         execute_restart_agent(cli, agent_name, &payload_json_str)
                     }
                 }
+            }
+            "spawn_agent" => {
+                execute_spawn_agent(cli, &payload_json_str)
             }
             _ => (
                 "failed".to_string(),
@@ -678,21 +778,35 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run_once_biome(cli: &CliContext, lines: u32, execute: bool, limit: u32) -> Result<()> {
-    cmd_poll_biome(cli, lines)?;
-    call_reducer_silent(cli, "decide_actions", None)?;
+fn cmd_run_once_biome(cli: &CliContext, lines: u32, execute: bool, limit: u32, domain: Option<&str>) -> Result<()> {
+    cmd_poll_biome(cli, lines, domain)?;
+    match domain {
+        Some(d) => call_reducer_silent(
+            cli,
+            "decide_actions_for_domain",
+            Some(vec![Value::String(d.to_string())]),
+        )?,
+        None => call_reducer_silent(cli, "decide_actions", None)?,
+    }
     if execute {
-        cmd_execute_biome(cli, limit)?;
+        cmd_execute_biome(cli, limit, domain)?;
     }
     Ok(())
 }
 
+fn boot_command_for_backend(backend: &str, workdir: &str) -> String {
+    match backend {
+        "codex" => format!("cd {workdir} && codex --full-auto"),
+        "claude" | _ => format!("cd {workdir} && claude --dangerously-skip-permissions"),
+    }
+}
+
 fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &str) -> (String, String) {
-    // Get agent's workdir and current pane
+    // Get agent's workdir, current pane, and metadata
     let agent_info = match sql_rows(
         cli,
         &format!(
-            "SELECT biome_pane_id, workdir, default_task FROM agents WHERE name = '{}'",
+            "SELECT biome_pane_id, workdir, default_task, metadata_json FROM agents WHERE name = '{}'",
             agent_name.replace('\'', "''")
         ),
     ) {
@@ -704,6 +818,13 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
     let old_pane_id = bsatn_unwrap(&agent_info[0]);
     let workdir = bsatn_unwrap(&agent_info[1]).unwrap_or_else(|| "~".to_string());
     let default_task = bsatn_unwrap_or(&agent_info[2], "Continue the current task.");
+    let metadata_str = bsatn_unwrap_or(&agent_info[3], "{}");
+
+    // Read backend from metadata, default to "claude"
+    let backend = serde_json::from_str::<Value>(&metadata_str)
+        .ok()
+        .and_then(|v| v.get("backend").and_then(|b| b.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "claude".to_string());
 
     // Extract task from payload, fall back to default_task
     let task = serde_json::from_str::<Value>(payload_json_str)
@@ -722,8 +843,8 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
         Err(err) => return ("failed".to_string(), format!("{err:#}")),
     };
 
-    // Boot Claude
-    let boot = format!("cd {workdir} && claude --dangerously-skip-permissions");
+    // Boot using backend from metadata
+    let boot = boot_command_for_backend(&backend, &workdir);
     if let Err(err) = biome_send_text(&cli.client, &cli.biome_url, &new_pane_id, &boot) {
         return ("failed".to_string(), format!("boot send failed: {err:#}"));
     }
@@ -745,7 +866,78 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
 
     (
         "done".to_string(),
-        format!("restarted with new biome pane {new_pane_id}"),
+        format!("restarted ({backend}) with new biome pane {new_pane_id}"),
+    )
+}
+
+fn execute_spawn_agent(cli: &CliContext, payload_json_str: &str) -> (String, String) {
+    let payload: Value = match serde_json::from_str(payload_json_str) {
+        Ok(v) => v,
+        Err(err) => return ("failed".to_string(), format!("bad spawn payload: {err}")),
+    };
+
+    let name = match payload.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return ("failed".to_string(), "spawn_agent payload missing 'name'".to_string()),
+    };
+    let workdir = payload
+        .get("workdir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("~")
+        .to_string();
+    let default_task = payload
+        .get("default_task")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let backend = payload
+        .get("backend")
+        .and_then(|v| v.as_str())
+        .unwrap_or("claude");
+    let metadata = payload
+        .get("metadata")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    let task = payload
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Continue the current task.");
+
+    // Create new biome pane
+    let pane_id = match biome_create_pane(&cli.client, &cli.biome_url, &name) {
+        Ok(id) => id,
+        Err(err) => return ("failed".to_string(), format!("pane create failed: {err:#}")),
+    };
+
+    // Register agent in DB
+    if let Err(err) = call_reducer_silent(
+        cli,
+        "agent_add",
+        Some(vec![
+            Value::String(name.clone()),
+            Value::String(pane_id.clone()),
+            optional_json_string(Some(workdir.clone())),
+            optional_json_string(default_task),
+            optional_json_string(None), // tmux_target
+            optional_json_string(Some(metadata)),
+        ]),
+    ) {
+        return ("failed".to_string(), format!("agent_add failed: {err:#}"));
+    }
+
+    // Boot backend
+    let boot = boot_command_for_backend(backend, &workdir);
+    if let Err(err) = biome_send_text(&cli.client, &cli.biome_url, &pane_id, &boot) {
+        return ("failed".to_string(), format!("boot send failed: {err:#}"));
+    }
+
+    // Send initial task
+    if let Err(err) = biome_send_text(&cli.client, &cli.biome_url, &pane_id, task) {
+        return ("failed".to_string(), format!("task send failed: {err:#}"));
+    }
+
+    (
+        "done".to_string(),
+        format!("spawned agent {name} ({backend}) in pane {pane_id}"),
     )
 }
 
@@ -804,10 +996,10 @@ fn run() -> Result<()> {
         }
         Commands::DecideActions => call_reducer(&context, "decide_actions", None),
         Commands::ResolveActiveSubGoals => call_reducer(&context, "resolve_active_sub_goals", None),
-        Commands::PollBiome(args) => cmd_poll_biome(&context, args.lines),
-        Commands::ExecuteBiome(args) => cmd_execute_biome(&context, args.limit),
+        Commands::PollBiome(args) => cmd_poll_biome(&context, args.lines, args.domain.as_deref()),
+        Commands::ExecuteBiome(args) => cmd_execute_biome(&context, args.limit, args.domain.as_deref()),
         Commands::RunOnceBiome(args) => {
-            cmd_run_once_biome(&context, args.lines, args.execute, args.limit)
+            cmd_run_once_biome(&context, args.lines, args.execute, args.limit, args.domain.as_deref())
         }
         Commands::QueuePrompt(args) => call_reducer(
             &context,
@@ -823,7 +1015,7 @@ fn run() -> Result<()> {
                 "confidence": some_json_f64(args.confidence),
                 "source_type": some_json_string(args.source_type),
                 "source_ref": optional_json_string(args.source_ref),
-                "metadata_json": some_json_string("{}".to_string())
+                "metadata_json": some_json_string(args.metadata.unwrap_or_else(|| "{}".to_string()))
             })]),
         ),
         Commands::GoalAdd(args) => call_reducer(
@@ -837,7 +1029,7 @@ fn run() -> Result<()> {
                 "priority": some_json_u32(args.priority),
                 "depends_on_goal_key": optional_json_string(args.depends_on_goal_key),
                 "success_fact_key": optional_json_string(args.success_fact_key),
-                "metadata_json": some_json_string("{}".to_string()),
+                "metadata_json": some_json_string(args.metadata.unwrap_or_else(|| "{}".to_string())),
                 "completion_report": null
             })]),
         ),
@@ -904,7 +1096,7 @@ fn run() -> Result<()> {
                 "success_fact_key": optional_json_string(args.success_fact_key),
                 "instruction_text": optional_json_string(args.instruction_text),
                 "stuck_guidance_text": optional_json_string(args.stuck_guidance_text),
-                "metadata_json": some_json_string("{}".to_string()),
+                "metadata_json": some_json_string(args.metadata.unwrap_or_else(|| "{}".to_string())),
                 "completion_report": null
             })]),
         ),
@@ -976,6 +1168,7 @@ fn run() -> Result<()> {
                 optional_json_string(args.workdir),
                 optional_json_string(args.default_task),
                 optional_json_string(args.tmux_target),
+                optional_json_string(args.metadata),
             ]),
         ),
         Commands::AgentRemove(args) => call_reducer(
@@ -987,6 +1180,83 @@ fn run() -> Result<()> {
             let pane_id = biome_resolve_pane(&context.client, &context.biome_url, &args.pane)?;
             biome_send_text_delayed(&context.client, &context.biome_url, &pane_id, &args.text, args.delay)?;
             println!("sent to {pane_id}");
+            Ok(())
+        }
+        Commands::Checkpoint(args) => {
+            // Update sub-goal with completion_report and optional status
+            let patch = json!({
+                "goal_key": none_json(),
+                "owner_agent": none_json(),
+                "title": none_json(),
+                "detail": none_json(),
+                "status": optional_json_string(args.status),
+                "priority": none_json(),
+                "depends_on_sub_goal_key": none_json(),
+                "success_fact_key": none_json(),
+                "instruction_text": none_json(),
+                "stuck_guidance_text": none_json(),
+                "metadata_json": none_json(),
+                "blocked_by": none_json(),
+                "completion_report": some_json_string(args.report),
+                "clear_depends": false,
+                "clear_success_fact": false,
+                "clear_instruction": false,
+                "clear_stuck_guidance": false,
+                "clear_blocked_by": false
+            });
+            call_reducer(
+                &context,
+                "sub_goal_update",
+                Some(vec![Value::String(args.sub_goal_key), patch]),
+            )?;
+            // Set any accompanying facts
+            for fact_str in &args.facts {
+                if let Some((key, value)) = fact_str.split_once('=') {
+                    call_reducer_silent(
+                        &context,
+                        "fact_set",
+                        Some(vec![json!({
+                            "fact_key": key,
+                            "value_json": value,
+                            "confidence": some_json_f64(1.0),
+                            "source_type": some_json_string("checkpoint".to_string()),
+                            "source_ref": none_json(),
+                            "metadata_json": some_json_string("{}".to_string())
+                        })]),
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        Commands::Heartbeat(args) => {
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            // Set <domain>.supervisor.status
+            call_reducer_silent(
+                &context,
+                "fact_set",
+                Some(vec![json!({
+                    "fact_key": format!("{}.supervisor.status", args.domain),
+                    "value_json": format!("\"{}\"", args.status),
+                    "confidence": some_json_f64(1.0),
+                    "source_type": some_json_string("heartbeat".to_string()),
+                    "source_ref": some_json_string(format!("domain:{}", args.domain)),
+                    "metadata_json": some_json_string(format!("{{\"domain\":\"{}\"}}", args.domain))
+                })]),
+            )?;
+            // Set <domain>.supervisor.last_heartbeat
+            call_reducer_silent(
+                &context,
+                "fact_set",
+                Some(vec![json!({
+                    "fact_key": format!("{}.supervisor.last_heartbeat", args.domain),
+                    "value_json": format!("\"{}\"", timestamp),
+                    "confidence": some_json_f64(1.0),
+                    "source_type": some_json_string("heartbeat".to_string()),
+                    "source_ref": some_json_string(format!("domain:{}", args.domain)),
+                    "metadata_json": some_json_string(format!("{{\"domain\":\"{}\"}}", args.domain))
+                })]),
+            )?;
+            println!("heartbeat: {}.supervisor.status={}, last_heartbeat={}", args.domain, args.status, timestamp);
             Ok(())
         }
     }

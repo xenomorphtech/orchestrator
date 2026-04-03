@@ -9,6 +9,7 @@ pub struct AgentInput {
     pub tmux_target: String,
     pub workdir: Option<String>,
     pub default_task: String,
+    pub metadata_json: Option<String>,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -89,6 +90,13 @@ pub struct FactInput {
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
+pub struct InternalAuthSessionInput {
+    pub token_hash: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
 pub struct ArtifactInput {
     pub path: String,
     pub sha256: Option<String>,
@@ -131,6 +139,8 @@ pub struct Agent {
     pub last_capture_preview: Option<String>,
     pub metadata_json: String,
     pub biome_pane_id: Option<String>,
+    #[default(None::<String>)]
+    pub idle_since: Option<String>,
 }
 
 #[derive(Clone)]
@@ -251,6 +261,16 @@ pub struct Event {
     pub message: String,
     pub payload_json: String,
     pub created_at: String,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = internal_auth_sessions, public)]
+pub struct InternalAuthSession {
+    #[primary_key]
+    pub token_hash: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub updated_at: String,
 }
 
 fn now(ctx: &ReducerContext) -> String {
@@ -556,18 +576,21 @@ fn default_agents() -> Vec<AgentInput> {
             tmux_target: format!("{DEFAULT_TMUX_SESSION}:oracle"),
             workdir: Some(DEFAULT_PROJECT_DIR.to_string()),
             default_task: "Continue the oracle task in /home/sdancer/games/nmss/. If done, test the oracle by running it. If already tested, save the results to VikingDB via `mcp openviking add_resource`.".to_string(),
+            metadata_json: None,
         },
         AgentInput {
             name: "crypto".to_string(),
             tmux_target: format!("{DEFAULT_TMUX_SESSION}:crypto"),
             workdir: Some(DEFAULT_PROJECT_DIR.to_string()),
             default_task: "Continue the crypto task in /home/sdancer/games/nmss/. If static analysis is done, try Unicorn emulation of the crypto function using nmss_emu.py. If stuck, hook sub_20bb48 and sub_2070a8 deeper with Capstone. Binary: output/decrypted/nmsscr.dec.".to_string(),
+            metadata_json: None,
         },
         AgentInput {
             name: "hybrid".to_string(),
             tmux_target: format!("{DEFAULT_TMUX_SESSION}:hybrid"),
             workdir: Some(DEFAULT_PROJECT_DIR.to_string()),
             default_task: "Continue the hybrid capture task in /home/sdancer/games/nmss/. If the capture script is done, test it. If crypto is not solved yet, stub the computation and validate that the capture path works.".to_string(),
+            metadata_json: None,
         },
     ]
 }
@@ -738,11 +761,11 @@ fn upsert_agent_internal(ctx: &ReducerContext, input: AgentInput, biome_pane_id:
         current_goal_key: existing.as_ref().and_then(|row| row.current_goal_key.clone()),
         current_sub_goal_key: existing.as_ref().and_then(|row| row.current_sub_goal_key.clone()),
         last_seen_at: existing.as_ref().and_then(|row| row.last_seen_at.clone()),
+        idle_since: existing.as_ref().and_then(|row| row.idle_since.clone()),
         last_capture_hash: existing.as_ref().and_then(|row| row.last_capture_hash.clone()),
         last_capture_preview: existing.as_ref().and_then(|row| row.last_capture_preview.clone()),
-        metadata_json: existing
-            .as_ref()
-            .map(|row| row.metadata_json.clone())
+        metadata_json: input.metadata_json.clone()
+            .or_else(|| existing.as_ref().map(|row| row.metadata_json.clone()))
             .unwrap_or_else(|| "{}".to_string()),
         biome_pane_id: biome_pane_id.or_else(|| existing.and_then(|row| row.biome_pane_id)),
     };
@@ -841,6 +864,7 @@ pub fn agent_add(
     workdir: Option<String>,
     default_task: Option<String>,
     tmux_target: Option<String>,
+    metadata_json: Option<String>,
 ) {
     upsert_agent_internal(
         ctx,
@@ -849,6 +873,7 @@ pub fn agent_add(
             tmux_target: tmux_target.unwrap_or_default(),
             workdir,
             default_task: default_task.unwrap_or_else(|| "Continue the current task.".to_string()),
+            metadata_json,
         },
         Some(biome_pane_id.clone()),
     );
@@ -883,9 +908,50 @@ pub fn agent_remove(ctx: &ReducerContext, name: String, delete: bool) -> Result<
         let mut updated = agent;
         updated.status = "unknown".to_string();
         updated.biome_pane_id = None;
+        updated.idle_since = None;
         ctx.db.agents().name().update(updated);
         log_event(ctx, Some(name.clone()), "agent.deregistered", name, None);
     }
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn agent_prune_stale(ctx: &ReducerContext, name: String) -> Result<(), String> {
+    require_agent(ctx, &name)?;
+
+    for sub_goal in ctx
+        .db
+        .sub_goals()
+        .iter()
+        .filter(|row| row.owner_agent == name && row.status == "active")
+    {
+        let mut updated = sub_goal;
+        updated.status = "pending".to_string();
+        updated.updated_at = now(ctx);
+        ctx.db.sub_goals().sub_goal_key().update(updated);
+    }
+
+    for action in ctx
+        .db
+        .actions()
+        .iter()
+        .filter(|row| row.agent_name.as_deref() == Some(name.as_str()) && row.status == "pending")
+    {
+        let mut updated = action;
+        updated.status = "failed".to_string();
+        updated.executed_at = Some(now(ctx));
+        updated.result_text = Some("agent pruned as stale".to_string());
+        ctx.db.actions().id().update(updated);
+    }
+
+    let _ = ctx.db.agents().name().delete(&name);
+    log_event(
+        ctx,
+        Some(name.clone()),
+        "agent.pruned",
+        name,
+        Some("{\"reason\":\"stale_cleanup\"}".to_string()),
+    );
     Ok(())
 }
 
@@ -1113,6 +1179,7 @@ pub fn sub_goal_remove(ctx: &ReducerContext, sub_goal_key: String, delete: bool)
 #[spacetimedb::reducer]
 pub fn fact_set(ctx: &ReducerContext, input: FactInput) {
     let fact_key = input.fact_key.clone();
+    let is_internal = fact_key.starts_with("g4.internal.");
     let row = Fact {
         fact_key: input.fact_key,
         value_json: input.value_json.clone(),
@@ -1124,13 +1191,44 @@ pub fn fact_set(ctx: &ReducerContext, input: FactInput) {
     };
     let _ = ctx.db.facts().fact_key().delete(&row.fact_key);
     ctx.db.facts().insert(row);
-    log_event(
-        ctx,
-        None,
-        "fact.updated",
-        format!("{fact_key}={}", input.value_json),
-        None,
-    );
+    if !is_internal {
+        log_event(
+            ctx,
+            None,
+            "fact.updated",
+            format!("{fact_key}={}", input.value_json),
+            None,
+        );
+    }
+}
+
+#[spacetimedb::reducer]
+pub fn fact_remove(ctx: &ReducerContext, fact_key: String) {
+    let _ = ctx.db.facts().fact_key().delete(&fact_key);
+    if !fact_key.starts_with("g4.internal.") {
+        log_event(ctx, None, "fact.deleted", fact_key, None);
+    }
+}
+
+#[spacetimedb::reducer]
+pub fn internal_auth_session_upsert(ctx: &ReducerContext, input: InternalAuthSessionInput) {
+    let row = InternalAuthSession {
+        token_hash: input.token_hash,
+        created_at: input.created_at,
+        expires_at: input.expires_at,
+        updated_at: now(ctx),
+    };
+    let _ = ctx
+        .db
+        .internal_auth_sessions()
+        .token_hash()
+        .delete(&row.token_hash);
+    ctx.db.internal_auth_sessions().insert(row);
+}
+
+#[spacetimedb::reducer]
+pub fn internal_auth_session_remove(ctx: &ReducerContext, token_hash: String) {
+    let _ = ctx.db.internal_auth_sessions().token_hash().delete(&token_hash);
 }
 
 #[spacetimedb::reducer]
@@ -1231,8 +1329,16 @@ pub fn queue_prompt(ctx: &ReducerContext, agent_name: String, text: String) -> R
 #[spacetimedb::reducer]
 pub fn agent_poll_record(ctx: &ReducerContext, input: AgentPollInput) -> Result<(), String> {
     let mut agent = require_agent(ctx, &input.agent_name)?;
+    let timestamp = now(ctx);
+    if input.status == "idle" {
+        if agent.status != "idle" || agent.idle_since.is_none() {
+            agent.idle_since = Some(timestamp.clone());
+        }
+    } else {
+        agent.idle_since = None;
+    }
     agent.status = input.status.clone();
-    agent.last_seen_at = Some(now(ctx));
+    agent.last_seen_at = Some(timestamp);
     agent.last_capture_hash = opt_text(input.last_capture_hash);
     agent.last_capture_preview = opt_text(input.last_capture_preview.clone());
     ctx.db.agents().name().update(agent);
@@ -1389,9 +1495,63 @@ pub fn decide_actions(ctx: &ReducerContext) {
 }
 
 #[spacetimedb::reducer]
+pub fn decide_actions_for_domain(ctx: &ReducerContext, domain: String) {
+    resolve_active_sub_goals(ctx);
+    let agents: Vec<_> = ctx
+        .db
+        .agents()
+        .iter()
+        .filter(|a| {
+            a.metadata_json.contains(&format!("\"domain\":\"{}\"", domain))
+        })
+        .collect();
+    for agent in agents {
+        if agent.status == "paused" {
+            continue;
+        }
+        let preview = agent.last_capture_preview.clone().unwrap_or_default();
+        match agent.status.as_str() {
+            "dead" => queue_action_internal(
+                ctx,
+                Some(agent.name.clone()),
+                "restart_agent".to_string(),
+                format!(
+                    "{{\"task\":{}}}",
+                    serde_json_escape(&current_task_prompt(ctx, &agent.name))
+                ),
+                Some("Agent appears dead".to_string()),
+            ),
+            "stuck" => queue_action_internal(
+                ctx,
+                Some(agent.name.clone()),
+                "send_prompt".to_string(),
+                format!(
+                    "{{\"text\":{}}}",
+                    serde_json_escape(&corrective_prompt(ctx, &agent.name, &preview))
+                ),
+                Some("Agent appears stuck".to_string()),
+            ),
+            "idle" => {
+                if let Some(prompt) = follow_up_prompt(ctx, &agent.name) {
+                    queue_action_internal(
+                        ctx,
+                        Some(agent.name.clone()),
+                        "send_prompt".to_string(),
+                        format!("{{\"text\":{}}}", serde_json_escape(&prompt)),
+                        Some("Idle follow-up".to_string()),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[spacetimedb::reducer]
 pub fn agent_update_pane_id(ctx: &ReducerContext, agent_name: String, biome_pane_id: String) -> Result<(), String> {
     let mut agent = require_agent(ctx, &agent_name)?;
     agent.biome_pane_id = Some(biome_pane_id.clone());
+    agent.idle_since = None;
     ctx.db.agents().name().update(agent);
     log_event(
         ctx,
