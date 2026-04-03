@@ -94,6 +94,9 @@ struct ExecuteBiomeArgs {
     /// Only execute actions for agents whose metadata_json.domain matches
     #[arg(long)]
     domain: Option<String>,
+    /// Set biome pane group tag on spawn/restart (defaults to domain if set)
+    #[arg(long)]
+    group: Option<String>,
 }
 
 #[derive(Args)]
@@ -107,6 +110,9 @@ struct RunOnceBiomeArgs {
     /// Scope poll/decide/execute to agents whose metadata_json.domain matches
     #[arg(long)]
     domain: Option<String>,
+    /// Set biome pane group tag on spawn/restart (defaults to domain if set)
+    #[arg(long)]
+    group: Option<String>,
 }
 
 #[derive(Args)]
@@ -398,10 +404,14 @@ fn biome_resolve_pane(client: &Client, base_url: &str, name_or_id: &str) -> Resu
     Err(anyhow!("no pane matching '{name_or_id}'"))
 }
 
-fn biome_create_pane(client: &Client, base_url: &str, name: &str) -> Result<String> {
+fn biome_create_pane(client: &Client, base_url: &str, name: &str, group: Option<&str>) -> Result<String> {
+    let mut body = json!({"name": name, "cols": 220, "rows": 50});
+    if let Some(g) = group {
+        body["group"] = json!(g);
+    }
     let resp = client
         .post(format!("{base_url}/panes"))
-        .json(&json!({"name": name, "cols": 220, "rows": 50}))
+        .json(&body)
         .timeout(std::time::Duration::from_millis(2000))
         .send()
         .context("biome create pane")?;
@@ -695,7 +705,7 @@ fn cmd_poll_biome(cli: &CliContext, lines: u32, domain: Option<&str>) -> Result<
     Ok(())
 }
 
-fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>) -> Result<()> {
+fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>, group: Option<&str>) -> Result<()> {
     let limit = limit as usize;
     // Fetch pending actions
     let rows = sql_rows(
@@ -743,12 +753,12 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>) -> Resu
                         }
                     }
                     Some(agent_name) => {
-                        execute_restart_agent(cli, agent_name, &payload_json_str)
+                        execute_restart_agent(cli, agent_name, &payload_json_str, group)
                     }
                 }
             }
             "spawn_agent" => {
-                execute_spawn_agent(cli, &payload_json_str)
+                execute_spawn_agent(cli, &payload_json_str, group)
             }
             _ => (
                 "failed".to_string(),
@@ -778,7 +788,7 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>) -> Resu
     Ok(())
 }
 
-fn cmd_run_once_biome(cli: &CliContext, lines: u32, execute: bool, limit: u32, domain: Option<&str>) -> Result<()> {
+fn cmd_run_once_biome(cli: &CliContext, lines: u32, execute: bool, limit: u32, domain: Option<&str>, group: Option<&str>) -> Result<()> {
     cmd_poll_biome(cli, lines, domain)?;
     match domain {
         Some(d) => call_reducer_silent(
@@ -789,7 +799,9 @@ fn cmd_run_once_biome(cli: &CliContext, lines: u32, execute: bool, limit: u32, d
         None => call_reducer_silent(cli, "decide_actions", None)?,
     }
     if execute {
-        cmd_execute_biome(cli, limit, domain)?;
+        // Use explicit --group if given, otherwise fall back to domain
+        let effective_group = group.or(domain);
+        cmd_execute_biome(cli, limit, domain, effective_group)?;
     }
     Ok(())
 }
@@ -801,7 +813,7 @@ fn boot_command_for_backend(backend: &str, workdir: &str) -> String {
     }
 }
 
-fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &str) -> (String, String) {
+fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &str, group_override: Option<&str>) -> (String, String) {
     // Get agent's workdir, current pane, and metadata
     let agent_info = match sql_rows(
         cli,
@@ -820,11 +832,22 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
     let default_task = bsatn_unwrap_or(&agent_info[2], "Continue the current task.");
     let metadata_str = bsatn_unwrap_or(&agent_info[3], "{}");
 
-    // Read backend from metadata, default to "claude"
-    let backend = serde_json::from_str::<Value>(&metadata_str)
-        .ok()
-        .and_then(|v| v.get("backend").and_then(|b| b.as_str()).map(str::to_string))
-        .unwrap_or_else(|| "claude".to_string());
+    // Read backend and domain from metadata
+    let metadata_val = serde_json::from_str::<Value>(&metadata_str).unwrap_or(json!({}));
+    let backend = metadata_val
+        .get("backend")
+        .and_then(|b| b.as_str())
+        .unwrap_or("claude")
+        .to_string();
+    let domain_from_meta = metadata_val
+        .get("domain")
+        .and_then(|d| d.as_str())
+        .map(str::to_string);
+
+    // Resolve group: explicit override > domain from metadata
+    let group = group_override
+        .map(str::to_string)
+        .or(domain_from_meta);
 
     // Extract task from payload, fall back to default_task
     let task = serde_json::from_str::<Value>(payload_json_str)
@@ -838,7 +861,7 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
     }
 
     // Create new pane
-    let new_pane_id = match biome_create_pane(&cli.client, &cli.biome_url, agent_name) {
+    let new_pane_id = match biome_create_pane(&cli.client, &cli.biome_url, agent_name, group.as_deref()) {
         Ok(id) => id,
         Err(err) => return ("failed".to_string(), format!("{err:#}")),
     };
@@ -870,7 +893,7 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
     )
 }
 
-fn execute_spawn_agent(cli: &CliContext, payload_json_str: &str) -> (String, String) {
+fn execute_spawn_agent(cli: &CliContext, payload_json_str: &str, group_override: Option<&str>) -> (String, String) {
     let payload: Value = match serde_json::from_str(payload_json_str) {
         Ok(v) => v,
         Err(err) => return ("failed".to_string(), format!("bad spawn payload: {err}")),
@@ -902,8 +925,18 @@ fn execute_spawn_agent(cli: &CliContext, payload_json_str: &str) -> (String, Str
         .and_then(|v| v.as_str())
         .unwrap_or("Continue the current task.");
 
+    // Resolve group: explicit override > domain from payload metadata
+    let domain_from_meta = payload
+        .get("metadata")
+        .and_then(|v| v.get("domain"))
+        .and_then(|d| d.as_str())
+        .map(str::to_string);
+    let group = group_override
+        .map(str::to_string)
+        .or(domain_from_meta);
+
     // Create new biome pane
-    let pane_id = match biome_create_pane(&cli.client, &cli.biome_url, &name) {
+    let pane_id = match biome_create_pane(&cli.client, &cli.biome_url, &name, group.as_deref()) {
         Ok(id) => id,
         Err(err) => return ("failed".to_string(), format!("pane create failed: {err:#}")),
     };
@@ -997,9 +1030,12 @@ fn run() -> Result<()> {
         Commands::DecideActions => call_reducer(&context, "decide_actions", None),
         Commands::ResolveActiveSubGoals => call_reducer(&context, "resolve_active_sub_goals", None),
         Commands::PollBiome(args) => cmd_poll_biome(&context, args.lines, args.domain.as_deref()),
-        Commands::ExecuteBiome(args) => cmd_execute_biome(&context, args.limit, args.domain.as_deref()),
+        Commands::ExecuteBiome(args) => {
+            let effective_group = args.group.as_deref().or(args.domain.as_deref());
+            cmd_execute_biome(&context, args.limit, args.domain.as_deref(), effective_group)
+        }
         Commands::RunOnceBiome(args) => {
-            cmd_run_once_biome(&context, args.lines, args.execute, args.limit, args.domain.as_deref())
+            cmd_run_once_biome(&context, args.lines, args.execute, args.limit, args.domain.as_deref(), args.group.as_deref())
         }
         Commands::QueuePrompt(args) => call_reducer(
             &context,
