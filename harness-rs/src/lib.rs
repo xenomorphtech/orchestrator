@@ -3,6 +3,30 @@ use spacetimedb::{ReducerContext, SpacetimeType, Table};
 const DEFAULT_PROJECT_DIR: &str = "/home/sdancer/games/nmss";
 const DEFAULT_TMUX_SESSION: &str = "nmss";
 
+/// What action to take for an agent based on its classified status.
+#[derive(Debug, PartialEq)]
+enum AgentAction {
+    Restart,
+    SendCorrectivePrompt,
+    SendFollowUp,
+    Skip,
+}
+
+/// Pure decision function: given agent status and whether it has an active sub-goal,
+/// determine what action to take. Dead agents are only restarted if they have active
+/// work assigned — this prevents auto-restart after goal cancellation.
+fn decide_agent_action(status: &str, has_active_sub_goal: bool) -> AgentAction {
+    match status {
+        "paused" => AgentAction::Skip,
+        "dead" if has_active_sub_goal => AgentAction::Restart,
+        "dead" => AgentAction::Skip,
+        // Stuck agents are handled by the orchestrator, not auto-nudged.
+        "stuck" => AgentAction::Skip,
+        "idle" if has_active_sub_goal => AgentAction::SendFollowUp,
+        _ => AgentAction::Skip,
+    }
+}
+
 #[derive(Clone, Debug, SpacetimeType)]
 pub struct AgentInput {
     pub name: String,
@@ -141,6 +165,8 @@ pub struct Agent {
     pub biome_pane_id: Option<String>,
     #[default(None::<String>)]
     pub idle_since: Option<String>,
+    #[default(None::<String>)]
+    pub rolling_description: Option<String>,
 }
 
 #[derive(Clone)]
@@ -273,6 +299,93 @@ pub struct InternalAuthSession {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct EpisodeInput {
+    pub summary: String,
+    pub agent_statuses_json: String,
+    pub actions_taken_json: String,
+    pub goal_progress_json: String,
+}
+
+// ── Service health monitoring ──────────────────────────────────────────
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct ServiceInput {
+    pub name: String,
+    pub service_type: String,
+    pub host: Option<String>,
+    pub check_target: String,
+    pub restart_policy: Option<String>,
+    pub restart_command: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct ServicePatch {
+    pub service_type: Option<String>,
+    pub host: Option<String>,
+    pub check_target: Option<String>,
+    pub status: Option<String>,
+    pub restart_policy: Option<String>,
+    pub restart_command: Option<String>,
+    pub metadata_json: Option<String>,
+    pub clear_restart_command: bool,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct ServiceHealthInput {
+    pub service_name: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub response_time_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = services, public)]
+pub struct Service {
+    #[primary_key]
+    pub name: String,
+    pub service_type: String,
+    pub host: String,
+    pub check_target: String,
+    pub status: String,
+    pub last_checked_at: Option<String>,
+    pub last_healthy_at: Option<String>,
+    pub consecutive_failures: u32,
+    pub restart_policy: String,
+    pub restart_command: Option<String>,
+    pub metadata_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = service_health_records, public)]
+pub struct ServiceHealthRecord {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    #[index(btree)]
+    pub service_name: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub response_time_ms: Option<u64>,
+    pub created_at: String,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = episodes, public)]
+pub struct Episode {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub created_at: String,
+    pub summary: String,
+    pub agent_statuses_json: String,
+    pub actions_taken_json: String,
+    pub goal_progress_json: String,
+}
+
 fn now(ctx: &ReducerContext) -> String {
     ctx.timestamp.to_string()
 }
@@ -322,6 +435,14 @@ fn require_sub_goal(ctx: &ReducerContext, sub_goal_key: &str) -> Result<SubGoal,
         .sub_goal_key()
         .find(&sub_goal_key.to_string())
         .ok_or_else(|| format!("unknown sub-goal: {sub_goal_key}"))
+}
+
+fn require_service(ctx: &ReducerContext, name: &str) -> Result<Service, String> {
+    ctx.db
+        .services()
+        .name()
+        .find(&name.to_string())
+        .ok_or_else(|| format!("unknown service: {name}"))
 }
 
 fn log_event(ctx: &ReducerContext, agent_name: Option<String>, event_type: &str, message: String, payload_json: Option<String>) {
@@ -525,12 +646,10 @@ fn decide_actions_internal(ctx: &ReducerContext) {
     resolve_active_sub_goals(ctx);
     let agents: Vec<_> = ctx.db.agents().iter().collect();
     for agent in agents {
-        if agent.status == "paused" {
-            continue;
-        }
+        let has_active_sub_goal = agent.current_sub_goal_key.is_some();
         let preview = agent.last_capture_preview.clone().unwrap_or_default();
-        match agent.status.as_str() {
-            "dead" => queue_action_internal(
+        match decide_agent_action(&agent.status, has_active_sub_goal) {
+            AgentAction::Restart => queue_action_internal(
                 ctx,
                 Some(agent.name.clone()),
                 "restart_agent".to_string(),
@@ -540,7 +659,7 @@ fn decide_actions_internal(ctx: &ReducerContext) {
                 ),
                 Some("Agent appears dead".to_string()),
             ),
-            "stuck" => queue_action_internal(
+            AgentAction::SendCorrectivePrompt => queue_action_internal(
                 ctx,
                 Some(agent.name.clone()),
                 "send_prompt".to_string(),
@@ -550,7 +669,7 @@ fn decide_actions_internal(ctx: &ReducerContext) {
                 ),
                 Some("Agent appears stuck".to_string()),
             ),
-            "idle" => {
+            AgentAction::SendFollowUp => {
                 if let Some(prompt) = follow_up_prompt(ctx, &agent.name) {
                     queue_action_internal(
                         ctx,
@@ -561,7 +680,7 @@ fn decide_actions_internal(ctx: &ReducerContext) {
                     );
                 }
             }
-            _ => {}
+            AgentAction::Skip => {}
         }
     }
     cross_pollinate_internal(ctx);
@@ -762,6 +881,7 @@ fn upsert_agent_internal(ctx: &ReducerContext, input: AgentInput, biome_pane_id:
         current_sub_goal_key: existing.as_ref().and_then(|row| row.current_sub_goal_key.clone()),
         last_seen_at: existing.as_ref().and_then(|row| row.last_seen_at.clone()),
         idle_since: existing.as_ref().and_then(|row| row.idle_since.clone()),
+        rolling_description: existing.as_ref().and_then(|row| row.rolling_description.clone()),
         last_capture_hash: existing.as_ref().and_then(|row| row.last_capture_hash.clone()),
         last_capture_preview: existing.as_ref().and_then(|row| row.last_capture_preview.clone()),
         metadata_json: input.metadata_json.clone()
@@ -802,7 +922,8 @@ fn upsert_goal_internal(ctx: &ReducerContext, input: GoalInput) -> Result<(), St
 
 fn upsert_sub_goal_internal(ctx: &ReducerContext, input: SubGoalInput) -> Result<(), String> {
     require_goal(ctx, &input.goal_key)?;
-    require_agent(ctx, &input.owner_agent)?;
+    // owner_agent is a soft reference — the agent may not exist yet.
+    // Goals define the work; agents are executors assigned later.
     if let Some(dep) = input.depends_on_sub_goal_key.as_ref() {
         require_sub_goal(ctx, dep)?;
     }
@@ -1253,6 +1374,19 @@ pub fn observation_add(
 }
 
 #[spacetimedb::reducer]
+pub fn episode_add(ctx: &ReducerContext, input: EpisodeInput) {
+    ctx.db.episodes().insert(Episode {
+        id: 0,
+        created_at: now(ctx),
+        summary: input.summary,
+        agent_statuses_json: input.agent_statuses_json,
+        actions_taken_json: input.actions_taken_json,
+        goal_progress_json: input.goal_progress_json,
+    });
+    log_event(ctx, None, "episode.recorded", "cycle episode logged".to_string(), None);
+}
+
+#[spacetimedb::reducer]
 pub fn artifact_upsert(ctx: &ReducerContext, input: ArtifactInput) {
     let timestamp = now(ctx);
     let existing = ctx.db.artifacts().path().find(&input.path);
@@ -1506,12 +1640,10 @@ pub fn decide_actions_for_domain(ctx: &ReducerContext, domain: String) {
         })
         .collect();
     for agent in agents {
-        if agent.status == "paused" {
-            continue;
-        }
+        let has_active_sub_goal = agent.current_sub_goal_key.is_some();
         let preview = agent.last_capture_preview.clone().unwrap_or_default();
-        match agent.status.as_str() {
-            "dead" => queue_action_internal(
+        match decide_agent_action(&agent.status, has_active_sub_goal) {
+            AgentAction::Restart => queue_action_internal(
                 ctx,
                 Some(agent.name.clone()),
                 "restart_agent".to_string(),
@@ -1521,7 +1653,7 @@ pub fn decide_actions_for_domain(ctx: &ReducerContext, domain: String) {
                 ),
                 Some("Agent appears dead".to_string()),
             ),
-            "stuck" => queue_action_internal(
+            AgentAction::SendCorrectivePrompt => queue_action_internal(
                 ctx,
                 Some(agent.name.clone()),
                 "send_prompt".to_string(),
@@ -1531,7 +1663,7 @@ pub fn decide_actions_for_domain(ctx: &ReducerContext, domain: String) {
                 ),
                 Some("Agent appears stuck".to_string()),
             ),
-            "idle" => {
+            AgentAction::SendFollowUp => {
                 if let Some(prompt) = follow_up_prompt(ctx, &agent.name) {
                     queue_action_internal(
                         ctx,
@@ -1542,7 +1674,7 @@ pub fn decide_actions_for_domain(ctx: &ReducerContext, domain: String) {
                     );
                 }
             }
-            _ => {}
+            AgentAction::Skip => {}
         }
     }
 }
@@ -1563,6 +1695,147 @@ pub fn agent_update_pane_id(ctx: &ReducerContext, agent_name: String, biome_pane
     Ok(())
 }
 
+#[spacetimedb::reducer]
+pub fn agent_update_description(ctx: &ReducerContext, agent_name: String, description: String) -> Result<(), String> {
+    let mut agent = require_agent(ctx, &agent_name)?;
+    agent.rolling_description = Some(description);
+    ctx.db.agents().name().update(agent);
+    log_event(
+        ctx,
+        Some(agent_name),
+        "agent.description_updated",
+        "rolling description updated".to_string(),
+        None,
+    );
+    Ok(())
+}
+
+// ── Service reducers ───────────────────────────────────────────────────
+
+#[spacetimedb::reducer]
+pub fn service_add(ctx: &ReducerContext, input: ServiceInput) {
+    let timestamp = now(ctx);
+    let existing = ctx.db.services().name().find(&input.name);
+    let row = Service {
+        name: input.name.clone(),
+        service_type: input.service_type,
+        host: input.host.unwrap_or_else(|| "localhost".to_string()),
+        check_target: input.check_target,
+        status: existing.as_ref().map(|r| r.status.clone()).unwrap_or_else(|| "unknown".to_string()),
+        last_checked_at: existing.as_ref().and_then(|r| r.last_checked_at.clone()),
+        last_healthy_at: existing.as_ref().and_then(|r| r.last_healthy_at.clone()),
+        consecutive_failures: existing.as_ref().map(|r| r.consecutive_failures).unwrap_or(0),
+        restart_policy: input.restart_policy.unwrap_or_else(|| "manual".to_string()),
+        restart_command: opt_text(input.restart_command),
+        metadata_json: json_or_empty(input.metadata_json),
+        created_at: existing.as_ref().map(|r| r.created_at.clone()).unwrap_or_else(|| timestamp.clone()),
+        updated_at: timestamp,
+    };
+    let _ = ctx.db.services().name().delete(&row.name);
+    ctx.db.services().insert(row);
+    log_event(ctx, None, "service.registered", input.name, None);
+}
+
+#[spacetimedb::reducer]
+pub fn service_update(ctx: &ReducerContext, name: String, patch: ServicePatch) -> Result<(), String> {
+    let current = require_service(ctx, &name)?;
+    let timestamp = now(ctx);
+    let updated = Service {
+        name: name.clone(),
+        service_type: patch.service_type.unwrap_or(current.service_type),
+        host: patch.host.unwrap_or(current.host),
+        check_target: patch.check_target.unwrap_or(current.check_target),
+        status: patch.status.unwrap_or(current.status),
+        last_checked_at: current.last_checked_at,
+        last_healthy_at: current.last_healthy_at,
+        consecutive_failures: current.consecutive_failures,
+        restart_policy: patch.restart_policy.unwrap_or(current.restart_policy),
+        restart_command: if patch.clear_restart_command { None } else { patch.restart_command.or(current.restart_command) },
+        metadata_json: patch.metadata_json.unwrap_or(current.metadata_json),
+        created_at: current.created_at,
+        updated_at: timestamp,
+    };
+    let _ = ctx.db.services().name().delete(&name);
+    ctx.db.services().insert(updated);
+    log_event(ctx, None, "service.updated", name, None);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn service_remove(ctx: &ReducerContext, name: String, delete: bool) -> Result<(), String> {
+    require_service(ctx, &name)?;
+    if delete {
+        for record in ctx.db.service_health_records().iter().filter(|r| r.service_name == name) {
+            let _ = ctx.db.service_health_records().id().delete(record.id);
+        }
+        let _ = ctx.db.services().name().delete(&name);
+        log_event(ctx, None, "service.deleted", name, None);
+    } else {
+        let mut svc = require_service(ctx, &name)?;
+        svc.status = "unknown".to_string();
+        svc.updated_at = now(ctx);
+        ctx.db.services().name().update(svc);
+        log_event(ctx, None, "service.deregistered", name, None);
+    }
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn service_health_record(ctx: &ReducerContext, input: ServiceHealthInput) -> Result<(), String> {
+    let mut svc = require_service(ctx, &input.service_name)?;
+    let timestamp = now(ctx);
+
+    // Record the health check
+    ctx.db.service_health_records().insert(ServiceHealthRecord {
+        id: 0,
+        service_name: input.service_name.clone(),
+        status: input.status.clone(),
+        detail: opt_text(input.detail),
+        response_time_ms: input.response_time_ms,
+        created_at: timestamp.clone(),
+    });
+
+    // Update service row
+    svc.status = input.status.clone();
+    svc.last_checked_at = Some(timestamp.clone());
+    svc.updated_at = timestamp;
+
+    if input.status == "healthy" {
+        svc.last_healthy_at = svc.last_checked_at.clone();
+        svc.consecutive_failures = 0;
+    } else {
+        svc.consecutive_failures += 1;
+    }
+
+    // Queue restart if auto policy and 3+ consecutive failures
+    if svc.consecutive_failures >= 3 && svc.restart_policy == "auto" {
+        let payload = serde_json::json!({
+            "service_name": svc.name,
+            "service_type": svc.service_type,
+            "host": svc.host,
+            "check_target": svc.check_target,
+            "restart_command": svc.restart_command,
+        });
+        queue_action_internal(
+            ctx,
+            None,
+            "restart_service".to_string(),
+            payload.to_string(),
+            Some(format!("service {} has {} consecutive failures", svc.name, svc.consecutive_failures)),
+        );
+    }
+
+    ctx.db.services().name().update(svc);
+    log_event(
+        ctx,
+        None,
+        "service.health_recorded",
+        format!("{}={}", input.service_name, input.status),
+        input.response_time_ms.map(|ms| format!("{{\"response_time_ms\":{ms}}}")),
+    );
+    Ok(())
+}
+
 fn serde_json_escape(text: &str) -> String {
     let escaped = text
         .replace('\\', "\\\\")
@@ -1571,4 +1844,54 @@ fn serde_json_escape(text: &str) -> String {
         .replace('\r', "\\r")
         .replace('\t', "\\t");
     format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_agent_with_active_sub_goal_restarts() {
+        assert_eq!(decide_agent_action("dead", true), AgentAction::Restart);
+    }
+
+    #[test]
+    fn dead_agent_without_sub_goal_skips() {
+        // This is the key case: goal was cancelled, agent died, should NOT auto-restart.
+        assert_eq!(decide_agent_action("dead", false), AgentAction::Skip);
+    }
+
+    #[test]
+    fn paused_agent_always_skips() {
+        assert_eq!(decide_agent_action("paused", true), AgentAction::Skip);
+        assert_eq!(decide_agent_action("paused", false), AgentAction::Skip);
+    }
+
+    #[test]
+    fn stuck_agent_is_skipped_for_orchestrator_to_handle() {
+        assert_eq!(decide_agent_action("stuck", true), AgentAction::Skip);
+        assert_eq!(decide_agent_action("stuck", false), AgentAction::Skip);
+    }
+
+    #[test]
+    fn idle_agent_with_goal_gets_follow_up() {
+        assert_eq!(decide_agent_action("idle", true), AgentAction::SendFollowUp);
+    }
+
+    #[test]
+    fn idle_agent_without_goal_skips() {
+        assert_eq!(decide_agent_action("idle", false), AgentAction::Skip);
+    }
+
+    #[test]
+    fn working_agent_always_skips() {
+        assert_eq!(decide_agent_action("working", true), AgentAction::Skip);
+        assert_eq!(decide_agent_action("working", false), AgentAction::Skip);
+    }
+
+    #[test]
+    fn unknown_status_skips() {
+        assert_eq!(decide_agent_action("unknown", true), AgentAction::Skip);
+        assert_eq!(decide_agent_action("unknown", false), AgentAction::Skip);
+    }
 }
