@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate"
+  short_description: "Run the agent orchestration loop"
+  default_prompt: "Use $orchestrate to inspect agents, run one harness cycle, and report the current state."
