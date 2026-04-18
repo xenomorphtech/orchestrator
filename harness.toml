@@ -1,0 +1,7 @@
+# Harness configuration
+# Values here are overridden by environment variables and CLI flags.
+
+database = "c200b70ed29ce3715b85a86635489a6704cde7365e85fa45dfae21ffa7b87a77"
+server = "http://127.0.0.1:3001"
+# biome_url = "http://127.0.0.1:3021"
+biome_api_key = "welcome to my w0rld"

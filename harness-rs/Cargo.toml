@@ -12,7 +12,7 @@ name = "harness"
 required-features = ["cli"]
 
 [features]
-cli = ["dep:reqwest"]
+cli = ["dep:reqwest", "dep:dotenvy", "dep:toml"]
 
 [dependencies]
 spacetimedb = { version = "2.1.0", features = ["unstable"] }
@@ -23,5 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+toml = { version = "0.8", optional = true }

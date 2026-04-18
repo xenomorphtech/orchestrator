@@ -6,15 +6,24 @@
 
 set -euo pipefail
 
-BIOME_URL="${BIOME_URL:-http://localhost:3000}"
+BIOME_URL="${BIOME_URL:-http://localhost:3021}"
+BIOME_API_KEY_VALUE="${HARNESS_BIOME_API_KEY:-${BIOME_API_KEY:-}}"
 
 target="$1"
 shift
 msg="$*"
 
+biome_curl() {
+  if [[ -n "$BIOME_API_KEY_VALUE" ]]; then
+    curl -s -H "X-API-Key: $BIOME_API_KEY_VALUE" "$@"
+  else
+    curl -s "$@"
+  fi
+}
+
 # Resolve name to pane id if needed (not a UUID pattern)
 if [[ ! "$target" =~ ^[0-9a-f]{8} ]]; then
-  pane_id=$(curl -s "$BIOME_URL/panes" | python3 -c "
+  pane_id=$(biome_curl "$BIOME_URL/panes" | python3 -c "
 import json,sys
 for p in json.load(sys.stdin):
     if p.get('name') == '$target':
@@ -25,7 +34,7 @@ for p in json.load(sys.stdin):
   fi
 else
   # Allow prefix match
-  pane_id=$(curl -s "$BIOME_URL/panes" | python3 -c "
+  pane_id=$(biome_curl "$BIOME_URL/panes" | python3 -c "
 import json,sys
 for p in json.load(sys.stdin):
     if p['id'].startswith('$target'):
@@ -41,13 +50,13 @@ fi
 b64_text=$(printf '%s' "$msg" | base64 -w0)
 b64_enter=$(printf '\r' | base64 -w0)
 
-curl -s -X POST "$BIOME_URL/panes/$pane_id/input" \
+biome_curl -X POST "$BIOME_URL/panes/$pane_id/input" \
   -H 'Content-Type: application/json' \
   -d "{\"data\":\"$b64_text\"}"
 
 sleep 0.15
 
-curl -s -X POST "$BIOME_URL/panes/$pane_id/input" \
+biome_curl -X POST "$BIOME_URL/panes/$pane_id/input" \
   -H 'Content-Type: application/json' \
   -d "{\"data\":\"$b64_enter\"}"
 

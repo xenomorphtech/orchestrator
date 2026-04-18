@@ -6,6 +6,7 @@ Monitor and drive Claude or Codex agents running in biome_term panes, working to
 - When spawning Codex agents, always use `--dangerously-bypass-approvals-and-sandbox` (not `--full-auto` or `--approval-mode`).
 - Codex agents often need to be nudged to continue — if idle, send a follow-up prompt. They tend to stop and wait more than Claude agents.
 - Codex always shows a `›` prompt at the bottom of the screen even while working — do NOT use the prompt character alone to detect idle state. Always check for `Working (` in the rows above the prompt first, and check `idle_seconds` from the panes API.
+- **Workers always start from a briefing `.md`.** Any time you spawn a new agent or restart one whose context was lost (fresh shell, `/clear`, pane recreated), you MUST first write/refresh `/home/sdancer/orchestrator/briefings/<agent>.md` with enough context for the worker to continue without re-deriving state. The first prompt sent to the worker should instruct it to read that file before doing anything else.
 
 ## Config
 
@@ -14,6 +15,36 @@ Monitor and drive Claude or Codex agents running in biome_term panes, working to
 - biome_term: `http://localhost:3021`
 
 If `$ARGUMENTS` is provided, treat it as the harness server or database override instead of the default.
+
+## Worker briefings
+
+Every worker agent is paired with a briefing file at `/home/sdancer/orchestrator/briefings/<agent>.md`. This file is the worker's source of truth when it starts fresh or after any context reset.
+
+A briefing MUST contain:
+
+1. **Role & workdir** — one sentence on what this agent owns and the absolute path it runs in.
+2. **Current goal / sub-goal** — the harness goal_key and sub_goal_key the agent is assigned to, with the title.
+3. **Success criteria** — the fact key(s) that, when set, complete the goal, and what "done" looks like concretely.
+4. **Progress so far** — bullets summarising prior cycles: what has been tried, what worked, what failed, what artifacts/files were produced (with paths).
+5. **Next 2–3 concrete tasks** — ordered, specific, actionable. No vague "keep going".
+6. **Constraints & gotchas** — device assignments, non-obvious rules from memory, things the agent must NOT do, known pitfalls from prior episodes.
+7. **Relevant files / references** — paths, URLs, fact keys the agent should consult.
+
+Keep briefings under ~150 lines. They are a working document: rewrite (not append) each time you refresh one, pulling the latest state from harness episodes, agent rolling descriptions, and recent screen captures.
+
+**When to write or refresh a briefing:**
+- Before spawning a new agent (step in API Reference below).
+- Before restarting a dead/stuck agent via `restart_agent` or manually via `harness send`.
+- Before sending `/clear` as part of the low-context refresh flow in step 2.
+- Any cycle where cross-pollination materially changes the plan and the agent will need that context after its next compaction.
+
+**How workers consume the briefing:** the first message sent after boot must be exactly:
+
+```
+Read /home/sdancer/orchestrator/briefings/<agent>.md — that is your full briefing. Then continue with task 1.
+```
+
+Do not paste the briefing contents inline — keep it as a file the worker reads, so the briefing can be updated independently and the worker can re-read it after compaction.
 
 ## Steps
 
@@ -39,15 +70,17 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
    /home/sdancer/orchestrator/harness agents
 
    # All biome_term panes
-   curl -s http://localhost:3021/panes
+   /home/sdancer/orchestrator/harness panes
    ```
 
    Cross-reference: any biome_term pane whose `name` or `id` does not appear in harness output is "unmanaged". Note these separately.
 
-2. **Capture and classify each agent** by reading its screen via biome_term:
+2. **Capture and classify each agent** by reading its screen via the harness:
 
    ```bash
-   curl -s http://localhost:3021/panes/<id>/screen
+   /home/sdancer/orchestrator/harness screen <pane-name-or-id>
+   # Or limit to last N lines:
+   /home/sdancer/orchestrator/harness screen <pane-name-or-id> --lines 30
    ```
 
    Classify from the `rows[]` array and pane metadata:
@@ -65,17 +98,13 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
    1. Send: `Summarize your current goal, what you've accomplished, and the exact next 2-3 tasks to continue. Be concise.`
    2. Wait for the agent to reply with its summary.
    3. Read the summary from the screen.
-   4. Send `/clear` to reset the agent's context window.
-   5. After the clear, inject the goal and tasks back:
+   4. Rewrite `/home/sdancer/orchestrator/briefings/<agent>.md` using the worker's summary plus the latest episode/fact context (see "Worker briefings" above).
+   5. Send `/clear` to reset the agent's context window.
+   6. After the clear, send the single briefing-pointer prompt:
       ```
-      You are continuing work on: <goal from summary>
-      Accomplished so far: <key accomplishments from summary>
-      Your next tasks:
-      1. <task 1 from summary>
-      2. <task 2 from summary>
-      Continue with task 1.
+      Read /home/sdancer/orchestrator/briefings/<agent>.md — that is your full briefing. Then continue with task 1.
       ```
-   This gives the agent a fresh context window while preserving continuity. Only do this for agents that have clear remaining work — don't refresh agents that are effectively done.
+   Never paste the summary or task list inline — always drive the worker off the briefing file so a later restart can reuse the same document. Only refresh agents that have clear remaining work; don't refresh agents that are effectively done.
 
 3. **Poll service health** to check systemd units, HTTP endpoints, and TCP ports:
 
@@ -92,6 +121,8 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
    ```
 
    This handles registered agents automatically: sends follow-up prompts to idle agents, corrective prompts to stuck agents, restarts dead agents, cross-pollinates facts, and queues artifact indexing.
+
+   **Before** running this with `--execute`, check whether any dead agents are likely to be restarted this cycle. For each such agent, refresh `/home/sdancer/orchestrator/briefings/<agent>.md` first, and make sure the agent's `default_task` in the harness is the briefing-pointer prompt (see "Worker briefings"). The harness reuses `default_task` as the post-boot prompt on restart — if that still points at the briefing file, the restarted worker will pick up full context automatically.
 
 5. **Handle unmanaged panes** discovered in step 1:
    - Report their name, id, and classified status
@@ -138,53 +169,67 @@ If `$ARGUMENTS` is provided, treat it as the harness server or database override
 ### Spawn a Claude agent in biome_term
 
 ```bash
-# Create pane
+# 1. Write the briefing FIRST (see "Worker briefings" for required content).
+#    Without this, the worker boots blind.
+$EDITOR /home/sdancer/orchestrator/briefings/my-agent.md
+
+# 2. Create pane (raw biome_term API — harness send will auto-resolve the name)
 curl -s -X POST http://localhost:3021/panes \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: application/json' -H "X-API-Key: $HARNESS_BIOME_API_KEY" \
   -d '{"name":"my-agent","cols":220,"rows":50}'
 # Response: {"id":"<uuid>","name":"my-agent","cols":220,"rows":50}
 
-# Start Claude
+# 3. Start Claude
 /home/sdancer/orchestrator/harness send my-agent "cd /path/to/project && claude --dangerously-skip-permissions"
 
-# Wait ~5s for Claude to initialize, then send task
-/home/sdancer/orchestrator/harness send my-agent "Your task prompt here"
+# 4. Wait ~5s for Claude to initialize, then point it at the briefing.
+#    Use this exact phrasing so restarts stay consistent.
+/home/sdancer/orchestrator/harness send my-agent \
+  "Read /home/sdancer/orchestrator/briefings/my-agent.md — that is your full briefing. Then continue with task 1."
 
-# Register with harness
+# 5. Register with harness. The default_task MUST be the briefing-pointer
+#    prompt so that automatic restarts re-seed context from the same file.
 /home/sdancer/orchestrator/harness agent-add my-agent \
   --biome-pane-id <uuid> --workdir /path/to/project \
-  --default-task "Continue the task"
+  --default-task "Read /home/sdancer/orchestrator/briefings/my-agent.md — that is your full briefing. Then continue with task 1."
 ```
 
 ### Spawn a Codex agent in biome_term
 
 ```bash
+# 1. Write briefing first: /home/sdancer/orchestrator/briefings/codex-agent.md
+
 curl -s -X POST http://localhost:3021/panes \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: application/json' -H "X-API-Key: $HARNESS_BIOME_API_KEY" \
   -d '{"name":"codex-agent","cols":220,"rows":50}'
 
+# 2. Launch codex with the briefing-pointer as its initial task.
 /home/sdancer/orchestrator/harness send codex-agent \
-  'cd /path/to/project && codex --dangerously-bypass-approvals-and-sandbox "your task"'
+  'cd /path/to/project && codex --dangerously-bypass-approvals-and-sandbox "Read /home/sdancer/orchestrator/briefings/codex-agent.md — that is your full briefing. Then continue with task 1."'
 
+# 3. Register with matching default_task so restarts re-use the briefing.
 /home/sdancer/orchestrator/harness agent-add codex-agent \
   --biome-pane-id <uuid> --workdir /path/to/project \
-  --default-task "Continue the codex task"
+  --default-task "Read /home/sdancer/orchestrator/briefings/codex-agent.md — that is your full briefing. Then continue with task 1."
 ```
 
 ### Monitor a pane
 
 ```bash
 # List all panes
-curl -s http://localhost:3021/panes
+/home/sdancer/orchestrator/harness panes
 
-# Get current screen (VT100-rendered rows)
-curl -s http://localhost:3021/panes/<uuid>/screen
+# Get current screen (full)
+/home/sdancer/orchestrator/harness screen <pane-name-or-id>
 
-# Get event log since sequence N
-curl -s "http://localhost:3021/panes/<uuid>/events?after=0"
+# Get last N lines of screen
+/home/sdancer/orchestrator/harness screen <pane-name-or-id> --lines 30
 
-# Kill a pane
-curl -s -X DELETE http://localhost:3021/panes/<uuid>
+# Get event log since sequence N (raw biome_term API)
+curl -s -H "X-API-Key: $HARNESS_BIOME_API_KEY" "http://localhost:3021/panes/<uuid>/events?after=0"
+
+# Kill a pane (raw biome_term API)
+curl -s -H "X-API-Key: $HARNESS_BIOME_API_KEY" -X DELETE http://localhost:3021/panes/<uuid>
 ```
 
 ### Send input to a pane
