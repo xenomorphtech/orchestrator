@@ -1,5 +1,8 @@
 use spacetimedb::{ReducerContext, SpacetimeType, Table};
 
+#[cfg(feature = "cli")]
+pub mod codex_app_server;
+
 const DEFAULT_PROJECT_DIR: &str = "/home/sdancer/games/nmss";
 const DEFAULT_TMUX_SESSION: &str = "nmss";
 

@@ -75,6 +75,10 @@ enum Commands {
     /// Create a biome_term pane, run a command, and register the agent
     AgentCreate(AgentCreateArgs),
     AgentRemove(AgentRemoveArgs),
+    /// Dump a single agent's full record (human-readable or JSON)
+    AgentGet(AgentGetArgs),
+    /// Dump all agents (table or JSON array, same per-row shape as agent-get)
+    AgentList(AgentListArgs),
     Send(SendArgs),
     /// Update a sub-goal's completion report and optionally set status/facts
     Checkpoint(CheckpointArgs),
@@ -325,15 +329,22 @@ struct SubGoalSetArgs {
 #[derive(Args)]
 struct AgentAddArgs {
     name: String,
+    /// Biome pane ID. Required for kind=biome_term. Ignored for kind=codex_app_server
+    /// (a synthetic placeholder is used since the column is non-null in DB).
     #[arg(long)]
-    biome_pane_id: String,
+    biome_pane_id: Option<String>,
     #[arg(long)]
     workdir: Option<String>,
     #[arg(long)]
     default_task: Option<String>,
     #[arg(long)]
     tmux_target: Option<String>,
-    /// JSON metadata (e.g. '{"domain":"nmss","backend":"claude","role":"worker"}')
+    /// Agent backend kind. Currently supported: biome_term (default), codex_app_server, codex-app-server (alias)
+    #[arg(long, default_value = "biome_term")]
+    kind: String,
+    /// JSON metadata (e.g. '{"domain":"nmss","backend":"claude","role":"worker"}').
+    /// Note: when --kind=codex_app_server, the kind is also written into metadata.kind
+    /// so the `send` dispatcher can pick the right backend without a schema migration.
     #[arg(long)]
     metadata: Option<String>,
 }
@@ -365,14 +376,42 @@ struct AgentRemoveArgs {
 }
 
 #[derive(Args)]
+struct AgentGetArgs {
+    /// Agent name (primary key)
+    name: String,
+    /// Emit a single JSON object on stdout instead of human-readable lines
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct AgentListArgs {
+    /// Emit a JSON array (each element matches `agent-get --json` shape) instead of the table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct SendArgs {
-    /// Pane name or UUID
+    /// Pane name, UUID, or agent name (codex_app_server agents are looked up by name).
     pane: String,
-    /// Text to send
+    /// Text/prompt to send
     text: String,
-    /// Delay in ms before sending the trailing carriage return (default 150)
+    /// Delay in ms before sending the trailing carriage return (biome_term only, default 150)
     #[arg(long, default_value_t = 150)]
     delay: u64,
+    /// Block until turn/completed (codex_app_server only). Default: true.
+    #[arg(long, default_value_t = true)]
+    wait: bool,
+    /// Fire-and-forget — return immediately after turn/start (codex_app_server only). Overrides --wait.
+    #[arg(long, default_value_t = false)]
+    no_wait: bool,
+    /// Max seconds to wait for turn/completed (codex_app_server only).
+    #[arg(long, default_value_t = 300)]
+    timeout: u64,
+    /// Stream events to stdout while waiting (codex_app_server only).
+    #[arg(long, default_value_t = false)]
+    follow: bool,
 }
 
 #[derive(Args)]
@@ -759,6 +798,141 @@ fn get_agent_metadata(cli: &CliContext, agent_name: &str) -> Result<String> {
         .and_then(|row| row.first())
         .map(|v| bsatn_unwrap_or(v, "{}"))
         .unwrap_or_else(|| "{}".to_string()))
+}
+
+// ── agent-get ────────────────────────────────────────────────────────────
+
+/// Decode a SQL cell into a stable JSON value:
+/// - Optional Sum types ([0,x]/[1,[]]) collapse to x or null.
+/// - Empty Strings (which the schema uses for non-Optional String columns) pass through as-is.
+/// - Other shapes pass through unchanged.
+fn cell_to_json(val: &Value) -> Value {
+    match val {
+        Value::Array(arr) if arr.len() == 2 => match arr[0].as_u64() {
+            Some(0) => arr[1].clone(),
+            Some(1) => Value::Null,
+            _ => val.clone(),
+        },
+        _ => val.clone(),
+    }
+}
+
+/// Extract (columns, rows) from the first SpacetimeDB SQL result set.
+fn extract_columns_and_rows(results: &[Value]) -> (Vec<String>, Vec<Vec<Value>>) {
+    let Some(first) = results.first() else {
+        return (Vec::new(), Vec::new());
+    };
+    let columns: Vec<String> = first
+        .get("schema")
+        .and_then(|s| s.get("elements"))
+        .and_then(|e| e.as_array())
+        .map(|elems| {
+            elems
+                .iter()
+                .filter_map(|e| {
+                    let name = e.get("name")?;
+                    if let Some(s) = name.as_str() {
+                        Some(s.to_string())
+                    } else {
+                        name.get("some").and_then(|s| s.as_str()).map(|s| s.to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let rows: Vec<Vec<Value>> = first
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_array().cloned())
+                .collect()
+        })
+        .unwrap_or_default();
+    (columns, rows)
+}
+
+/// Fetch a single agent row from the agents table by primary key.
+/// Returns (column_names, row_values) so callers can render however they like.
+fn fetch_agent_row(cli: &CliContext, name: &str) -> Result<Option<(Vec<String>, Vec<Value>)>> {
+    let query = format!(
+        "SELECT * FROM agents WHERE name = '{}'",
+        name.replace('\'', "''")
+    );
+    let results = sql_query(cli, &query)?;
+    let (columns, mut rows) = extract_columns_and_rows(&results);
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((columns, rows.remove(0))))
+}
+
+/// Fetch all agent rows. Returns (column_names, row_values_per_agent).
+fn fetch_all_agent_rows(cli: &CliContext) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let results = sql_query(cli, "SELECT * FROM agents")?;
+    Ok(extract_columns_and_rows(&results))
+}
+
+/// Convert a single agent row into the canonical JSON object shape used by both
+/// `agent-get --json` and `agent-list --json`. `metadata_json` is parsed as
+/// nested JSON so consumers can `jq '.metadata_json.kind'` directly.
+fn agent_row_to_json_object(columns: &[String], values: &[Value]) -> serde_json::Map<String, Value> {
+    let mut obj = serde_json::Map::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
+        let raw = values.get(idx).cloned().unwrap_or(Value::Null);
+        let decoded = cell_to_json(&raw);
+        let final_val = if col == "metadata_json" {
+            match &decoded {
+                Value::String(s) => {
+                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| decoded.clone())
+                }
+                _ => decoded.clone(),
+            }
+        } else {
+            decoded
+        };
+        obj.insert(col.clone(), final_val);
+    }
+    obj
+}
+
+fn cmd_agent_get(cli: &CliContext, name: &str, as_json: bool) -> Result<()> {
+    let Some((columns, values)) = fetch_agent_row(cli, name)? else {
+        eprintln!("agent '{name}' not found");
+        std::process::exit(2);
+    };
+
+    let obj = agent_row_to_json_object(&columns, &values);
+
+    if as_json {
+        out!("{}", serde_json::to_string(&Value::Object(obj))?);
+    } else {
+        for col in &columns {
+            let v = obj.get(col).cloned().unwrap_or(Value::Null);
+            let rendered = match &v {
+                Value::Null => "(null)".to_string(),
+                Value::String(s) => s.clone(),
+                _ => serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
+            };
+            out!("{col}: {rendered}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_agent_list(cli: &CliContext, as_json: bool) -> Result<()> {
+    if as_json {
+        let (columns, rows) = fetch_all_agent_rows(cli)?;
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|values| Value::Object(agent_row_to_json_object(&columns, values)))
+            .collect();
+        out!("{}", serde_json::to_string(&Value::Array(arr))?);
+        Ok(())
+    } else {
+        // Reuse the existing table renderer that `harness agents` uses.
+        sql(cli, "SELECT * FROM agents")
+    }
 }
 
 // ── Biome-aware CLI commands ────────────────────────────────────────────
@@ -1294,6 +1468,355 @@ fn get_agent_pane_id(cli: &CliContext, agent_name: &str) -> Result<Option<String
         .filter(|s| !s.is_empty()))
 }
 
+// ── codex_app_server agent kind plumbing ────────────────────────────────
+
+/// Snapshot of fields needed to dispatch a `send` to a codex_app_server agent.
+struct AgentForSend {
+    name: String,
+    kind: String,
+    workdir: Option<String>,
+    metadata: Value,
+    default_task: Option<String>,
+    biome_pane_id: Option<String>,
+    tmux_target: Option<String>,
+}
+
+fn normalize_agent_kind(raw: &str) -> String {
+    match raw.trim() {
+        "codex-app-server" | "codex_app_server" | "codex_app" | "codex-app" => {
+            "codex_app_server".to_string()
+        }
+        "" | "biome_term" | "biome-term" | "biome" => "biome_term".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Compose the metadata_json that gets written to the agents row. We thread the
+/// kind into metadata.kind so dispatch never needs a schema migration.
+fn compose_agent_metadata(user_metadata: Option<&str>, kind: &str) -> Result<String> {
+    let mut obj = match user_metadata {
+        Some(s) if !s.trim().is_empty() => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Object(map)) => map,
+            Ok(_) => return Err(anyhow!("--metadata must be a JSON object")),
+            Err(err) => return Err(anyhow!("--metadata is not valid JSON: {err}")),
+        },
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("kind".to_string(), Value::String(kind.to_string()));
+    Ok(Value::Object(obj).to_string())
+}
+
+/// Look up an agent by name; returns Some(snapshot) if a row exists.
+/// Falls back to None if `name` doesn't match an agent (caller will treat as a raw pane).
+fn lookup_agent_for_send(cli: &CliContext, name: &str) -> Result<Option<AgentForSend>> {
+    let rows = sql_rows(
+        cli,
+        &format!(
+            "SELECT name, biome_pane_id, workdir, default_task, tmux_target, metadata_json FROM agents WHERE name = '{}'",
+            name.replace('\'', "''")
+        ),
+    )?;
+    let Some(row) = rows.into_iter().next() else { return Ok(None) };
+    if row.len() < 6 {
+        return Ok(None);
+    }
+    let agent_name = bsatn_unwrap(&row[0]).unwrap_or_else(|| name.to_string());
+    let biome_pane_id = bsatn_unwrap(&row[1]);
+    let workdir = bsatn_unwrap(&row[2]);
+    let default_task = bsatn_unwrap(&row[3]);
+    let tmux_target = bsatn_unwrap(&row[4]);
+    let metadata_str = bsatn_unwrap_or(&row[5], "{}");
+    let metadata: Value = serde_json::from_str(&metadata_str).unwrap_or(json!({}));
+    let kind = metadata
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "biome_term".to_string());
+    Ok(Some(AgentForSend {
+        name: agent_name,
+        kind,
+        workdir,
+        metadata,
+        default_task,
+        biome_pane_id,
+        tmux_target,
+    }))
+}
+
+/// Persist the codex thread_id into the agent's metadata_json so subsequent
+/// sends can resume. Re-invokes `agent_add` (which is upsert) with the same
+/// non-mutating fields plus the augmented metadata.
+fn persist_codex_thread_id(cli: &CliContext, agent: &AgentForSend, thread_id: &str) -> Result<()> {
+    let mut meta_obj = match agent.metadata.as_object().cloned() {
+        Some(m) => m,
+        None => serde_json::Map::new(),
+    };
+    meta_obj.insert("kind".to_string(), Value::String("codex_app_server".to_string()));
+    meta_obj.insert(
+        "codex_thread_id".to_string(),
+        Value::String(thread_id.to_string()),
+    );
+    let metadata_str = Value::Object(meta_obj).to_string();
+    let biome_pane_id = agent
+        .biome_pane_id
+        .clone()
+        .unwrap_or_else(|| format!("codex-app-server:{}", agent.name));
+    call_reducer_silent(
+        cli,
+        "agent_add",
+        Some(vec![
+            Value::String(agent.name.clone()),
+            Value::String(biome_pane_id),
+            optional_json_string(agent.workdir.clone()),
+            optional_json_string(agent.default_task.clone()),
+            optional_json_string(agent.tmux_target.clone()),
+            some_json_string(metadata_str),
+        ]),
+    )
+}
+
+/// Run a one-shot codex_app_server send: spawn child, init, thread/start
+/// (or thread/resume if we have a thread_id), turn/start, drain events to
+/// JSONL, optionally to stdout, until turn/completed (or timeout).
+#[cfg(feature = "cli")]
+fn cmd_codex_send(cli: &CliContext, args: &SendArgs, agent: &AgentForSend) -> Result<()> {
+    use orchestrator_harness::codex_app_server::{append_event_jsonl, Session};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    let workdir = agent
+        .workdir
+        .clone()
+        .ok_or_else(|| anyhow!("agent '{}' has no workdir; cannot spawn codex app-server", agent.name))?;
+    let workdir_path = PathBuf::from(&workdir);
+    if !workdir_path.is_dir() {
+        return Err(anyhow!(
+            "agent workdir does not exist or is not a directory: {workdir}"
+        ));
+    }
+
+    let now = chrono::Utc::now();
+    let run_id = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let session_root = std::env::var("HARNESS_CODEX_SESSION_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from("/home/sdancer/orchestrator/analysis/codex-sessions")
+        });
+    let session_dir = session_root.join(&agent.name).join(&run_id);
+    std::fs::create_dir_all(&session_dir)
+        .with_context(|| format!("create session dir {}", session_dir.display()))?;
+    let events_path = session_dir.join("events.jsonl");
+
+    let _ = writeln!(
+        &mut io::stderr().lock(),
+        "[codex-send] agent={} workdir={} session_dir={}",
+        agent.name,
+        workdir_path.display(),
+        session_dir.display()
+    );
+
+    let session = Session::spawn(&workdir_path, &session_dir).context("spawn codex app-server")?;
+    let _init = session
+        .initialize("orchestrator-harness", "Orchestrator Harness", "0.1.0")
+        .context("initialize codex app-server")?;
+
+    let stored_thread_id = agent
+        .metadata
+        .get("codex_thread_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let thread_id = if let Some(tid) = stored_thread_id.clone() {
+        // Try to resume; if codex rejects (e.g. the thread on disk is gone),
+        // fall back to a fresh thread/start.
+        match session.request(
+            "thread/resume",
+            json!({
+                "threadId": tid,
+                "approvalPolicy": "never",
+                "sandboxPolicy": { "type": "dangerFullAccess" },
+                "cwd": workdir_path.to_string_lossy(),
+            }),
+            std::time::Duration::from_secs(15),
+        ) {
+            Ok(_resume_result) => {
+                let _ = writeln!(
+                    &mut io::stderr().lock(),
+                    "[codex-send] resumed thread {tid}"
+                );
+                tid
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    &mut io::stderr().lock(),
+                    "[codex-send] thread/resume failed ({err:#}); starting fresh thread"
+                );
+                let started = session.thread_start(&workdir_path).context("thread/start fallback")?;
+                started.thread_id
+            }
+        }
+    } else {
+        let started = session.thread_start(&workdir_path).context("thread/start")?;
+        let _ = writeln!(
+            &mut io::stderr().lock(),
+            "[codex-send] started new thread {}",
+            started.thread_id
+        );
+        started.thread_id
+    };
+
+    // Persist the thread_id back to metadata before starting the turn so a crash
+    // mid-turn still leaves the resume id in place.
+    persist_codex_thread_id(cli, agent, &thread_id)
+        .context("persist codex_thread_id to agent metadata")?;
+
+    let title = format!("harness send {}", &args.pane);
+    let turn = session
+        .turn_start(&thread_id, &args.text, &workdir_path, &title)
+        .context("turn/start")?;
+    let _ = writeln!(
+        &mut io::stderr().lock(),
+        "[codex-send] turn.id={}",
+        turn.turn_id
+    );
+
+    if args.no_wait {
+        // Fire-and-forget: persist last_turn_id and exit. We deliberately don't
+        // shutdown the session here — it'll be reaped on Drop. Callers should
+        // use --wait when they need the turn output.
+        out!(
+            "{}",
+            json!({
+                "agent": agent.name,
+                "thread_id": thread_id,
+                "turn_id": turn.turn_id,
+                "events_jsonl": events_path.display().to_string(),
+                "status": "started",
+            })
+        );
+        return Ok(());
+    }
+
+    let timeout = Duration::from_secs(args.timeout);
+    let deadline = Instant::now() + timeout;
+    let mut completed = false;
+    let mut completed_status: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
+    let mut event_count: u64 = 0;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match session
+            .events
+            .recv_timeout(remaining.min(Duration::from_secs(5)))
+        {
+            Ok(ev) => {
+                let _ = append_event_jsonl(&events_path, &ev);
+                event_count += 1;
+                let replied = session.auto_reply(&ev).unwrap_or(false);
+                if args.follow && !replied {
+                    let _ = writeln!(
+                        &mut io::stderr().lock(),
+                        "[codex-send] event method={} id={:?}",
+                        ev.method,
+                        ev.id
+                    );
+                }
+                // Capture the most recent assistant text for the final report.
+                if ev.method == "item/completed"
+                    || ev.method == "item/updated"
+                    || ev.method == "thread/itemAppended"
+                    || ev.method == "thread/itemUpdated"
+                {
+                    if let Some(text) = extract_assistant_text(&ev.params) {
+                        last_assistant_text = Some(text);
+                    }
+                }
+                if ev.method == "turn/completed" {
+                    completed = true;
+                    completed_status = ev
+                        .params
+                        .get("turn")
+                        .and_then(|t| t.get("status"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    break;
+                }
+                if ev.method == "turn/failed" {
+                    completed_status = Some("failed".to_string());
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = session.shutdown();
+                return Err(anyhow!("event channel closed before turn/completed"));
+            }
+        }
+    }
+
+    if !completed {
+        let _ = session.turn_interrupt(&thread_id, &turn.turn_id);
+        let _ = session.shutdown();
+        return Err(anyhow!(
+            "timed out after {}s waiting for turn/completed (events seen: {event_count})",
+            args.timeout
+        ));
+    }
+
+    let _ = session.shutdown();
+    let report = json!({
+        "agent": agent.name,
+        "thread_id": thread_id,
+        "turn_id": turn.turn_id,
+        "events_jsonl": events_path.display().to_string(),
+        "status": completed_status.clone().unwrap_or_else(|| "unknown".to_string()),
+        "events_seen": event_count,
+        "last_assistant_text": last_assistant_text,
+    });
+    out!("{}", report);
+    Ok(())
+}
+
+#[cfg(not(feature = "cli"))]
+fn cmd_codex_send(_cli: &CliContext, _args: &SendArgs, _agent: &AgentForSend) -> Result<()> {
+    Err(anyhow!("codex_app_server kind requires the cli feature"))
+}
+
+/// Try to pull an assistant text payload out of a thread/itemAppended or
+/// thread/itemUpdated params. Best-effort; returns None if the shape doesn't
+/// look like an assistant message.
+fn extract_assistant_text(params: &Value) -> Option<String> {
+    let item = params.get("item")?;
+    // v2 protocol uses `type` (e.g. "agentMessage", "userMessage", "reasoning").
+    // Older / alternate shapes use `itemType`.
+    let item_type = item
+        .get("type")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.get("itemType").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if item_type != "agentMessage" && item_type != "assistantMessage" && item_type != "text" {
+        return None;
+    }
+    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    // Fallback: look for a `content` array with text segments.
+    if let Some(arr) = item.get("content").and_then(|v| v.as_array()) {
+        let mut buf = String::new();
+        for seg in arr {
+            if let Some(t) = seg.get("text").and_then(|v| v.as_str()) {
+                buf.push_str(t);
+            }
+        }
+        if !buf.is_empty() {
+            return Some(buf);
+        }
+    }
+    None
+}
+
 // ── Core CLI infrastructure ─────────────────────────────────────────────
 
 fn main() -> ExitCode {
@@ -1561,18 +2084,35 @@ fn run() -> Result<()> {
                 }),
             ]),
         ),
-        Commands::AgentAdd(args) => call_reducer(
-            &context,
-            "agent_add",
-            Some(vec![
-                Value::String(args.name),
-                Value::String(args.biome_pane_id),
-                optional_json_string(args.workdir),
-                optional_json_string(args.default_task),
-                optional_json_string(args.tmux_target),
-                optional_json_string(args.metadata),
-            ]),
-        ),
+        Commands::AgentAdd(args) => {
+            let kind = normalize_agent_kind(&args.kind);
+            let biome_pane_id = match (kind.as_str(), args.biome_pane_id.clone()) {
+                ("codex_app_server", None) => format!("codex-app-server:{}", args.name),
+                ("codex_app_server", Some(id)) => id,
+                ("biome_term", Some(id)) => id,
+                ("biome_term", None) => {
+                    return Err(anyhow!("--biome-pane-id is required for kind=biome_term"));
+                }
+                (other, _) => {
+                    return Err(anyhow!(
+                        "unknown agent kind '{other}' (expected biome_term or codex_app_server)"
+                    ));
+                }
+            };
+            let metadata = compose_agent_metadata(args.metadata.as_deref(), &kind)?;
+            call_reducer(
+                &context,
+                "agent_add",
+                Some(vec![
+                    Value::String(args.name),
+                    Value::String(biome_pane_id),
+                    optional_json_string(args.workdir),
+                    optional_json_string(args.default_task),
+                    optional_json_string(args.tmux_target),
+                    some_json_string(metadata),
+                ]),
+            )
+        }
         Commands::AgentCreate(args) => {
             let pane_id = biome_create_pane(&context, &args.name, None)?;
             let _ = writeln!(
@@ -1616,7 +2156,17 @@ fn run() -> Result<()> {
             "agent_remove",
             Some(vec![Value::String(args.name), Value::Bool(args.delete)]),
         ),
+        Commands::AgentGet(args) => cmd_agent_get(&context, &args.name, args.json),
+        Commands::AgentList(args) => cmd_agent_list(&context, args.json),
         Commands::Send(args) => {
+            // If `pane` matches a known agent name with kind=codex_app_server in metadata,
+            // dispatch through the codex flow. Otherwise fall back to biome_term path
+            // (preserves prior behavior for raw pane names/UUIDs and biome_term agents).
+            if let Some(agent_meta) = lookup_agent_for_send(&context, &args.pane)? {
+                if agent_meta.kind == "codex_app_server" {
+                    return cmd_codex_send(&context, &args, &agent_meta);
+                }
+            }
             let pane_id = biome_resolve_pane(&context, &args.pane)?;
             biome_send_text_delayed(&context, &pane_id, &args.text, args.delay)?;
             out!("sent to {pane_id}");

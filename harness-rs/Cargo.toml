@@ -11,6 +11,14 @@ crate-type = ["cdylib", "rlib"]
 name = "harness"
 required-features = ["cli"]
 
+[[example]]
+name = "codex_app_server_smoke"
+required-features = ["cli"]
+
+[[example]]
+name = "codex_app_server_approval_probe"
+required-features = ["cli"]
+
 [features]
 cli = ["dep:reqwest", "dep:dotenvy", "dep:toml"]
 
