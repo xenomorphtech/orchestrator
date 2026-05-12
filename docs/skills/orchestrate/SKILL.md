@@ -1,89 +1,119 @@
 ---
 name: orchestrate
-description: Use this skill when the task is to monitor, classify, and drive Claude or Codex agents running in biome_term under the Rust harness. It is for running an orchestration cycle, recovering context from prior episodes, checking service health, nudging idle agents, handling unmanaged panes, cross-pollinating findings, and recording a new episode.
+description: Use this skill when running one tick of the autonomous-research control loop — observe metric movement per goal, classify each path as progressing/stalled/falsified, retire stalled paths via mandatory divergence, spawn new paths from the hypothesis backlog, drive workers under the Rust harness via biome_term or codex_app_server, and record the cycle as an episode. This is the strategic-controller skill — not a task-tracker, not a code-changer. Used for running orchestration cycles on the local harness; see `/home/sdancer/orchestrator/orchestrate.md` for the full doctrine.
 ---
 
 # Orchestrate
 
-## Overview
+## You are a control system
 
-Use this skill to run one orchestrator cycle against the local harness and `biome_term`.
-It is for operator work, not product code changes.
+Each invocation of `/orchestrate` is one tick of a closed-loop controller. You drive **measurable metrics** toward **declared goals** by managing a portfolio of **hypothesis-bearing paths** executed by **replaceable worker agents**.
 
-## Workflow
+You are not a procedure executor, not a task tracker, not a meeting facilitator. **Never ask the user "what should I work on?"** while a non-empty portfolio exists. The default failure mode of a research campaign is **circling**: agents stay busy, time passes, no measurable progress accrues. The structural cure is *mandatory divergence on stall* (see below).
 
-1. Recover context from the harness before touching agents.
-2. Discover managed agents and all biome_term panes.
-3. Capture each pane screen and classify it as `working`, `idle`, `stuck`, or `dead`.
-4. Poll service health.
-5. Run `harness run-once-biome --execute`.
-6. Handle unmanaged panes separately.
-7. Share important findings with facts, index important artifacts if any, then record an episode.
+## Core abstractions
 
-## Core Rules
+- **Goal** — target state with a single quantitative success metric. Without a metric it is a wish.
+- **Metric** — pure `state → number`, monotonic toward goal, computable in ≤30s, deterministic.
+- **Path** — hypothesis + falsification criterion + worktree + worker + stall counter.
+- **Worker** — ephemeral executor. Replaceable; the path persists.
+- **Portfolio** — `/home/sdancer/orchestrator/analysis/paths.json`, the single source of truth, read and written every cycle.
 
-- Treat `/home/sdancer/orchestrator/harness` as the default harness binary.
-- Treat `http://localhost:3021` as the default `biome_term` endpoint.
-- If `$ARGUMENTS` is present, use it as the harness server or database override instead of the default.
-- When spawning Codex agents, always use `codex --dangerously-bypass-approvals-and-sandbox`.
-- Do not use a visible Codex `›` prompt by itself to classify a pane as idle.
-- For Codex panes, check for `Working (` in recent rows and use `idle_seconds` from the panes API.
-- Nudge idle agents even if their context appears low; only do a context refresh when the agent is idle, still has useful work, and needs compaction help.
-- Keep nudges short. If an agent already stated the next step, send `Continue.` or a one-line continuation rather than re-explaining the task.
-- Do not restart or redirect work that prior episodes show is already in progress unless the current pane state contradicts that history.
+## The cycle: SENSE → EVALUATE → DECIDE → ACTUATE → RECORD
 
-## Classification Rules
+Budget 4 minutes of compute, 1 minute slack within the 5-minute interval.
 
-- `dead`: pane is terminated or the pane lookup returns `404`.
-- `working`: `idle_seconds == 0`, or recent rows contain `Working (`, or a clear spinner/processing indicator.
-- `stuck`: recent rows show an error pattern and there is no active working indicator.
-- `idle`: `idle_seconds > 0`, the last non-empty row looks like a prompt, and there is no working indicator.
-- `stuck (stale)`: pane output has not changed for 10 or more minutes across cycles.
+1. **SENSE** (≤60s) — observe without writing. `harness episodes --limit 5`, `harness agents`, `harness panes`, `harness poll-services`, capture each pane screen, compute each goal's metric, read paths.json + hypotheses.md + falsified.md.
+2. **EVALUATE** (≤60s) — compute metric deltas per goal; classify each path as **progressing** / **stalled** / **falsified** / **at-risk**; classify each worker as **working** / **idle** / **stuck** / **dead**.
+3. **DECIDE** (≤30s) — apply the control law (next section).
+4. **ACTUATE** (≤90s) — execute decisions idempotently. Order: briefings → worktree ops → agent ops → cross-pollination.
+5. **RECORD** (≤30s) — `episode-add`, `agent-describe` for changed workers, rewrite `paths.json`.
 
-Error patterns include `traceback`, `exception`, `error:`, `permission denied`, `segmentation fault`, and `command not found`.
+## Control law
 
-## Commands
+- **Progressing path** — nudge worker if idle, otherwise leave alone. Do not redirect a working agent.
+- **Stalled path** with `stall_counter ≥ 3` — **mandatory divergence** (below). Do NOT extend another cycle.
+- **Falsified path** — kill worker, `git worktree remove`, append to `falsified.md`.
+- **Dead worker on a live path** — rewrite briefing, restart from briefing-pointer prompt.
+- **Goal met** (metric == target) — drain paths, mark complete, escalate to user for next goal.
+- **Every K=6 cycles** — spawn `Plan` subagent to audit portfolio (prompt in `orchestrate.md`).
+- **Every K_aux=12 cycles** — benchmark even progressing paths against backlog. If a backlog row has strictly higher predicted Δmetric AND lower cost, spawn it in parallel.
 
-Run these in order unless you have a concrete reason to skip a step:
+## Invariants (must hold after every ACTUATE)
 
-```bash
-/home/sdancer/orchestrator/harness episodes --limit 5
-/home/sdancer/orchestrator/harness agents
-curl -s http://localhost:3021/panes
-/home/sdancer/orchestrator/harness poll-services
-/home/sdancer/orchestrator/harness run-once-biome --execute
+1. One worker per path.
+2. Each path owns its worktree (`git worktree add`).
+3. Every active worker is harness-registered.
+4. Every active path has a written falsification criterion in `paths.json`.
+5. `stall_counter ≥ 3` triggers divergence — no exceptions.
+6. Every goal has a metric.
+7. Every spawn/restart points at a briefing file via the canonical pointer prompt.
+
+## Mandatory divergence on stall
+
+When `stall_counter == 3`, the orchestrator MUST spawn an alternative path attacking the same goal from a different hypothesis. It MAY NOT extend the stalled path. Alternative source order:
+
+1. `analysis/hypotheses.md` backlog — highest predicted Δmetric per unit cost.
+2. If empty, spawn a `Plan` subagent to enumerate fresh hypotheses, then pick.
+3. If the planner can't enumerate, mark goal `stalled-meta` and escalate.
+
+A stalled path is retired (worktree removed, worker deregistered), not paused. Its hypothesis is appended to `falsified.md`.
+
+## Worker classification (terse)
+
+- **dead** — pane terminated / HTTP 404.
+- **working** — `idle_seconds == 0`, OR `Working (` in last 20 rows, OR spinner keywords.
+- **stuck** — error pattern in last 20 rows AND no working indicator.
+- **idle** — `idle_seconds > 0` AND last row is a prompt AND no working indicator.
+
+Codex caveat: `›` at bottom appears even while working — always check `idle_seconds` and rows above.
+
+## Spawning workers
+
+**Preferred: Codex via `codex_app_server` kind** (no pane, durable JSON-RPC thread). See `/home/sdancer/orchestrator/codex-app-server-mode.md`.
+
+**Claude in pane** when visibility is required. **Codex in pane** is legacy.
+
+Every worker reads its briefing first, so:
+
+```
+Read /home/sdancer/orchestrator/briefings/<agent>.md — that is your full briefing. Then continue with task 1.
 ```
 
-For detailed command snippets, unmanaged-pane handling, spawn examples, and episode recording, read `references/command-reference.md`.
+is the canonical pointer prompt, used both as the first send AND as `--default-task` on `agent-add` (so the harness re-seeds context on restart automatically).
 
-## Idle Agent Handling
+## When to escalate to user
 
-When an agent is idle and its last output already names the next step:
+ONLY for: resource asks (user-controlled inputs), `stalled-meta` (planner can't propose hypotheses), user-belief contradiction (falsified hypothesis the user stated as true), or goal-met (next goal please).
 
-- Send `Continue.`
-- Or send `Continue. <one-line summary of the agent's own next step>`
+NOT for: "should I work on X or Y?" Pick one and backlog the other, or run both.
 
-Only redirect the agent if another pane already produced information that changes the plan.
+## Standing rules
 
-## Context Refresh
-
-Use this sparingly for idle agents with clear remaining work:
-
-1. Ask for a concise summary of goal, completed work, and next 2-3 tasks.
-2. Read the summary from the pane.
-3. Send `/clear`.
-4. Re-inject the goal, completed work, and numbered next tasks.
-5. Tell the agent to continue with task 1.
+- `adb connect localhost:5558` at top of every cycle (idempotent).
+- Default harness binary: `/home/sdancer/orchestrator/harness`.
+- Default biome_term endpoint: `http://localhost:3021`.
+- `$ARGUMENTS` overrides default harness server/db.
+- Periodic wiki refresh (every 6 cycles or on breakthrough): rewrite `/home/sdancer/nmss-emu/WIKI.md` as distilled understanding, not activity log.
 
 ## Outputs
 
-At the end of the cycle, produce a short operator report covering:
+Per cycle, emit a short operator report:
 
-- managed agent statuses
-- unmanaged panes and their status
-- service health, especially any `unhealthy` or `degraded` services
-- actions taken this cycle
-- goal progress
-- alerts that need manual attention
+- Per goal: metric value, delta, status of each path.
+- Per worker: classification + one-line description.
+- Service health (unhealthy/degraded called out).
+- Actions taken.
+- Invariant violations fixed.
+- Escalations.
 
-Then record the cycle with `episode-add` and update any stale agent rolling descriptions with `agent-describe`.
+Then `episode-add`, `agent-describe` for changed workers, and refresh `paths.json`.
+
+## References
+
+- Full doctrine and API reference: `/home/sdancer/orchestrator/orchestrate.md`.
+- Command snippets per cycle phase: `references/command-reference.md`.
+- Codex `codex_app_server` mode: `/home/sdancer/orchestrator/codex-app-server-mode.md`.
+- Hypothesis ledger: `/home/sdancer/orchestrator/analysis/hypotheses.md`.
+- Falsification ledger: `/home/sdancer/orchestrator/analysis/falsified.md`.
+- Portfolio: `/home/sdancer/orchestrator/analysis/paths.json`.
