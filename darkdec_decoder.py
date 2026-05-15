@@ -191,7 +191,10 @@ def decimate(points, limit):
     if len(points) <= limit:
         return points
     step = max(1, math.ceil(len(points) / limit))
-    return points[::step] + ([] if points[-1] is points[::step][-1] else [points[-1]])
+    kept = points[::step]
+    if kept[-1] is not points[-1]:
+        kept.append(points[-1])
+    return kept
 
 
 def write_csv(path, rows, fields):
@@ -237,15 +240,15 @@ def write_report(out, pcap, packets, interfaces, blocks, payloads, frames, playe
         lines.append(f'| {direction} | {length} | {count:,} |')
     lines += ['', '## Player', '']
     if p:
-        lines.append(f'- Updates: {p['count']:,}; time {p['first_t']:.3f}s to {p['last_t']:.3f}s.')
-        lines.append(f'- Start: ({p['start_x']:.2f}, {p['start_z']:.2f}); last: ({p['last_x']:.2f}, {p['last_z']:.2f}).')
-        lines.append(f'- Bounds X {p['min_x']:.2f}..{p['max_x']:.2f}, Z {p['min_z']:.2f}..{p['max_z']:.2f}; decoded path length {p['distance']:.2f}.')
+        lines.append('- Updates: {count:,}; time {first_t:.3f}s to {last_t:.3f}s.'.format(**p))
+        lines.append('- Start: ({start_x:.2f}, {start_z:.2f}); last: ({last_x:.2f}, {last_z:.2f}).'.format(**p))
+        lines.append('- Bounds X {min_x:.2f}..{max_x:.2f}, Z {min_z:.2f}..{max_z:.2f}; decoded path length {distance:.2f}.'.format(**p))
     lines += ['', '## Entity candidates', '', f'- Entity IDs found: {len(entities)}', f'- Entity movement updates: {sum(len(points) for points in entities.values()):,}', '', '| ID | Updates | Last t | Last X | Last Z | Distance |', '|---|---:|---:|---:|---:|---:|']
     for row in sorted([dict(summary(points), entity_id=f'0x{eid:02x}') for eid, points in entities.items()], key=lambda row: row['count'], reverse=True)[:20]:
-        lines.append(f'| {row['entity_id']} | {row['count']:,} | {row['last_t']:.2f} | {row['last_x']:.2f} | {row['last_z']:.2f} | {row['distance']:.2f} |')
+        lines.append('| {entity_id} | {count:,} | {last_t:.2f} | {last_x:.2f} | {last_z:.2f} | {distance:.2f} |'.format(**row))
     lines += ['', '## Active near capture end', '', '| ID | Last t | X | Z | Distance from player |', '|---|---:|---:|---:|---:|']
     for row in active_end(player, entities)[:20]:
-        lines.append(f'| {row['entity_id']} | {row['last_t']:.2f} | {row['x']:.2f} | {row['z']:.2f} | {row['distance_from_player']:.2f} |')
+        lines.append('| {entity_id} | {last_t:.2f} | {x:.2f} | {z:.2f} | {distance_from_player:.2f} |'.format(**row))
     (out / 'decode_report.md').write_text(nl.join(lines) + nl, encoding='utf-8')
 
 
