@@ -4,7 +4,14 @@ Windows live minimap for Dark December traffic on TCP port `10001`.
 
 The sniffer captures packets through Npcap/WinPcap-compatible pcap, reassembles
 the TCP payload streams by sequence number, decodes the known Dark December
-movement frames, and serves a local browser minimap over HTTP/SSE.
+movement frames, and renders a native `egui` minimap. A browser minimap is still
+available as a fallback/debug view.
+
+## Why egui
+
+The web UI is useful for fast protocol debugging and remote screenshots, but the
+native `egui` app is the better default while playing: one process, one window,
+no browser dependency, lower operational friction, and easy `.exe` packaging.
 
 ## Windows setup
 
@@ -17,14 +24,27 @@ Example:
 
 ```powershell
 $env:LIBPCAP_LIBDIR = "C:\Npcap-SDK\Lib\x64"
+$env:PATH = "C:\Windows\System32\Npcap;$env:PATH"
 cargo run --release -- --list-devices
 cargo run --release -- --iface "Ethernet" --port 10001
 ```
 
-Then open:
+`cargo run` starts the native `egui` minimap by default. The browser minimap is
+still available:
 
-```text
-http://127.0.0.1:17891/
+```powershell
+cargo run --release --bin darkdec-minimap-web -- --iface "Ethernet" --port 10001
+```
+
+Then open `http://127.0.0.1:17891/`.
+
+On this workstation the SDK was extracted to `..\..\npcap-sdk-1.16`. The helper
+script detects that path, adds the Npcap DLL directory to `PATH`, and runs the
+native minimap:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run-egui.ps1 -ListDevices
+powershell -ExecutionPolicy Bypass -File .\run-egui.ps1 -Iface "Realtek" -Port 10001
 ```
 
 ## Offline replay
@@ -34,6 +54,7 @@ and minimap without a live capture:
 
 ```powershell
 cargo run --release --no-default-features -- --offline-stream-dir ..\streams\first_quest
+cargo run --release --no-default-features --features egui -- --offline-stream-dir ..\streams\first_quest
 ```
 
 ## Useful flags

@@ -10,11 +10,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "live-pcap")]
+use std::time::Instant;
 
 use darkdec::decode_frame;
 use state::WorldState;
-use tcp_reassembly::{frames_from_ordered_stream, Direction, TcpReassembler};
+use tcp_reassembly::{frames_from_ordered_stream, Direction};
+#[cfg(feature = "live-pcap")]
+use tcp_reassembly::TcpReassembler;
 use web::{broadcast, new_clients, spawn_server};
 
 #[derive(Clone, Debug)]

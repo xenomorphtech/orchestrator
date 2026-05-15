@@ -48,20 +48,20 @@ Open `minimap.html` in a browser and use the timeline slider to inspect movement
 
 ## Live minimap sniffer
 
-`minimap-sniffer/` contains a Rust + browser minimap for live Windows captures
-through Npcap/WinPcap-compatible pcap.
+`minimap-sniffer/` contains a Rust + egui minimap for live Windows captures
+through Npcap/WinPcap-compatible pcap. A browser view remains available for
+debugging.
 
 ```powershell
 cd minimap-sniffer
-cargo run --release -- --list-devices
-cargo run --release -- --iface "Ethernet" --port 10001
+powershell -ExecutionPolicy Bypass -File .\run-egui.ps1 -ListDevices
+powershell -ExecutionPolicy Bypass -File .\run-egui.ps1 -Iface "Realtek" -Port 10001
 ```
 
-It serves the minimap at `http://127.0.0.1:17891/`. It can also replay the
-committed TCP stream export:
+It can also replay the committed TCP stream export:
 
 ```powershell
-cargo run --release --no-default-features -- --offline-stream-dir ..\streams\first_quest
+cargo run --release --no-default-features --features egui -- --offline-stream-dir ..\streams\first_quest
 ```
 
 ## Privacy note
