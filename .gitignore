@@ -1,3 +1,33 @@
 harness-rs/target/
 .env
 .claude/scheduled_tasks.lock
+.claude/
+
+# Large data — codex event streams, traces, memdumps
+analysis/codex-sessions/
+analysis/trace_diff_*/
+analysis/onleave_*/
+analysis/itrace_*/
+analysis/checkpoints/
+analysis/snapshot_mutation_*/
+analysis/codex-protocol/
+analysis/stage_drv_io_table.jsonl
+
+# Game binaries / APKs / fixtures
+games/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Tool-specific scratch
+*.bin
+*.pcap
+*.pcapng
+*.so
+*.apk
+*.dex
+
+# Stray scratch files
+*.tmp_directive

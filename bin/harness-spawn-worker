@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# harness-spawn-worker <agent-name> [override_prompt]
+#
+# Invoked by the harness-worker@<name>.service systemd unit. Runs one codex turn
+# under systemd ownership (system.slice), fully isolated from any user session.
+#
+# Reads the agent's default_task from harness DB unless a non-empty override
+# prompt is passed as $2. Calls `harness send` with --wait, allowing systemd
+# to track the turn's lifetime via the wrapper process.
+
+set -euo pipefail
+
+NAME="${1:-}"
+OVERRIDE_PROMPT="${2:-}"
+
+if [[ -z "$NAME" ]]; then
+  echo "harness-spawn-worker: missing agent name" >&2
+  exit 64
+fi
+
+HARNESS=/home/sdancer/orchestrator/harness
+
+PROMPT_FILE="/var/lib/harness-worker/${NAME}.prompt"
+
+if [[ -n "$OVERRIDE_PROMPT" ]]; then
+  PROMPT="$OVERRIDE_PROMPT"
+elif [[ -s "$PROMPT_FILE" ]]; then
+  PROMPT=$(cat "$PROMPT_FILE")
+  mv "$PROMPT_FILE" "${PROMPT_FILE}.consumed-$(date -u +%Y%m%dT%H%M%SZ)"
+else
+  PROMPT=$("$HARNESS" agent-get "$NAME" --json 2>/dev/null | jq -r '.default_task // empty')
+fi
+
+if [[ -z "$PROMPT" ]]; then
+  echo "harness-spawn-worker: agent '$NAME' has no default_task and no override prompt" >&2
+  exit 65
+fi
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting turn for $NAME" >&2
+exec "$HARNESS" send "$NAME" "$PROMPT" --wait --timeout 10800
