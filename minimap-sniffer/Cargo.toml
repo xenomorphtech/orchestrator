@@ -1,0 +1,12 @@
+[package]
+name = "darkdec-minimap-sniffer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["live-pcap"]
+live-pcap = ["dep:pcap"]
+
+[dependencies]
+pcap = { version = "2.4", optional = true }

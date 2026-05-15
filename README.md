@@ -46,6 +46,24 @@ The script writes:
 
 Open `minimap.html` in a browser and use the timeline slider to inspect movement.
 
+## Live minimap sniffer
+
+`minimap-sniffer/` contains a Rust + browser minimap for live Windows captures
+through Npcap/WinPcap-compatible pcap.
+
+```powershell
+cd minimap-sniffer
+cargo run --release -- --list-devices
+cargo run --release -- --iface "Ethernet" --port 10001
+```
+
+It serves the minimap at `http://127.0.0.1:17891/`. It can also replay the
+committed TCP stream export:
+
+```powershell
+cargo run --release --no-default-features -- --offline-stream-dir ..\streams\first_quest
+```
+
 ## Privacy note
 
 Raw captures are intentionally ignored by `.gitignore`. They may contain IPs,

@@ -1,4 +1,5 @@
 harness-rs/target/
+minimap-sniffer/target/
 .env
 .claude/scheduled_tasks.lock
 .claude/
@@ -40,4 +41,3 @@ __pycache__/
 # Tracked Dark December TCP stream exports
 !streams/
 !streams/**
-
