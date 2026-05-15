@@ -16,13 +16,19 @@ analysis/stage_drv_io_table.jsonl
 # Game binaries / APKs / fixtures
 games/
 
-# Python bytecode
+# Generated decoder outputs (from upstream darkdecember work)
+darkdec_output/
+*_output/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+*.py[cod]
 
 # Tool-specific scratch
 *.bin
+# Raw captures can contain sensitive traffic/session metadata
 *.pcap
 *.pcapng
 *.so
