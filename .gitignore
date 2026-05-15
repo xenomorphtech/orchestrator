@@ -1,0 +1,11 @@
+# Raw captures can contain sensitive traffic/session metadata.
+*.pcap
+*.pcapng
+
+# Generated decoder outputs.
+darkdec_output/
+*_output/
+
+# Python cache.
+__pycache__/
+*.py[cod]
