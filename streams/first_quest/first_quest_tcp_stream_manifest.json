@@ -1,0 +1,27 @@
+{
+  "source_capture": "CAPTURA DARK DECEMBER PRIMERA QUEST.pcapng",
+  "port": 10001,
+  "format": "raw TCP payload byte streams, reassembled per direction by TCP sequence number",
+  "directions": {
+    "c2s": {
+      "file": "first_quest_c2s.tcpstream.bin",
+      "segments": 12727,
+      "bytes": 490870,
+      "sha256": "b0b7dc2444650d65331c265701ffd1776fb267f67d4f43f9ab2ff5c6d79bb303",
+      "gaps": [],
+      "fully_duplicate_segments_skipped": 0
+    },
+    "s2c": {
+      "file": "first_quest_s2c.tcpstream.bin",
+      "segments": 11103,
+      "bytes": 1670631,
+      "sha256": "cdffbd7de39e230e69bb0d8b476ccb709c0c222173448d8679da9cb853f1bdd7",
+      "gaps": [],
+      "fully_duplicate_segments_skipped": 0
+    }
+  },
+  "flow_packet_counts": {
+    "192.168.1.36:65261->158.101.105.58:10001": 12727,
+    "158.101.105.58:10001->192.168.1.36:65261": 11103
+  }
+}
