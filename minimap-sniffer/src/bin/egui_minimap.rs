@@ -144,7 +144,7 @@ impl MinimapApp {
 
         if response.dragged() {
             self.follow = false;
-            let delta = response.drag_delta();
+            let delta = ui.input(|input| input.pointer.delta());
             self.center.0 -= delta.x / self.zoom;
             self.center.1 += delta.y / self.zoom;
         }
