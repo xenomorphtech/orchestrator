@@ -1,6 +1,7 @@
 harness-rs/target/
 minimap-sniffer/target/
 .env
+.dash_secret_key
 .claude/scheduled_tasks.lock
 .claude/
 
