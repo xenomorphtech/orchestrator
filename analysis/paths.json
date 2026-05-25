@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_cycle_at": "2026-05-15T03:40Z",
+  "last_cycle_at": "2026-05-23T18:52Z",
   "harness_db_status": "up",
   "harness_db_notes": "Recovered cycle 2 via .env: HARNESS_SERVER=http://127.0.0.1:3000. The ~/.config/spacetime/cli.toml default_server=127.0.0.1:3001 is stale (no SpacetimeDB has ever listened on :3001 in this boot). All harness state lives on :3000. DB has 1723 facts and shows campaign was active through 2026-05-03 06:57Z, then 8 days dormant.",
   "paths_json_freshness": "2026-05-15T03:40Z",
@@ -1545,6 +1545,126 @@
       "closure_kind": "done-with-caveat",
       "closure_note": "Formally closed cycle 204 at 0.6/1.0 done-with-caveat per K=6 planner audit. 5/5 client-side gates mapped, 3 cleared (native PGS callbacks, manifest app_id, downstream Java callbacks); final blocker is GMS SignInPerformer requiring real Google-registered OAuth 2.0 web client ID for thered (user resource). Backlog hypotheses queued (direct-https-construction, snapshot-cached-https-mine, coresident-pgs-uprobe). Cached MAGIC32 = 2FCF997702C244969BFEAF7F0D6AAA1C continues to serve all known cert consumers.",
       "gate_resolution_required_at_user_level": true
+    },
+    "albion_action_loop": {
+      "metric_name": "state.zone non-null on https://albion.orch.run/state",
+      "current": 0,
+      "target": 1,
+      "paths": [
+        {
+          "name": "accountportal-cdp",
+          "worker": "albion-accountportal-cdp",
+          "worktree": "/home/sdancer/albion-accountportal-cdp",
+          "hypothesis": "A headed browser on remote vast.ai DISPLAY=:2 lets a human-solved reCAPTCHA + AlbionAccount login yield a refresh token persistable to Unity prefs, which Albion will replay to skip 2FA.",
+          "falsification": "Headed-browser flow reaches 2FA but cannot persist a token Albion accepts, OR Albion refuses any persisted token across container rotation.",
+          "stall_counter": 133,
+          "last_metric_move_at": "2026-05-23T13:58Z",
+          "status": "partial-breakthrough-driver-exited",
+          "notes": "turn-3 c3937; remote pip install + chromium download in progress; SCP of driver+inbox_poll confirmed via outputDeltas",
+          "notes_2026-05-23": "3 consecutive 1-hour captcha-wait windows expired without user VNC click; sibling captcha-vision-solve spawned c4069",
+          "notes_2026-05-23T17:39Z": "L3.5 unblocked by vision-solve sibling; form submitted; awaiting 2FA + token capture cascade",
+          "notes_2026-05-23T17:43Z": "Driver exited 17:41:58Z after writing refresh_token.json with only _gcl_au fallback cookie. Cascade broke at L4 (token capture)."
+        },
+        {
+          "name": "photon-sdk-research",
+          "worker": "albion-photon-sdk-research",
+          "worktree": "/home/sdancer/albion-photon-sdk-research",
+          "hypothesis": "IL2CPP INT3 trap on LoginGui::Connect + helper-thread managed-string substitution can inject a captured 2FA code without keyboard XTEST.",
+          "falsification": "XTEST OK-click + Return submit on :3 do not trigger the gated getter-caller path; submit gesture never reaches the field.",
+          "stall_counter": 0,
+          "last_metric_move_at": "2026-05-23T13:00Z",
+          "status": "pivoting: stale-anchor closed, hooking live shared-secret derivation",
+          "notes": "turn-59 verdict 2026-05-23: trap arms + observes getter + builds managed string, but X-event delivery to the modal field is the remaining wall; sibling worker classified PATH stalled."
+        },
+        {
+          "name": "magic-link",
+          "worker": "albion-magic-link",
+          "worktree": "/home/sdancer/albion-magic-link",
+          "hypothesis": "Albion 2FA email contains a trust-grant URL that clicked from a browser approves the device session.",
+          "falsification": "30-email sample shows zero device-trust links; only password-reset, clickeu wrapper, T&C, privacy.",
+          "stall_counter": 3,
+          "last_metric_move_at": "2026-05-23T12:30Z",
+          "status": "closed-falsified",
+          "notes": "fact albion_2fa_email_no_trust_link_2026-05-23"
+        },
+        {
+          "name": "captcha-vision-solve",
+          "worker": "albion-captcha-vision-solve",
+          "worktree": "/home/sdancer/albion-captcha-vision-solve",
+          "hypothesis": "Codex worker attaches to sibling chromium's CDP endpoint and solves reCAPTCHA v2 image-grid via vision model OR audio challenge via Whisper, materializing token in g-recaptcha-response.",
+          "falsification": "5 consecutive solve attempts (image + audio) all timeout or fail-verify on the same session.",
+          "stall_counter": 0,
+          "last_metric_move_at": "2026-05-23T17:43Z",
+          "status": "closed-falsified",
+          "spawned_at": "2026-05-23T17:34Z",
+          "spawned_thread": "019e55e7-0e62-7d91-9cbc-37f9dcdc0961",
+          "breakthrough_2026-05-23T17:39Z": "g-recaptcha-response materialized; sibling driver submitted form. Tiles 1,6,7 = fire hydrant.",
+          "notes_2026-05-23T17:43Z": "captcha solved (artifact: challenge_crop.png + after_round1_submit.png + refresh_token.json + flow_trace.json). Worker now investigating why token-capture stage emitted no candidates.",
+          "falsified_at": "2026-05-23T18:10Z",
+          "falsified_by": "CF Turnstile + 405 Method Not Allowed wall on /login_check after 3 captcha+2FA+password loops; full diagnosis at /home/sdancer/albion-captcha-vision-solve/analysis/post_submit_diagnosis.md"
+        },
+        {
+          "name": "token-recovery",
+          "worker": "albion-token-recovery",
+          "worktree": "/home/sdancer/albion-token-recovery",
+          "hypothesis": "Prior successful Albion login on this account wrote a cached refresh_token / device-trust artifact somewhere on disk; surveying both substrates and replaying it into Unity prefs flips zone non-null without re-running browser flow.",
+          "falsification": "Thorough survey of both substrates reveals no usable cached token from prior session.",
+          "stall_counter": 0,
+          "last_metric_move_at": "2026-05-23T18:10Z",
+          "status": "closed-falsified",
+          "spawned_at": "2026-05-23T18:10Z",
+          "falsified_at": "2026-05-23T18:24Z",
+          "falsified_by": "Sweep complete; no reusable refresh/access/exchange token in Unity prefs OR substrate disk OR browser cookies. Artifacts: substrate_sweep_2026-05-23.md + no_cached_auth.md."
+        },
+        {
+          "name": "native-password-mode",
+          "worker": "albion-native-password-mode",
+          "worktree": "/home/sdancer/albion-native-password-mode",
+          "hypothesis": "Albion's documented in-client 'password' login mode (per global-metadata.dat) takes plain credentials and skips browser/CF stack entirely; if invocable via CLI flag/env/boot.config, Unity authenticates directly and zone flips.",
+          "falsification": "After 3 turns, no invocation mechanism found OR mode fails Albion's backend check.",
+          "stall_counter": 0,
+          "last_metric_move_at": "2026-05-23T18:20Z",
+          "status": "closed-falsified-epic-sdk-gap",
+          "spawned_at": "2026-05-23T18:20Z",
+          "falsified_at": "2026-05-23T18:52Z",
+          "falsified_by": "Plus-prefix argv works (LoginScreen\u2192GameLoading) but EpicOfflineDialog.Update() NRE blocks WorldEntry. Substrate restored. See password_mode_blocked.md + password_mode_attempt_log.md"
+        },
+        {
+          "name": "photon-sdk-research-active",
+          "worker": "albion-photon-sdk-research",
+          "worktree": "/home/sdancer/albion-photon-sdk-research",
+          "hypothesis": "Capturing the 96B S_trim session key from Albion's runtime memory yields a replayable photon authentication artifact (turn 40 milestone proved parent_can_read).",
+          "falsification": "Patched scanner still misses S_trim anchor across [heap]+anon-arenas.",
+          "stall_counter": 0,
+          "last_metric_move_at": "2026-05-23T18:20Z",
+          "status": "spawned-revival",
+          "spawned_at": "2026-05-23T18:20Z"
+        },
+        {
+          "name": "photon-login-fuzz-active",
+          "worker": "albion-photon-login-fuzz",
+          "worktree": "/home/sdancer/albion-photon-login-fuzz",
+          "hypothesis": "Direct fuzzing of Photon login packet structure (separate from S_trim capture) yields a synthesizable login flow that bypasses the entire web/CF stack.",
+          "falsification": "After 3 turns, no synthesizable packet sequence achieves successful auth response from Albion's server.",
+          "stall_counter": 0,
+          "last_metric_move_at": "2026-05-23T18:24Z",
+          "status": "spawned-revival",
+          "spawned_at": "2026-05-23T18:24Z"
+        },
+        {
+          "name": "epic-args-prepend",
+          "worker": "albion-epic-args-prepend",
+          "worktree": "/home/sdancer/albion-epic-args-prepend",
+          "hypothesis": "Prepending +epicapp +epicdeploymentid +epicsandboxid argv keys (from same IL2CPP cluster) before +AUTH_TYPE password satisfies Epic SDK init and unblocks GameLoading\u2192WorldEntry transition.",
+          "falsification": "After 3 turns, Albion still NREs in EpicOfflineDialog.Update() OR fails to advance from GameLoading.",
+          "stall_counter": 1,
+          "last_metric_move_at": "2026-05-23T18:52Z",
+          "status": "pivoting: no static defaults, heap-scanning for Epic IDs",
+          "spawned_at": "2026-05-23T18:52Z"
+        }
+      ],
+      "last_move_at": "2026-05-22T20:25Z",
+      "turn_46_brainstorm_top": "coordinated-supervisor-swap (score 12, briefing redirect to existing path)"
     }
   },
   "cycle_log": [

@@ -42,3 +42,14 @@ __pycache__/
 # Tracked Dark December TCP stream exports
 !streams/
 !streams/**
+.zai_api_key
+
+# Runtime state — orchestrator workspace artifacts
+harness.db
+analysis/talk.jsonl
+analysis/talk_channels/
+analysis/graph_memory/
+analysis/albion_*.png
+analysis/dd_packet_typenames_*.txt
+analysis/vastai_albion_instance_setup.md
+tools/**/.venv/
