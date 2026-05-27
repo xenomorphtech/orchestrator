@@ -22,16 +22,6 @@ Non-pane Codex agent backed by `codex app-server` JSON-RPC over stdio. Default f
 
 Full operator doc: `codex-app-server-mode.md`. Read it before adding, sending to, or debugging a `codex_app_server` agent.
 
-## Protected agents — DO NOT TOUCH WITHOUT EXPLICIT GO
-
-The following agents are mid-task on a live RE campaign. Disrupting them costs us real progress. Do **not** run `harness send`, `harness agent-add` (it upserts), pane kills, or anything else against them unless the user has explicitly told you in this conversation to do so:
-
-- `cert-rust-reimpl`
-- `cert-ptrace`
-- `cert-re`
-
-This is a hard rule, not a guideline. If you are unsure whether an action affects one of these agents, stop and ask.
-
 ## Conventions
 
 ### Briefings
