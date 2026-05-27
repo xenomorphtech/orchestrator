@@ -1,71 +1,35 @@
-# Dark December packet decoder
+# Orchestrator
 
-Utilities for decoding a Dark December TCP capture on port `10001` and rendering an
-interactive minimap of the player and entity/monster position candidates.
+Harness infrastructure for running multiple coordinated coding-agent workers
+against a project: scheduler, dashboard, biome terminal layout, talk channels,
+and the shared `orchestrate` skill.
 
-## What this decodes
+## Scope
 
-From the first quest capture:
+This repo is for the **orchestration harness itself** — code that runs and
+coordinates workers, not the things workers happen to be working on.
 
-- Traffic is TCP on port `10001`.
-- Application frames use a 4-byte little-endian total length prefix.
-- Bytes 4 and 5 are a small channel/header pair, commonly `01 00` or `01 01`.
-- The useful body decodes with adjacent XOR over bytes after that 2-byte channel:
+### Do not contaminate this repo with goal-specific data
 
-```text
-decoded[i] = raw_body[i] ^ raw_body[i + 1]
-```
+Workspace artifacts from any individual campaign — captures, dumps, decoded
+streams, per-target wikis, per-target Rust crates, debugging notes, agent
+briefings, verdicts, hypotheses, traces — belong in **their own repos**, not
+here. The harness must remain reusable across goals.
 
-The current extractor detects:
+Examples of work that lives elsewhere:
 
-- Player position candidate: S2C 41-byte frames whose decoded body starts
-  `12 02 60 6d`.
-- Entity/monster movement candidates: S2C 41-byte frames shaped as
-  `12 <id> 86 01 00 00 00 46 11`.
-- Coordinates are little-endian float32 values at decoded offsets `9` and `17`.
-- An orientation-like float is at decoded offset `25`.
+- `~/nmss-wiki/` — NMSS cert / harness research
+- `briefings/` — per-agent working notes (local-only, gitignored)
+- `analysis/` — per-campaign verdicts / hypotheses (local-only, gitignored)
+- `minimap-sniffer/`, `darkdecember/` — dark december campaign artifacts
+  (local-only, gitignored)
 
-## Usage
+If you find yourself adding a directory with a campaign name or target name to
+the root of this repo, that's the signal: it belongs somewhere else.
 
-Put a `.pcapng` capture next to the script, or pass its full path:
+## What lives here
 
-```powershell
-python darkdec_decoder.py "CAPTURA DARK DECEMBER PRIMERA QUEST.pcapng" --out darkdec_output
-```
-
-The script writes:
-
-- `darkdec_output/minimap.html`
-- `darkdec_output/decode_report.md`
-- `darkdec_output/player_track.csv`
-- `darkdec_output/entity_tracks.csv`
-- `darkdec_output/entities_summary.csv`
-- `darkdec_output/active_end_entities.csv`
-- `darkdec_output/frame_lengths.csv`
-- `darkdec_output/decoded_frame_samples.txt`
-
-Open `minimap.html` in a browser and use the timeline slider to inspect movement.
-
-## Live minimap sniffer
-
-`minimap-sniffer/` contains a Rust + egui minimap for live Windows captures
-through Npcap/WinPcap-compatible pcap. A browser view remains available for
-debugging.
-
-```powershell
-cd minimap-sniffer
-powershell -ExecutionPolicy Bypass -File .\run-egui.ps1 -ListDevices
-powershell -ExecutionPolicy Bypass -File .\run-egui.ps1 -Iface "Realtek" -Port 10001
-```
-
-It can also replay the committed TCP stream export:
-
-```powershell
-cargo run --release --no-default-features --features egui -- --offline-stream-dir ..\streams\first_quest
-```
-
-## Privacy note
-
-Raw captures are intentionally ignored by `.gitignore`. They may contain IPs,
-session data, account-adjacent metadata, or gameplay traces. Keep captures local
-unless you explicitly want to publish them.
+- `harness-rs/` — Rust harness (scheduler, services, agent reducer)
+- `web/` — dashboard (auth gate, talk channels, screenshots)
+- `orchestrate.md`, `orchestrate-scheduler.sh`, `send.sh` — orchestration tooling
+- `.claude/` skills and settings shared across workers

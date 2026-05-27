@@ -56,3 +56,8 @@ tools/**/.venv/
 
 # Per-agent briefings (local-only, not shared)
 briefings/
+
+# Goal-specific work — keep in their own repos, not here
+analysis/
+minimap-sniffer/
+darkdecember/
