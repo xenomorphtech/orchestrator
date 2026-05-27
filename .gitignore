@@ -53,3 +53,6 @@ analysis/albion_*.png
 analysis/dd_packet_typenames_*.txt
 analysis/vastai_albion_instance_setup.md
 tools/**/.venv/
+
+# Per-agent briefings (local-only, not shared)
+briefings/
