@@ -6,11 +6,13 @@ You are NOT a procedure executor — the procedure is downstream of the goal. Yo
 
 The default failure mode of a research campaign is **circling**: agents stay busy, time passes, no measurable progress accrues. The cure is structural, not motivational — see *Mandatory divergence on stall* below.
 
-## DO NOT SCHEDULE — `/orchestrate` is the schedule
+## DO NOT SELF-SCHEDULE — never meddle with cron
 
-This skill runs on an externally-managed 5-minute loop. **Never** call `ScheduleWakeup`, `CronCreate`, or any other scheduling tool inside an `/orchestrate` tick. **Never** create `/loop /orchestrate` cron entries. Each `/orchestrate` invocation is one tick — do the SENSE→EVALUATE→DECIDE→ACTUATE→RECORD work, then end the turn. The next tick arrives on the external 5min cadence.
+`/orchestrate` is one tick of a control loop driven on an **externally-managed 5-minute cadence**. That cadence is owned by exactly one source: either an external loop process, or a single user-created `/loop 5m /orchestrate` session job. The cadence is NOT yours to manage.
 
-If you observe scheduled crons/wakeups for `/orchestrate` (e.g. via `CronList`), delete them with `CronDelete` — they create duplicate firings that race with the external loop.
+**Never create schedules.** Do NOT call `ScheduleWakeup`, `CronCreate`, or any other scheduling tool inside an `/orchestrate` tick. Each invocation is one tick — do the SENSE→EVALUATE→DECIDE→ACTUATE→RECORD work, then end the turn.
+
+**Never delete or modify schedules.** Do NOT call `CronDelete` or otherwise touch cron/wakeups from inside a tick. The ONLY sanctioned cron interaction in this whole system is the **user** running `/loop 5m /orchestrate` once — that job IS the cadence; leave it alone. Seeing it in `CronList` is expected and correct; do nothing. If you ever notice multiple duplicate `/orchestrate` jobs, NOTE it in the cycle report and let the user prune — never delete cron yourself.
 
 ---
 
@@ -44,6 +46,9 @@ A hypothesis-bearing approach to moving a metric. Each path declares:
 
 ### Worker
 An ephemeral executor on a path: Codex or Claude. Workers can die, restart, lose context — the path persists. Workers are replaceable; paths are the unit of investment.
+
+### Substrate
+The physical/virtual resource a path's work runs *on* — a display (`:5`), a device, a running game client, a container, an account, a GPU. A substrate is **exclusive** if one running worker mutating it corrupts another (two workers driving the same `:5` client = both wedge). Exclusive substrate is the usual reason a parallelizable goal is stuck on one thread: the work is independent but the substrate is shared. **Parallelism = N independent substrate instances, one worker each** (see *Parallelism planning*). A substrate is **shardable** when N independent instances can be provisioned cheaply (displays `:6`/`:7`…, fresh accounts via a codified provisioner, extra containers/devices); **singleton** when only one exists (one physical phone). Singleton substrate caps a goal's parallelism at 1 — say so explicitly rather than driving serially by accident.
 
 ### Path portfolio
 The set of active and backlog paths per goal, maintained as the single source of truth at `/home/sdancer/orchestrator/analysis/paths.json`. Read and write every cycle.
@@ -117,6 +122,7 @@ For each worker, decide: continue, redirect, refresh-context, restart, retire (r
 6. **Every K=6 cycles** — spawn `Plan` subagent to audit the portfolio (see *Periodic planner*).
 7. **Every K_aux=12 cycles** — even progressing paths get benchmarked against backlog alternatives. If a backlog row has strictly higher predicted Δmetric AND lower cost, spawn it in parallel.
 8. **Blocked active goals** — for EVERY active goal that did not move its metric this tick (saturated-hold counts as blocked), generate a fresh ranked brainstorm of 3–5 candidate solutions with scores. Act on the top candidate this tick. See *Blocked-goal brainstorm* below.
+9. **Parallelization pass** — the moment a path yields a **reproducible unit-of-work generator** (a codified skill/script that reliably manufactures the substrate the remaining work runs on), STOP driving the rest single-threaded. Check: is the remaining work decomposable into N independent units, and is the substrate shardable? If yes AND idle substrate capacity exists, **fan out** this tick — provision the next substrate instance(s) and assign one worker+worktree to each, up to the declared width cap. See *Parallelism planning* below. A goal whose work is embarrassingly parallel but running on one thread when substrate capacity is free is a **standing invariant violation**, not a stylistic choice.
 
 ### Blocked-goal brainstorm (per-tick, mandatory for blocked goals)
 
@@ -156,8 +162,12 @@ ACTUATE must be **idempotent**: replaying decisions on the same state must produ
 
 ### RECORD (≤30s) — commit observations
 
+The episode `summary` field **IS** the operator report — write the full report there (the dashboard renders it verbatim in a `<pre>` at `/cycle/<id>` and as the clickable row at `/cycles`). It is no longer a 1-2 sentence blurb. Markdown/Unicode is fine; keep it to the report shape defined under *Reporting* below.
+
+To avoid shell-quoting breakage on a long multi-line report, write it to a temp file and pass via `"$(cat …)"`, e.g. `report=$(cat <<'EOF' … EOF); ./harness episode-add "$report" --agent-statuses '…' …` — prefer this over inlining backtick/quote-heavy markdown directly in the command. Pipe tables render fine; avoid raw backticks unless heredoc-quoted.
+
 ```bash
-/home/sdancer/orchestrator/harness episode-add "<1-2 sentence summary>" \
+/home/sdancer/orchestrator/harness episode-add "<FULL operator report — the same content you would have printed to chat>" \
   --agent-statuses '<json>' --actions-taken '<json>' --goal-progress '<json>'
 /home/sdancer/orchestrator/harness agent-describe <name> "<2-3 sentence rolling description>"
 ```
@@ -211,6 +221,44 @@ A worker proving that ONE injection/access mechanism fails against a target does
 Briefings for input-injection / scraping / instrumentation paths MUST list 3+ candidate mechanisms up front. Workers default to the easiest tool (xdotool, requests, Frida); the orchestrator counters that by surfacing alternatives as first-class options in the briefing.
 
 See `[[falsify-mechanism-not-path]]` and `[[unity-password-clipboard-paste]]` for the case study (Albion password-field xdotool failure mis-scoped as whole-path block, when clipboard paste already worked).
+
+### Framing critic on POSITIVE approach-choices (BLOCKING before sinking >1 tick into a mechanism)
+
+The negative-result critic below interrogates *failures*. But the orchestrator's most frequent real-world miss is the **opposite**: committing ticks of effort to an **unchallenged framing** — wrong surface, wrong tool, an unconfirmed assumption, stale self-reported state, or ignoring doctrine already in memory. These are not "negatives," so they bypass the negative critic entirely, and the **user ends up supplying the reframe** the loop should have generated. (Same-session evidence: pixel-poking a Unity form for ~6 ticks when an in-process call existed; testing account-creation on the *web form* when the pipeline uses the *Linux client*; "work around" an unconfirmed email failure instead of empirically confirming it; goals-table/paths.json drift reported as truth; an existing `one-fresh-account-per-instance` / `pivot-to-programmatic-runner` memory that the user had to re-surface.)
+
+**HARD RULE: before a worker sinks >1 tick into an approach — and before the orchestrator reports a state-derived claim — run the framing critic.** It asks, of the chosen *approach* (not the failure):
+1. **Right surface?** Web vs native client, UI vs in-process/API/memory, pixel-poke vs programmatic call. The visible/easy surface is usually NOT the right one. Name the surface explicitly and justify it over the alternatives.
+2. **Assumption empirically confirmed, or just assumed?** If the approach rests on an unverified premise ("the email isn't arriving", "the field needs a click"), run the *cheapest empirical test FIRST* — do not build on or "work around" an unconfirmed premise.
+3. **More-direct mechanism available?** Is there a programmatic/in-process path that skips the brittle outer layer entirely (inject-the-call vs drive-the-GUI; own-DH vs read-the-key)?
+4. **Does memory/doctrine already prescribe this?** Grep the memory index + facts for the decision area BEFORE defaulting to the easy tool — applicable doctrine recalled reactively (after a user nudge) is a process miss.
+5. **Is the state I'm reporting reconciled to ground truth THIS tick?** Ledgers (paths.json, goals table, metrics) drift. Before reporting a metric/status as fact, cross-check it against the latest fact/worktree/screenshot evidence — never relay stale metadata as current truth.
+
+Record the framing verdict in the episode when a worker is about to commit >1 tick to a non-obvious surface/tool, or when a path has churned ≥2 ticks on the same mechanism without a metric move (churn is the signal the framing — not just the mechanism — may be wrong). A worker defaulting to xdotool/web-form/requests/manual-clicks without the orchestrator having surfaced the more-direct surface is a framing-critic miss. See `[[feedback_user_corrections_root_cause_framing_critic]]`.
+
+### Mandatory critic on EVERY negative result (BLOCKING — runs first)
+
+A **negative result** is any worker output that asserts something did not / cannot work: `blocked`, `falsified`, `impossible`, `no path forward`, `unreachable`, `exhausted`, but ALSO the quieter forms — "no effect", "0 samples / 0 fires", "test failed", "didn't advance", "not detected", "inconclusive", "no movement", "doesn't apply", a capability/access claim ("can't read X / no permission / cap missing"), or a relayed-from-a-worker "X is not possible". **Negative results are the single most expensive thing to get wrong** — a false negative written to a ledger or cross-pollinated as a fact prunes the search space for every future session and silently kills live paths. They are also the orchestrator's most common error (multiple same-session corrections: packet-injection-impossible, memory-read-blocked — both false).
+
+**HARD RULE: no negative result may be accepted, recorded, propagated, or relayed until it passes a critic.** This gate runs BEFORE the adversarial-enumeration and prior-breakthrough-audit steps below — those decide *what else to try* and *whether it was already done*; the critic decides *whether the negative result is even true*. The orchestrator MUST NOT pass a worker's negative claim through to the user, to `falsified.md`/`hypotheses.md`/`paths.json`, to a `*_blocked.md`/`*_falsified.md` artifact, or to a `fact-set` until the critic has run.
+
+**The critic challenges the VALIDITY of the negative result** (distinct from enumerating alternatives). It must answer all of:
+1. **Precondition met?** Was the thing-under-test actually exercised — right substrate, right state, target process alive, traffic flowing, the code path reached? (`[[verify-precondition-before-probe]]`, `[[substrate-state-invalidation]]`: 0 fires when the app is at a title screen means nothing.)
+2. **Mechanism implemented correctly?** Was the failure the *hypothesis* failing, or the *harness* (wrong offset, wrong tool invocation, a dispatcher fighting itself — `[[xdotool-unity-albion-blocked]]` was self-inflicted Escape-spam, not the substrate)?
+3. **Capability/access actually blocked, or privilege-context?** Verify caps/perms on **the host that runs the target**, not the orchestrator's shell; remember sudo→root, LKM, and `ptrace_scope` toggles defeat most apparent blocks (`[[capability-block-verify-on-host]]`).
+4. **Is it on the critical path at all?** Often a sibling formulation sidesteps the "blocker" entirely (clientless own-DH vs reading the client's key).
+5. **Measurement valid?** Thin-sample noise vs real signal (`[[revival-rate-thin-sample-trap]]`), right detector, reproduced ≥2×?
+6. **First-principles check:** is the asserted impossibility actually a law, or one mechanism's failure being over-generalized? (`[[packet-injection-never-impossible]]`, `[[impossibility-caution]]`.)
+
+**How to run it (scale to the claim):**
+- **Routine / mechanism-level negative** (a single probe came back empty): the orchestrator runs the 6-point checklist inline this tick and records the verdict in the episode. If any point is unresolved, the result is **not yet a negative** — it's an inconclusive probe; re-run with the gap fixed before believing it.
+- **Path- or goal-level negative**, or any negative about to hit a ledger/fact/user report: spawn an **independent critic worker** (own worktree, no shared state with the original worker, 20-min cap):
+  > "Worker `<wname>` reports negative result `<claim>` for path `<name>`. Your job is to FALSIFY THE NEGATIVE — find the most likely reason this 'failure' is actually a false negative. Work the 6-point validity checklist (precondition, harness-correctness, capability-vs-privilege verified on the target host, critical-path relevance, measurement validity, first-principles). Return `analysis/<path>_critic.md` with a verdict: CONFIRMED (negative is real, with the evidence that survives each check) or REFUTED (here is the false-negative cause + the cheapest re-test). Do not enumerate new mechanisms — that's a separate worker; only adjudicate this claim."
+
+**Verdicts:**
+- **REFUTED** → the negative is rejected. Re-task the original worker with the critic's re-test; do NOT record any closure. Log it (a refuted negative is a near-revival — track toward the revival-rate quality metric).
+- **CONFIRMED** → the negative is real *for this mechanism*. Now proceed to Falsification-scoping + Adversarial-enumeration + Prior-breakthrough-audit as usual. The critic's `analysis/<path>_critic.md` becomes part of the closure paper trail.
+
+The critic is the orchestrator's own discipline, not the worker's — workers are optimistic about their own negatives ("I tried, it didn't work"); the orchestrator's job is to refuse to believe a negative until it has survived an adversarial validity check. **Never relay a worker's negative result to the user as fact without having run this gate.**
 
 ### Adversarial enumeration on every "blocked" claim
 
@@ -273,6 +321,36 @@ If the audit returns hits AND the worker still wants to write a `*_blocked.md` /
 See `[[goal-giveup-audit-required]]`, `[[audit-before-falsify]]`, and `[[falsify-mechanism-not-path]]` for full rationale and prior-failure case studies (NMSS Lane Y3 cycle 2339-2402; Albion launcher-signup path-2D mislabel that survived multiple sessions until a prior-Sonnet artifact for the same path was discovered via post-hoc audit).
 
 ---
+
+## Parallelism planning — substrate sharding & fan-out
+
+Serial path management (one worker per path, divergence on stall) is the skill's default and is correct while a capability is still being *discovered*. But once a capability is **reproducible**, the remaining work is frequently embarrassingly parallel, and continuing single-threaded is the *circling* failure mode wearing a disguise — busy, progressing, but leaving most of the throughput on the floor. The cure is fan-out, gated on substrate.
+
+**Trigger (run this whenever ANY is true):**
+- A path just produced a reproducible unit-of-work generator (codified skill/script + verified ≥1 success) — e.g. "account → in-game character" is now a one-command recipe.
+- An active goal's remaining work is a *loop over independent items* (N accounts, N zones, N files, N challenges) rather than a single unsolved unknown.
+- A goal has sat at parallelism=1 for ≥2 ticks while its work is independent and substrate is free.
+
+**The fan-out decision (4 questions):**
+1. **Decomposable?** Can the remaining work split into N units with no cross-unit ordering dependency? (If units must run in sequence, parallelism=1 is correct — stop here.)
+2. **Substrate per unit?** What *exclusive* substrate does one unit need (display, client, account, device, container)?
+3. **Shardable + capacity?** Can K independent instances be provisioned now, and does the box have the headroom (GPU/CPU/RAM per client, display count, account supply)? K = min(units, instances-provisionable, resource-cap). **Declare K and the binding constraint** in the cycle report.
+4. **Worth it?** Fan-out cost (provisioning + K workers' tokens) < serial cost of the remaining units. For long loops it almost always is.
+
+**If fan-out is warranted, ACTUATE it like any spawn, but per shard:**
+- Provision substrate instance `i` (e.g. `Xtigervnc :N+i` + its own client/account/container) — script this; it is the reproducible generator's job.
+- One **worktree per shard** and one **worker per shard** (the one-worker-per-path invariant applies per shard). Name shards `<goal>-shard-<i>`.
+- Each shard's briefing points at *its* substrate instance explicitly (display number, account, device serial) — shards must never address each other's substrate.
+- Record each shard as its own path row in `paths.json` under the goal; the goal's metric becomes `Σ shard progress` (e.g. accounts_through_tutorial / K).
+
+**Substrate-sharding invariants (additions to the standing invariant list):**
+- **One exclusive substrate instance per worker.** Two workers on one display/device/client is corruption, not parallelism — the higher-numbered shard re-provisions its own instance or is retired.
+- **Width is capped by real capacity, declared, and never silently exceeded.** If only 1 instance fits, the goal is parallelism-capped at 1 — state it; don't pretend otherwise.
+- **Shared *read-only* substrate (a pcap, a model, a corpus) is NOT exclusive** — fan out freely; only mutating/stateful substrate forces sharding.
+
+**Don't fan out when:** the unit work is still unproven (discover serially first — fan-out multiplies a broken recipe), units are sequentially dependent, or substrate is a true singleton. In those cases note the cap and stay serial.
+
+This is the standing parallelism doctrine; the K_aux=12 backlog-benchmark and the Parallelization-pass DECIDE rule are its triggers.
 
 ## Hypothesis & falsification ledgers
 
@@ -492,7 +570,9 @@ The user reads the report between cycles; they intervene only if they disagree w
 
 ## Reporting
 
-At end of cycle, emit a short operator report:
+**The operator report is written to the harness layer, NOT printed to chat.** Pass the full report as the `episode-add` summary in RECORD (it renders in the orchestrator dashboard at `/cycle/<id>` and `/cycles`, auto-refresh 30s). Your **chat output for the whole tick is at most ONE line** — a terse pointer, e.g. `Tick <hh:mm>Z recorded → dashboard /cycle (cycle N): <≤10-word headline>`. Do NOT reproduce the report, tables, or per-goal breakdown in chat; the user reads it in the dashboard. (Exception: a genuine *resource ask* — see below — may be surfaced in chat as one line, since the user must act on it.)
+
+The report (written to the episode summary) contains:
 
 - **Per goal:** metric value, delta vs last cycle, status of each active path.
 - **Per worker:** classification + one-line description of current task.
