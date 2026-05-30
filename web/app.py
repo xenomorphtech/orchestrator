@@ -7,15 +7,23 @@ operator's auto-memory tree. Pure SSR, Tailwind CDN, no JS framework.
 Run:  python3 /home/sdancer/orchestrator/web/app.py  (binds 127.0.0.1:3030)
 """
 from __future__ import annotations
-import hashlib, json, os, re, secrets, subprocess
+import hashlib, json, os, re, secrets, subprocess, urllib.request
 from collections import deque
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, abort, make_response, redirect, render_template_string, request, url_for
+from flask import Flask, abort, jsonify, make_response, redirect, render_template_string, request, url_for
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from markupsafe import escape
 
 HARNESS = "/home/sdancer/orchestrator/harness"
+# Direct SpacetimeDB SQL endpoint (same server/db the harness CLI talks to). Used to
+# fetch the *newest* episodes: the harness `episodes --limit N` runs `... LIMIT N` with
+# no ORDER BY, and SpacetimeDB returns rows in ascending rowid order, so the CLI yields
+# the OLDEST N. SpacetimeDB v2.1 supports neither ORDER BY nor MAX(), so we binary-search
+# the max id via `WHERE id >= X LIMIT 1` probes, then fetch a bounded id-window.
+HARNESS_SERVER = os.environ.get("HARNESS_SERVER", "http://127.0.0.1:3000")
+HARNESS_DATABASE = os.environ.get("HARNESS_DATABASE", "orchestrator-harness")
+SQL_URL = f"{HARNESS_SERVER}/v1/database/{HARNESS_DATABASE}/sql"
 ANALYSIS = Path("/home/sdancer/orchestrator/analysis")
 BRIEFINGS = Path("/home/sdancer/orchestrator/briefings")
 MEMORY = Path("/home/sdancer/.claude/projects/-home-sdancer-orchestrator/memory")
@@ -99,10 +107,68 @@ def parse_json_cell(s: str):
 
 # ─── data accessors (cached briefly per-request) ────────────────────────────
 
+def sql_query(query: str, timeout: int = 10) -> list[dict]:
+    """Run read-only SQL against the harness SpacetimeDB and return list[dict]."""
+    req = urllib.request.Request(
+        SQL_URL, data=query.encode(), method="POST",
+        headers={"Content-Type": "text/plain"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode())
+    if not payload:
+        return []
+    result = payload[0]
+    cols = [
+        (e["name"]["some"] if isinstance(e.get("name"), dict) else e["name"])
+        for e in result["schema"]["elements"]
+    ]
+    return [dict(zip(cols, row)) for row in result["rows"]]
+
+
+_MAX_EPISODE_ID = {"id": 0}
+
+
+def _episode_id_exists_from(x: int) -> bool:
+    return bool(sql_query(f"SELECT id FROM episodes WHERE id >= {x} LIMIT 1"))
+
+
+def max_episode_id() -> int:
+    """Largest episode id present. Cached; cheap (≈1 probe) in steady state."""
+    cached = _MAX_EPISODE_ID["id"]
+    if cached and not _episode_id_exists_from(cached + 1):
+        return cached
+    lo, hi = max(cached, 1), max(cached * 2, 2)
+    while _episode_id_exists_from(hi):  # exponential upper bound
+        lo, hi = hi, hi * 2
+    while lo < hi:                      # binary-search largest present id
+        mid = (lo + hi + 1) // 2
+        if _episode_id_exists_from(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    _MAX_EPISODE_ID["id"] = lo
+    return lo
+
+
 def episodes(limit: int = 50):
-    rows = parse_table(run("episodes", "--limit", str(limit)))
-    # newest first (harness returns ascending by id)
-    rows.reverse()
+    # newest `limit` episodes, newest first. See SQL_URL note for why the CLI can't.
+    try:
+        top = max_episode_id()
+        if top <= 0:
+            return []
+        window = limit * 5 + 100  # generous for id gaps (deleted episodes)
+        rows = sql_query(
+            "SELECT id, created_at, summary, agent_statuses_json, "
+            "actions_taken_json, goal_progress_json FROM episodes "
+            f"WHERE id > {top - window}"
+        )
+        rows.sort(key=lambda r: int(r["id"]))   # ascending by id
+        rows = rows[-limit:]                     # newest `limit` (still ascending)
+        rows.reverse()                           # newest first
+    except Exception:
+        # fall back to the CLI (oldest-N, reversed) so the page still renders
+        rows = parse_table(run("episodes", "--limit", str(limit)))
+        rows.reverse()
     for r in rows:
         for k in ("agent_statuses_json", "actions_taken_json", "goal_progress_json"):
             r[k] = parse_json_cell(r.get(k, "")) or {}
@@ -524,9 +590,18 @@ def cycles_list():
 
 @app.route("/cycle/<int:cid>")
 def cycle_detail(cid):
-    # naive: pull a window and find it
-    eps = episodes(limit=500)
-    e = next((x for x in eps if str(x["id"]) == str(cid)), None)
+    try:
+        rows = sql_query(
+            "SELECT id, created_at, summary, agent_statuses_json, "
+            "actions_taken_json, goal_progress_json FROM episodes "
+            f"WHERE id = {int(cid)}"
+        )
+        e = rows[0] if rows else None
+        if e:
+            for k in ("agent_statuses_json", "actions_taken_json", "goal_progress_json"):
+                e[k] = parse_json_cell(e.get(k, "")) or {}
+    except Exception:
+        e = next((x for x in episodes(limit=500) if str(x["id"]) == str(cid)), None)
     if not e:
         abort(404)
     body = [f'<h1 class="text-2xl mb-1">Cycle {e["id"]}</h1>']
@@ -776,10 +851,15 @@ def talk_view():
     )
 
     entries = talk_entries(channel=channel, limit=200)
-    if not entries:
-        body.append('<div class="text-zinc-500 mb-4">(no messages yet)</div>')
-    else:
-        body.append('<div class="space-y-3 mb-5">')
+    # Marker for the incremental poller: total message count currently rendered.
+    # talk_since() compares against this `n` to send only newer messages.
+    initial_count = len(entries)
+    empty_cls = " hidden" if entries else ""
+    body.append(
+        '<div id="talk-empty" class="text-zinc-500 mb-4{}">(no messages yet)</div>'.format(empty_cls)
+    )
+    body.append('<div id="talk-messages" class="space-y-3 mb-5">')
+    if entries:
         for entry in entries:
             sender = str(entry.get("from", "") or "worker")
             ts = str(entry.get("ts", "") or "")
@@ -801,7 +881,7 @@ def talk_view():
                 '<pre class="text-sm text-zinc-200 whitespace-pre-wrap">{}</pre>'
                 '</article>'.format(indent, badge, escape(sender), escape(ts), reply_meta, text)
             )
-        body.append('</div>')
+    body.append('</div>')
 
     body.append(
         f'<form method="post" action="/talk?c={escape(channel)}" class="border-t border-zinc-800 pt-4">'
@@ -822,48 +902,135 @@ def talk_view():
     body.append(
         """<script>
         (function () {
-          const ta = document.querySelector('textarea[name="text"]');
-          if (!ta) return;
           const channel = __CHANNEL_JSON__;
-          const KEY = 'talk_draft_v2:' + channel;
-          const saved = sessionStorage.getItem(KEY);
-          if (saved && !ta.value) ta.value = saved;
-          ta.addEventListener('input', function () {
-            sessionStorage.setItem(KEY, ta.value);
-          });
-          ta.addEventListener('keydown', function (e) {
-            if (e.ctrlKey && e.key === 'Enter') {
-              e.preventDefault();
-              if (ta.form && typeof ta.form.requestSubmit === 'function') {
-                ta.form.requestSubmit();
-                return;
-              }
-              if (ta.form) ta.form.submit();
-            }
-          });
-          if (ta.form) {
-            ta.form.addEventListener('submit', function () {
-              sessionStorage.removeItem(KEY);
+          let seen = __INITIAL_COUNT__;
+          const ta = document.querySelector('textarea[name="text"]');
+          const list = document.getElementById('talk-messages');
+          const empty = document.getElementById('talk-empty');
+
+          // ---- draft persistence + Ctrl+Enter send (unchanged behavior) ----
+          if (ta) {
+            const KEY = 'talk_draft_v2:' + channel;
+            const saved = sessionStorage.getItem(KEY);
+            if (saved && !ta.value) ta.value = saved;
+            ta.addEventListener('input', function () {
+              sessionStorage.setItem(KEY, ta.value);
             });
+            ta.addEventListener('keydown', function (e) {
+              if (e.ctrlKey && e.key === 'Enter') {
+                e.preventDefault();
+                if (ta.form && typeof ta.form.requestSubmit === 'function') {
+                  ta.form.requestSubmit();
+                  return;
+                }
+                if (ta.form) ta.form.submit();
+              }
+            });
+            if (ta.form) {
+              ta.form.addEventListener('submit', function () {
+                sessionStorage.removeItem(KEY);
+              });
+            }
           }
+
+          // Defuse any legacy meta-refresh that might still be present.
           document.querySelectorAll('meta[http-equiv="refresh"]').forEach(function (meta) {
             meta.remove();
           });
-          function schedule(delayMs) {
-            window.setTimeout(function tick() {
-              const busy = document.activeElement === ta || ta.value.trim().length > 0;
-              if (busy) {
-                schedule(5000);
+
+          // ---- incremental append (no full-page reload) ----
+          function badgeClass(sender) {
+            if (sender === 'user') return 'bg-sky-500 text-white';
+            if (sender === 'orchestrator') return 'bg-emerald-500 text-white';
+            return 'bg-amber-500 text-black';
+          }
+          function buildMessage(entry) {
+            const sender = String(entry.from || 'worker');
+            const ts = String(entry.ts || '');
+            const text = String(entry.text || '');
+            const replyTo = String(entry.reply_to || '');
+            const article = document.createElement('article');
+            article.className = 'border border-zinc-800 rounded bg-zinc-950/70 p-3' + (replyTo ? ' pl-6' : '');
+            const head = document.createElement('div');
+            head.className = 'flex items-center gap-2 mb-2';
+            const badge = document.createElement('span');
+            badge.className = 'inline-block rounded px-2 py-0.5 text-xs ' + badgeClass(sender);
+            badge.textContent = sender;
+            const tsEl = document.createElement('span');
+            tsEl.className = 'text-zinc-500 text-xs';
+            tsEl.textContent = ts;
+            head.appendChild(badge);
+            head.appendChild(tsEl);
+            if (replyTo) {
+              const r = document.createElement('span');
+              r.className = 'ml-2 text-zinc-600';
+              r.textContent = 'reply_to ' + replyTo;
+              head.appendChild(r);
+            }
+            const pre = document.createElement('pre');
+            pre.className = 'text-sm text-zinc-200 whitespace-pre-wrap';
+            pre.textContent = text;
+            article.appendChild(head);
+            article.appendChild(pre);
+            return article;
+          }
+          function nearBottom() {
+            const doc = document.documentElement;
+            return (window.innerHeight + window.scrollY) >= (doc.scrollHeight - 80);
+          }
+          let polling = false;
+          async function poll() {
+            if (polling || !list) return;
+            polling = true;
+            try {
+              const res = await fetch('/talk/' + encodeURIComponent(channel) + '/since?n=' + seen, {
+                headers: {'Accept': 'application/json'},
+                credentials: 'same-origin',
+              });
+              if (!res.ok) return;
+              const data = await res.json();
+              if (!Array.isArray(data.messages) || data.messages.length === 0) {
+                if (typeof data.count === 'number') seen = data.count;
                 return;
               }
-              window.location.reload();
-            }, delayMs);
+              const stick = nearBottom();
+              for (const entry of data.messages) {
+                list.appendChild(buildMessage(entry));
+              }
+              if (empty) empty.classList.add('hidden');
+              seen = (typeof data.count === 'number') ? data.count : (seen + data.messages.length);
+              if (stick) window.scrollTo(0, document.documentElement.scrollHeight);
+            } catch (e) {
+              /* transient network error: keep marker, retry next tick */
+            } finally {
+              polling = false;
+            }
           }
-          schedule(10000);
+          window.setInterval(poll, 3000);
         })();
-        </script>""".replace("__CHANNEL_JSON__", json.dumps(channel))
+        </script>""".replace("__CHANNEL_JSON__", json.dumps(channel)).replace("__INITIAL_COUNT__", json.dumps(initial_count))
     )
     return render("talk", "\n".join(body), refresh=0)
+
+
+@app.route("/talk/<channel>/since")
+def talk_since(channel: str):
+    """Incremental diff endpoint: return only messages whose absolute line
+    index is >= the client's last-seen count `n`. Used by the talk page to
+    append new messages without a full-page reload."""
+    slug = sanitize_channel_slug(channel) or GENERAL_TALK_CHANNEL
+    try:
+        since_n = int(request.args.get("n", "0"))
+    except (TypeError, ValueError):
+        since_n = 0
+    if since_n < 0:
+        since_n = 0
+    # talk_entries() caps at `limit`; pass a large limit so `count` reflects the
+    # true tail position and the client marker stays consistent.
+    entries = talk_entries(channel=slug, limit=100000)
+    total = len(entries)
+    new_entries = entries[since_n:] if since_n < total else []
+    return jsonify({"channel": slug, "count": total, "messages": new_entries})
 
 
 @app.route("/talk/new", methods=["POST"])
