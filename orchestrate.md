@@ -187,8 +187,26 @@ These MUST hold after every ACTUATE. A SENSE pass that observes a violation make
 5. **Stall counter ≥ 3 triggers divergence.** No exceptions.
 6. **Every goal has a metric.** A goal without a metric is a wish — surface it for refinement.
 7. **Every spawn/restart points at a briefing file**, never at an inlined prompt. The briefing-pointer prompt is the same string used as `--default-task` on `agent-add`, so the harness can re-seed context automatically on restart.
+8. **Every non-done goal reduces distance every tick.** No active goal may end a tick with zero distance-reduction unless the report names (a) the single concrete blocker attacked this tick and (b) the next concrete sub-step. "Held at ceiling", "parked", "banked", "saturated-hold", "steady-state" are NOT permitted end-states (see *No silent absorbing states* below).
+9. **No silent absorbing states.** The ONLY terminal path statuses are `done` and `path-dropped` (the latter requires the full negative-result-critic + adversarial-enumeration + prior-breakthrough audit). Every other status keeps accruing the stall counter and remains subject to per-tick distance-reduction. A path cannot be relabelled out of the active lifecycle to dodge the divergence rule.
 
 ---
+
+## Always reduce geometric distance — no silent absorbing states (HARD RULE)
+
+The control loop's job is to **monotonically reduce the distance to every non-done goal, every tick.** The most common real failure is not a wrong move — it is *no move*, disguised as a decision: "parked", "banked", "held at ceiling", "needs a sustained session", "requires human/legit play", "multi-hour integration — bank it", "saturated", "proportionality call". Every one of these silently moved a live path **out of the active lifecycle**, so the `stall_counter ≥ 3 → divergence` rule — the one mechanism designed to break stalls — never fired. **Parking is stall-counter laundering.** This rule closes that exit.
+
+1. **`parked` / `banked` / `saturated-hold` / `legit-play backlog` are ABOLISHED as end-states.** A path is exactly one of: `active` (being driven this tick), `backlog` (queued, but still accrues stall and is subject to the per-tick brainstorm), `done`, or `path-dropped` (full audit done). If you catch yourself writing any other terminal-sounding status, you are stalling — convert it to the single concrete next sub-step instead.
+
+2. **"Requires human/legit play", "needs a sustained session", "multi-hour integration", "proportionality" are NEGATIVE RESULTS** — the quietest forms — and MUST pass the *Mandatory critic on every negative result* + *Adversarial enumeration* before they touch any ledger or report. In practice this forces the question: *what gameplay action, packet, or click would actually reduce the distance, and have I tried injecting it?* (Case study: the Albion bridge-enemies tutorial gate was "parked as legit-play" because one quest-trigger packet didn't tick it — when the untried, fully-autonomous path was to inject the **combat-cast** at the mobs until the KILL objective ticked. "Legit play" was a `falsify-mechanism-not-path` violation in disguise.)
+
+3. **Hours-long ⇒ chunk, don't bank.** A task too big for one tick is a *chunking* instruction, never a stop condition. Each tick advances it by ONE concrete committed sub-step (port one file, one nav hop, one probe, one captured opcode) and commits. Monotonic progress beats finish-or-don't-start.
+
+4. **A headline metric being met does NOT demote its sub-goals.** Satisficing on the top-line number (e.g. "governing intent done, the rest can hold") is a stall. Drive every declared sub-goal to `done` or `path-dropped`.
+
+5. **Prefer a continuous/ordinal distance metric** (step N/total, pieces-integrated/total, mobs-killed/required) over a binary milestone, so a zero-movement tick is *visible* as an alarm rather than tolerated because a report got written.
+
+6. **The only legitimate per-tick "no internal move" is a true external gate** — user authorization (e.g. a genuine ban-risk decision), money, hardware, third-party access. Even then the loop MUST be actively attacking the *path around* the gate, and the gate is surfaced as a one-line resource ask — not used to silence the whole goal.
 
 ## Mandatory divergence on stall
 
