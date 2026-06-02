@@ -16,13 +16,35 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from markupsafe import escape
 
 HARNESS = "/home/sdancer/orchestrator/harness"
+
+
+def _harness_toml_value(key: str):
+    """Read a top-level string value from harness.toml — same config the CLI reads,
+    so the dashboard needs no HARNESS_SERVER/HARNESS_DATABASE env (resolution order:
+    env var > harness.toml > built-in default). Searches ./harness.toml then ~/.config."""
+    candidates = [
+        Path("/home/sdancer/orchestrator/harness.toml"),
+        Path.home() / ".config" / "harness" / "harness.toml",
+    ]
+    pat = re.compile(rf'^\s*{re.escape(key)}\s*=\s*"([^"]*)"')
+    for p in candidates:
+        try:
+            for line in p.read_text().splitlines():
+                m = pat.match(line)
+                if m:
+                    return m.group(1)
+        except Exception:
+            continue
+    return None
+
+
 # Direct SpacetimeDB SQL endpoint (same server/db the harness CLI talks to). Used to
 # fetch the *newest* episodes: the harness `episodes --limit N` runs `... LIMIT N` with
 # no ORDER BY, and SpacetimeDB returns rows in ascending rowid order, so the CLI yields
 # the OLDEST N. SpacetimeDB v2.1 supports neither ORDER BY nor MAX(), so we binary-search
 # the max id via `WHERE id >= X LIMIT 1` probes, then fetch a bounded id-window.
-HARNESS_SERVER = os.environ.get("HARNESS_SERVER", "http://127.0.0.1:3000")
-HARNESS_DATABASE = os.environ.get("HARNESS_DATABASE", "orchestrator-harness")
+HARNESS_SERVER = os.environ.get("HARNESS_SERVER") or _harness_toml_value("server") or "http://127.0.0.1:3000"
+HARNESS_DATABASE = os.environ.get("HARNESS_DATABASE") or _harness_toml_value("database") or "orchestrator-harness"
 SQL_URL = f"{HARNESS_SERVER}/v1/database/{HARNESS_DATABASE}/sql"
 ANALYSIS = Path("/home/sdancer/orchestrator/analysis")
 BRIEFINGS = Path("/home/sdancer/orchestrator/briefings")
@@ -772,25 +794,113 @@ def memory_view(name=None):
     return render(name, "\n".join(body))
 
 
+def _briefing_norm(v):
+    """Normalize a CLI-table cell: treat (none)/empty as ''."""
+    return "" if not v or v == "(none)" else v
+
+
+def _tag_chips(tags_str):
+    tags = [t.strip() for t in (tags_str or "").split(",") if t.strip()]
+    return "".join(
+        f'<span class="inline-block rounded bg-zinc-800 text-zinc-300 text-[10px] '
+        f'px-1.5 py-0.5 mr-1 mb-1">#{escape(t)}</span>'
+        for t in tags
+    )
+
+
+def _goal_chip(goal):
+    return (
+        f'<span class="inline-block rounded bg-indigo-900/40 text-indigo-300 text-[10px] '
+        f'px-1.5 py-0.5">{escape(goal)}</span>'
+        if goal else '<span class="text-zinc-600 text-xs">—</span>'
+    )
+
+
 @app.route("/briefings")
 @app.route("/briefings/<name>")
 def briefings_view(name=None):
     if name is None:
-        files = list_md(BRIEFINGS)
-        body = [f'<h1 class="text-2xl mb-4">Briefings <span class="text-sm text-zinc-500">({len(files)})</span></h1>']
-        body.append('<ul class="space-y-1">')
-        for f in files:
-            body.append(f'<li><a class="text-sky-400 hover:underline" href="/briefings/{f["name"]}">{f["name"]}</a> '
-                        f'<span class="text-zinc-500 text-xs">— {f["title"]} ({f["mtime"].strftime("%Y-%m-%d %H:%M")})</span></li>')
-        body.append('</ul>')
+        show = request.args.get("show", "active")  # active | archived | all
+        if show == "archived":
+            rows = parse_table(run("briefing-list", "--only-archived"))
+        elif show == "all":
+            rows = parse_table(run("briefing-list", "--archived"))
+        else:
+            show = "active"
+            rows = parse_table(run("briefing-list"))
+        for r in rows:
+            r["goal_key"] = _briefing_norm(r.get("goal_key"))
+            r["category"] = _briefing_norm(r.get("category"))
+
+        body = [f'<h1 class="text-2xl mb-1">Briefings <span class="text-sm text-zinc-500">'
+                f'({len(rows)} {escape(show)})</span></h1>']
+
+        def tab(label, val):
+            cls = ("bg-sky-600/20 border-sky-500 text-sky-200" if show == val
+                   else "border-zinc-700 text-zinc-400 hover:text-white")
+            return f'<a href="/briefings?show={val}" class="rounded border px-2 py-1 text-xs {cls}">{label}</a>'
+        body.append('<div class="flex gap-2 mb-4">'
+                    + tab("active", "active") + tab("archived", "archived") + tab("all", "all")
+                    + '</div>')
+
+        if not rows:
+            body.append('<div class="text-zinc-500">(none)</div>')
+            return render("briefings", "\n".join(body))
+
+        # Group by category (uncategorized last).
+        groups = {}
+        for r in rows:
+            groups.setdefault(r["category"] or "(uncategorized)", []).append(r)
+        for cat in sorted(groups, key=lambda c: (c == "(uncategorized)", c.lower())):
+            items = sorted(groups[cat], key=lambda x: x.get("name", ""))
+            body.append('<details open class="mb-3 bg-zinc-900 border border-zinc-800 rounded p-3">'
+                        f'<summary class="cursor-pointer text-zinc-100">{escape(cat)} '
+                        f'<span class="text-zinc-500 text-xs">({len(items)})</span></summary>')
+            body.append('<table class="w-full mt-2"><thead><tr class="text-zinc-500 text-left text-xs">'
+                        '<th class="pr-3 py-1">name</th><th class="pr-3">goal</th>'
+                        '<th class="pr-3">tags</th><th>updated</th></tr></thead><tbody>')
+            for r in items:
+                nm = r.get("name", "")
+                arch = ('<span class="ml-1 rounded bg-amber-900/40 text-amber-300 text-[10px] px-1">archived</span>'
+                        if r.get("archived") == "true" else "")
+                body.append(
+                    f'<tr><td class="pr-3 align-top"><a class="text-sky-400 hover:underline" '
+                    f'href="/briefings/{escape(nm)}">{escape(nm)}</a>{arch}</td>'
+                    f'<td class="pr-3 align-top">{_goal_chip(r["goal_key"])}</td>'
+                    f'<td class="pr-3 align-top">{_tag_chips(r.get("tags"))}</td>'
+                    f'<td class="align-top text-xs text-zinc-500">{escape((r.get("updated_at") or "")[:19])}</td></tr>')
+            body.append('</tbody></table></details>')
         return render("briefings", "\n".join(body))
-    content = read_md(BRIEFINGS, name)
-    if content is None:
-        abort(404)
-    body = [f'<h1 class="text-xl mb-2">{name}</h1>',
-            f'<div class="bg-zinc-900 border border-zinc-800 rounded p-3"><pre class="text-xs">{content}</pre></div>',
-            '<div class="mt-3"><a class="text-sky-400 hover:underline" href="/briefings">← all briefings</a></div>']
-    return render(name, "\n".join(body))
+
+    # Detail view — body from SQL (source of truth), metadata header from the list.
+    base = name[:-3] if name.endswith(".md") else name
+    meta = next((r for r in parse_table(run("briefing-list", "--archived"))
+                 if r.get("name") == base), None)
+    body_md = run("briefing-get", base)
+    if not body_md.strip() or body_md.startswith("(error"):
+        content = read_md(BRIEFINGS, base + ".md")  # legacy file fallback
+        if content is None:
+            abort(404)
+        body_md = content
+
+    hdr = [f'<h1 class="text-xl mb-2">{escape(base)}</h1>']
+    if meta:
+        chips = []
+        goal = _briefing_norm(meta.get("goal_key"))
+        cat = _briefing_norm(meta.get("category"))
+        if goal:
+            chips.append(f'<span class="rounded bg-indigo-900/40 text-indigo-300 text-xs px-1.5 py-0.5">goal: {escape(goal)}</span>')
+        if cat:
+            chips.append(f'<span class="rounded bg-emerald-900/40 text-emerald-300 text-xs px-1.5 py-0.5">{escape(cat)}</span>')
+        if meta.get("archived") == "true":
+            chips.append('<span class="rounded bg-amber-900/40 text-amber-300 text-xs px-1.5 py-0.5">archived</span>')
+        hdr.append('<div class="flex flex-wrap gap-1 items-center mb-3">'
+                   + "".join(chips) + _tag_chips(meta.get("tags"))
+                   + f'<span class="text-zinc-500 text-xs ml-2">updated {escape((meta.get("updated_at") or "")[:19])}</span></div>')
+    body = hdr + [
+        f'<div class="bg-zinc-900 border border-zinc-800 rounded p-3"><pre class="text-xs">{escape(body_md)}</pre></div>',
+        '<div class="mt-3"><a class="text-sky-400 hover:underline" href="/briefings">← all briefings</a></div>']
+    return render(base, "\n".join(body))
 
 
 @app.route("/talk", methods=["GET", "POST"])
