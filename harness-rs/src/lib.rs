@@ -150,6 +150,21 @@ pub struct AgentPollInput {
     pub last_capture_preview: Option<String>,
 }
 
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct BriefingInput {
+    /// Briefing id — conventionally the worker/agent name it drives (e.g. "albion-quest2").
+    pub name: String,
+    /// The briefing body, markdown.
+    pub body_md: String,
+    /// Goal this briefing belongs to (goal_key), if any.
+    pub goal_key: Option<String>,
+    /// Category, e.g. "live-driver", "offline-prep", "infra".
+    pub category: Option<String>,
+    /// Comma-separated tags.
+    pub tags: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
 #[derive(Clone)]
 #[spacetimedb::table(accessor = agents, public)]
 pub struct Agent {
@@ -387,6 +402,32 @@ pub struct Episode {
     pub agent_statuses_json: String,
     pub actions_taken_json: String,
     pub goal_progress_json: String,
+}
+
+/// Worker briefing — SQL-backed (body kept as markdown). Replaces flat briefings/<name>.md
+/// as the source of truth; the CLI mirrors body_md to the file path for worker compatibility.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = briefings, public)]
+pub struct Briefing {
+    #[primary_key]
+    pub name: String,
+    /// Markdown body.
+    pub body_md: String,
+    /// Goal this briefing belongs to (goal_key), if any.
+    #[index(btree)]
+    pub goal_key: Option<String>,
+    /// Category bucket, e.g. "live-driver" / "offline-prep" / "infra".
+    #[index(btree)]
+    pub category: Option<String>,
+    /// Comma-separated tags.
+    pub tags: String,
+    /// Archived = not in active use (kept for history, hidden from the default list).
+    #[index(btree)]
+    pub archived: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub archived_at: Option<String>,
+    pub metadata_json: String,
 }
 
 fn now(ctx: &ReducerContext) -> String {
@@ -1387,6 +1428,128 @@ pub fn episode_add(ctx: &ReducerContext, input: EpisodeInput) {
         goal_progress_json: input.goal_progress_json,
     });
     log_event(ctx, None, "episode.recorded", "cycle episode logged".to_string(), None);
+}
+
+/// Upsert a briefing. Preserves created_at; refreshes updated_at; a fresh set marks it
+/// active (archived=false) — writing a briefing means it is in use again.
+#[spacetimedb::reducer]
+pub fn briefing_set(ctx: &ReducerContext, input: BriefingInput) {
+    let timestamp = now(ctx);
+    let existing = ctx.db.briefings().name().find(&input.name);
+    let row = Briefing {
+        name: input.name.clone(),
+        body_md: input.body_md,
+        goal_key: opt_text(input.goal_key)
+            .or_else(|| existing.as_ref().and_then(|r| r.goal_key.clone())),
+        category: opt_text(input.category)
+            .or_else(|| existing.as_ref().and_then(|r| r.category.clone())),
+        tags: opt_text(input.tags)
+            .or_else(|| existing.as_ref().map(|r| r.tags.clone()))
+            .unwrap_or_default(),
+        archived: false,
+        created_at: existing
+            .as_ref()
+            .map(|r| r.created_at.clone())
+            .unwrap_or_else(|| timestamp.clone()),
+        updated_at: timestamp,
+        archived_at: None,
+        metadata_json: json_or_empty(input.metadata_json),
+    };
+    let _ = ctx.db.briefings().name().delete(&row.name);
+    ctx.db.briefings().insert(row);
+    log_event(ctx, None, "briefing.set", input.name, None);
+}
+
+/// Update only a briefing's metadata (goal/category/tags) without touching the body.
+#[spacetimedb::reducer]
+pub fn briefing_set_meta(
+    ctx: &ReducerContext,
+    name: String,
+    goal_key: Option<String>,
+    category: Option<String>,
+    tags: Option<String>,
+) -> Result<(), String> {
+    let mut row = ctx
+        .db
+        .briefings()
+        .name()
+        .find(&name)
+        .ok_or_else(|| format!("no briefing named {name}"))?;
+    if let Some(g) = opt_text(goal_key) {
+        row.goal_key = Some(g);
+    }
+    if let Some(c) = opt_text(category) {
+        row.category = Some(c);
+    }
+    if let Some(t) = tags {
+        row.tags = t;
+    }
+    row.updated_at = now(ctx);
+    ctx.db.briefings().name().update(row);
+    Ok(())
+}
+
+/// Archive (archived=true) or restore (archived=false) a single briefing.
+#[spacetimedb::reducer]
+pub fn briefing_archive(ctx: &ReducerContext, name: String, archived: bool) -> Result<(), String> {
+    let mut row = ctx
+        .db
+        .briefings()
+        .name()
+        .find(&name)
+        .ok_or_else(|| format!("no briefing named {name}"))?;
+    row.archived = archived;
+    row.archived_at = if archived { Some(now(ctx)) } else { None };
+    row.updated_at = now(ctx);
+    ctx.db.briefings().name().update(row);
+    log_event(
+        ctx,
+        None,
+        if archived { "briefing.archived" } else { "briefing.restored" },
+        name,
+        None,
+    );
+    Ok(())
+}
+
+/// Periodic archiver: archive every non-archived briefing whose name has no live agent.
+/// "In actual use" = an attached/registered agent points at it, detected by
+/// `biome_pane_id.is_some()` (a live pane, or a codex_app_server pane id). Deregistering an
+/// agent clears biome_pane_id, so its briefing becomes archivable; deleting removes the row.
+/// The `status` field is intentionally NOT used — it is stale until a poll classifies the pane,
+/// so a freshly-spawned live worker reads "unknown" and would be wrongly archived.
+/// Non-destructive — archived briefings are kept and can be restored.
+#[spacetimedb::reducer]
+pub fn briefing_archive_unused(ctx: &ReducerContext) {
+    let live: std::collections::HashSet<String> = ctx
+        .db
+        .agents()
+        .iter()
+        .filter(|a| a.biome_pane_id.is_some())
+        .map(|a| a.name)
+        .collect();
+    let timestamp = now(ctx);
+    let mut archived_count: u32 = 0;
+    let stale: Vec<Briefing> = ctx
+        .db
+        .briefings()
+        .iter()
+        .filter(|b| !b.archived && !live.contains(&b.name))
+        .collect();
+    for mut row in stale {
+        row.archived = true;
+        row.archived_at = Some(timestamp.clone());
+        row.updated_at = timestamp.clone();
+        ctx.db.briefings().name().update(row);
+        archived_count += 1;
+    }
+    log_event(
+        ctx,
+        None,
+        "briefing.archive_unused",
+        format!("archived {archived_count} unused briefings"),
+        None,
+    );
 }
 
 #[spacetimedb::reducer]

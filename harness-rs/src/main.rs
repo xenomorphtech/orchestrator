@@ -106,6 +106,18 @@ enum Commands {
     Dump,
     /// Restore goals, sub-goals, and facts from JSONL on stdin
     Restore,
+    /// Upsert a SQL-backed briefing (body markdown + goal/category/tags); mirrors to briefings/<name>.md
+    BriefingSet(BriefingSetArgs),
+    /// Print a briefing's body markdown from SQL (optionally re-materialize the .md file)
+    BriefingGet(BriefingGetArgs),
+    /// List briefings (default: active only; --archived to include archived; filter by --goal/--category/--tag)
+    BriefingList(BriefingListArgs),
+    /// Archive (or --restore) a single briefing by name; moves its .md to/from briefings/_archived/
+    BriefingArchive(BriefingArchiveArgs),
+    /// Update a briefing's metadata only (goal/category/tags) without touching the body
+    BriefingSetMeta(BriefingSetMetaArgs),
+    /// Periodic archiver: archive every briefing with no live agent + sync the .md mirror
+    BriefingArchiveUnused,
 }
 
 struct CliContext {
@@ -475,6 +487,79 @@ struct AgentDescribeArgs {
     name: String,
     /// Rolling description text
     description: String,
+}
+
+#[derive(Args)]
+struct BriefingSetArgs {
+    /// Briefing id (conventionally the worker/agent name it drives)
+    name: String,
+    /// Briefing body markdown inline (mutually exclusive with --body-file)
+    #[arg(long)]
+    body: Option<String>,
+    /// Read the briefing body markdown from this file (e.g. an existing briefings/<name>.md)
+    #[arg(long)]
+    body_file: Option<String>,
+    /// Goal this briefing belongs to (goal_key)
+    #[arg(long)]
+    goal: Option<String>,
+    /// Category bucket (e.g. live-driver / offline-prep / infra)
+    #[arg(long)]
+    category: Option<String>,
+    /// Comma-separated tags
+    #[arg(long)]
+    tags: Option<String>,
+    /// JSON metadata
+    #[arg(long)]
+    metadata: Option<String>,
+}
+
+#[derive(Args)]
+struct BriefingGetArgs {
+    /// Briefing id
+    name: String,
+    /// Re-materialize briefings/<name>.md from the SQL body (e.g. after a restore)
+    #[arg(long)]
+    materialize: bool,
+}
+
+#[derive(Args)]
+struct BriefingListArgs {
+    /// Include archived briefings too
+    #[arg(long)]
+    archived: bool,
+    /// Show ONLY archived briefings
+    #[arg(long)]
+    only_archived: bool,
+    /// Filter by goal_key
+    #[arg(long)]
+    goal: Option<String>,
+    /// Filter by category
+    #[arg(long)]
+    category: Option<String>,
+    /// Filter by a tag substring
+    #[arg(long)]
+    tag: Option<String>,
+}
+
+#[derive(Args)]
+struct BriefingArchiveArgs {
+    /// Briefing id
+    name: String,
+    /// Restore instead of archive (archived=false, move .md back to briefings/)
+    #[arg(long)]
+    restore: bool,
+}
+
+#[derive(Args)]
+struct BriefingSetMetaArgs {
+    /// Briefing id
+    name: String,
+    #[arg(long)]
+    goal: Option<String>,
+    #[arg(long)]
+    category: Option<String>,
+    #[arg(long)]
+    tags: Option<String>,
 }
 
 #[derive(Args)]
@@ -2303,7 +2388,170 @@ fn run() -> Result<()> {
         Commands::Panes => cmd_panes(&context),
         Commands::Dump => cmd_dump(&context),
         Commands::Restore => cmd_restore(&context),
+        Commands::BriefingSet(args) => cmd_briefing_set(&context, args),
+        Commands::BriefingGet(args) => cmd_briefing_get(&context, args),
+        Commands::BriefingList(args) => cmd_briefing_list(&context, args),
+        Commands::BriefingArchive(args) => cmd_briefing_archive(&context, args),
+        Commands::BriefingSetMeta(args) => call_reducer(
+            &context,
+            "briefing_set_meta",
+            Some(vec![
+                Value::String(args.name),
+                optional_json_string(args.goal),
+                optional_json_string(args.category),
+                optional_json_string(args.tags),
+            ]),
+        ),
+        Commands::BriefingArchiveUnused => cmd_briefing_archive_unused(&context),
     }
+}
+
+// ---- Briefings (SQL-backed; body mirrored to briefings/<name>.md for worker compat) ----
+
+const BRIEFINGS_DIR: &str = "/home/sdancer/orchestrator/briefings";
+
+fn briefing_active_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(BRIEFINGS_DIR).join(format!("{name}.md"))
+}
+
+fn briefing_archived_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(BRIEFINGS_DIR)
+        .join("_archived")
+        .join(format!("{name}.md"))
+}
+
+/// Move the .md mirror between briefings/ and briefings/_archived/ to match archived state.
+fn briefing_sync_file(name: &str, archived: bool) {
+    let active = briefing_active_path(name);
+    let arch = briefing_archived_path(name);
+    if archived {
+        if active.exists() {
+            if let Some(parent) = arch.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&active, &arch);
+        }
+    } else if arch.exists() {
+        let _ = std::fs::rename(&arch, &active);
+    }
+}
+
+fn cmd_briefing_set(cli: &CliContext, args: BriefingSetArgs) -> Result<()> {
+    let body = match (args.body, &args.body_file) {
+        (Some(b), _) => b,
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading body file {path}"))?,
+        (None, None) => {
+            // Default: mirror the existing on-disk briefings/<name>.md if present.
+            let p = briefing_active_path(&args.name);
+            std::fs::read_to_string(&p)
+                .with_context(|| format!("no --body/--body-file and no existing {}", p.display()))?
+        }
+    };
+    call_reducer(
+        cli,
+        "briefing_set",
+        Some(vec![json!({
+            "name": args.name,
+            "body_md": body,
+            "goal_key": optional_json_string(args.goal),
+            "category": optional_json_string(args.category),
+            "tags": optional_json_string(args.tags),
+            "metadata_json": some_json_string(args.metadata.unwrap_or_else(|| "{}".to_string()))
+        })]),
+    )?;
+    // Mirror to the active file path so workers' "Read briefings/<name>.md" keeps working.
+    let p = briefing_active_path(&args.name);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&p, &body).with_context(|| format!("writing mirror {}", p.display()))?;
+    let _ = std::fs::remove_file(briefing_archived_path(&args.name));
+    Ok(())
+}
+
+fn briefing_sql_str(v: Option<&Value>) -> String {
+    v.and_then(bsatn_unwrap).unwrap_or_default()
+}
+
+fn cmd_briefing_get(cli: &CliContext, args: BriefingGetArgs) -> Result<()> {
+    let q = format!(
+        "SELECT body_md, goal_key, category, tags, archived, updated_at FROM briefings WHERE name = '{}'",
+        args.name.replace('\'', "''")
+    );
+    let rows = sql_rows(cli, &q)?;
+    let Some(row) = rows.first() else {
+        return Err(anyhow!("no briefing named {}", args.name));
+    };
+    let body = briefing_sql_str(row.first());
+    if args.materialize {
+        let p = briefing_active_path(&args.name);
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&p, &body)?;
+        out!("materialized {}", p.display());
+    } else {
+        out!("{body}");
+    }
+    Ok(())
+}
+
+fn cmd_briefing_list(cli: &CliContext, args: BriefingListArgs) -> Result<()> {
+    let mut wheres: Vec<String> = Vec::new();
+    if args.only_archived {
+        wheres.push("archived = true".to_string());
+    } else if !args.archived {
+        wheres.push("archived = false".to_string());
+    }
+    if let Some(g) = &args.goal {
+        wheres.push(format!("goal_key = '{}'", g.replace('\'', "''")));
+    }
+    if let Some(c) = &args.category {
+        wheres.push(format!("category = '{}'", c.replace('\'', "''")));
+    }
+    let where_clause = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", wheres.join(" AND "))
+    };
+    // tag is a substring filter applied client-side (SQL LIKE on tags is fine too, but keep simple).
+    let _ = &args.tag;
+    sql(
+        cli,
+        &format!(
+            "SELECT name, goal_key, category, tags, archived, updated_at FROM briefings{where_clause}"
+        ),
+    )
+}
+
+fn cmd_briefing_archive(cli: &CliContext, args: BriefingArchiveArgs) -> Result<()> {
+    let archived = !args.restore;
+    call_reducer(
+        cli,
+        "briefing_archive",
+        Some(vec![
+            Value::String(args.name.clone()),
+            Value::Bool(archived),
+        ]),
+    )?;
+    briefing_sync_file(&args.name, archived);
+    Ok(())
+}
+
+fn cmd_briefing_archive_unused(cli: &CliContext) -> Result<()> {
+    call_reducer(cli, "briefing_archive_unused", None)?;
+    // Sync the filesystem mirror to the new archived state.
+    let rows = sql_rows(cli, "SELECT name, archived FROM briefings")?;
+    for row in rows {
+        let name = briefing_sql_str(row.first());
+        let archived = matches!(row.get(1), Some(Value::Bool(true)));
+        if name.is_empty() {
+            continue;
+        }
+        briefing_sync_file(&name, archived);
+    }
+    Ok(())
 }
 
 fn cmd_dump(cli: &CliContext) -> Result<()> {

@@ -92,6 +92,7 @@ adb connect localhost:5558   # standing rule — idempotent
 /home/sdancer/orchestrator/harness agents
 /home/sdancer/orchestrator/harness panes
 /home/sdancer/orchestrator/harness poll-services
+/home/sdancer/orchestrator/senses_check.sh   # services-alive + vast non-outbid; reports problems, auto-cleans outbid (act on its output)
 ```
 
 Capture each pane's screen, classify it (rules below), compute each active goal's current metric value, and read `analysis/paths.json`, `analysis/hypotheses.md`, `analysis/falsified.md`.
@@ -155,7 +156,7 @@ Persist the full ranked list in the cycle's episode-add under `actions_taken` so
 
 ACTUATE must be **idempotent**: replaying decisions on the same state must produce the same result. Do not issue a second `harness send` while a prior one is still being processed by the agent.
 
-1. **Briefings first.** Rewrite `/home/sdancer/orchestrator/briefings/<agent>.md` for every agent that's about to be spawned, restarted, or `/clear`-refreshed.
+1. **Briefings first.** Rewrite `/home/sdancer/orchestrator/briefings/<agent>.md` for every agent that's about to be spawned, restarted, or `/clear`-refreshed, then persist it to SQL with metadata: `harness briefing-set <agent> --body-file briefings/<agent>.md --goal <goal_key> --category <cat> --tags <csv>` (the DB row is the source of truth; the .md is a mirror — see *Worker briefings → Briefings are SQL-backed*).
 2. **Worktree operations.** `git worktree add` for new paths; `git worktree remove` for retired.
 3. **Agent operations.** `agent-add`, `agent-remove`, `harness send`.
 4. **Cross-pollination.** `fact-set` for facts that should reach OTHER agents in their next nudge.
@@ -441,6 +442,8 @@ Agent({
 
 Apply the returned diff. Record a fact `last_planner_cycle_<YYYY-MM-DD-HH>` with a one-line summary so concurrent orchestrator instances don't double-spawn.
 
+At the same K=6 cadence, run `harness briefing-archive-unused` (briefing housekeeping — archives any briefing with no live agent; non-destructive + reversible; see *Worker briefings → Briefings are SQL-backed*).
+
 ---
 
 ## Worker handling
@@ -488,6 +491,18 @@ Every worker is paired with a briefing at `/home/sdancer/orchestrator/briefings/
 7. **Relevant files / references** — paths, URLs, fact keys.
 
 Keep briefings under ~150 lines. Briefings are working documents — **rewrite, don't append**.
+
+### Briefings are SQL-backed (source of truth = the harness DB; the .md file is a mirror)
+
+Briefings live in the SpacetimeDB `briefings` table (body markdown + metadata: `goal_key`, `category`, `tags`, `archived`, `created_at`, `updated_at`). The flat `briefings/<name>.md` file is a **mirror** the CLI maintains so workers' "Read briefings/<name>.md" keeps working — but the **DB row is the source of truth**.
+
+- **Persist a briefing:** after writing/rewriting `briefings/<name>.md`, run
+  `harness briefing-set <name> --body-file briefings/<name>.md --goal <goal_key> --category <cat> --tags <csv>`
+  (writes the SQL row + metadata AND re-mirrors the file; un-archives it). You can also pass `--body "<text>"` instead of `--body-file`. Always set `--goal` + `--category` (e.g. `live-driver` / `offline-prep` / `infra`) so the portfolio stays queryable.
+- **Update metadata only:** `harness briefing-set-meta <name> --goal <k> --category <c> --tags <csv>`.
+- **Read/list:** `harness briefing-get <name>` (body from SQL; `--materialize` re-writes the .md), `harness briefing-list [--archived|--only-archived] [--goal k] [--category c]`.
+- **Archive / restore:** `harness briefing-archive <name>` (moves the .md to `briefings/_archived/`); `--restore` brings it back. Archived briefings are KEPT (history), just hidden from the default list + active dir.
+- **Periodic archiving (housekeeping):** `harness briefing-archive-unused` archives every briefing with **no live agent** (an agent row with a `biome_pane_id` — i.e. an attached pane / codex thread; deregistering clears it). Run it **every K=6 cycles** (alongside the planner) to keep the active set == the briefings actually driving live work. Non-destructive + reversible. (It deliberately ignores agent `status`, which is stale until a poll classifies a freshly-spawned worker.)
 
 **Canonical briefing-pointer prompt** (use for every spawn, restart, and post-`/clear` refresh; also the `--default-task` value on `agent-add`):
 
@@ -562,6 +577,20 @@ git -C <repo> worktree remove <path>                      # when retiring a path
 
 Worktree path is unique per path. The briefing's "workdir" points at the worktree, not the original repo.
 
+### Worktree lifecycle — SHORT-LIVED, deliver→fold→delete→respawn (HARD RULE)
+
+Long-lived feature-branch worktrees are a trap: they diverge for days, accumulate overlapping edits across `analysis/`/`tools/`/`crates/`/lockfiles, and turn into a painful N-way merge where `main` is stale and nobody knows which copy is current. **Keep work sessions small and worktrees short-lived.** The unit of work is ONE deliverable, not an open-ended branch.
+
+The lifecycle for every worktree path:
+1. **Scope it to a single concrete deliverable** (one verb, one capture, one ported file, one verified milestone) — not "work on X indefinitely."
+2. **On delivery** (deliverable committed + verified): **FOLD to `main` immediately** — merge the branch into `main` in the canonical repo (e.g. `~/albion`), resolve the (small, fresh) conflict surface, confirm `main` builds.
+3. **DELETE the worktree** (`git worktree remove <path>` + `git branch -d <branch>`) — do not leave it lingering to drift.
+4. **SPAWN A NEW WORKER + fresh worktree off the now-current `main`** for the next step. The path persists in `paths.json`; the worktree/branch/worker are disposable and recreated from current `main`.
+
+Why this is mandatory: frequent folds keep each merge tiny and near-conflict-free (hours of divergence, not days); `main` stays the always-current source of truth (so the knowledge base + the next worker start from reality, not a stale base); and it kills the recurring "multiple worktrees with different versions, which is newest?" failure at the root. A worktree that has delivered but not folded is **carrying undelivered value off-`main`** — treat an un-folded delivered worktree like an un-recorded result: a process violation to fix this tick.
+
+Corollary — **never let >1 worktree drift far from `main` on overlapping subtrees.** If SENSE observes it, folding the delivered ones is a high-priority action for the cycle. Preserve branches until folded; once folded + verified, delete them so the next divergence can't reuse a stale base. The live exclusive-substrate worker (e.g. the singleton game client) is the one exception to "delete after deliver" — it persists with its substrate — but its *committed* work still folds to `main` per-deliverable, and its uncommitted scratch is never the source of truth.
+
 ---
 
 ## Standing rules
@@ -572,6 +601,7 @@ Worktree path is unique per path. The briefing's "workdir" points at the worktre
 - **`$ARGUMENTS`** if provided overrides the harness server/database default.
 - **Never wait for user input.** The orchestrator is the strategic decision-maker. Steady-state "awaiting direction" cycles are a failure mode — fix them by spawning more parallel paths, not by asking the user.
 - **Periodic wiki refresh** (every 6 cycles, or on a breakthrough fact): rewrite `/home/sdancer/nmss-emu/WIKI.md` as a distilled state-of-understanding doc (Goals / Current understanding / Confirmed facts / Open questions / Algorithm map / Useful checkpoints / Last updated). Keep under ~300 lines. Distill — do not dump fact strings verbatim.
+- **Health probe = a script, not prose.** `/home/sdancer/orchestrator/senses_check.sh` (run in SENSE) checks services-alive + vast.ai non-outbid, reports problems, and auto-cleans outbid/dead instances. Act on its output; keep the operational logic in the script, not in this skill.
 
 ---
 
