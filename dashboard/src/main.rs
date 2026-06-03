@@ -1383,214 +1383,29 @@ fn read_md_file(dir: &FsPath, name: &str) -> Option<String> {
 }
 
 fn goal_tree_data(state: &AppState, goal_key: &str) -> Result<Value> {
-    let goal = fetch_goal_row(state, goal_key)
-        .ok_or_else(|| anyhow::anyhow!("goal `{goal_key}` not found in harness DB"))?;
-    let subgoals = fetch_subgoal_rows(state, goal_key);
-    let paths = fetch_path_rows(state, goal_key);
-    let facts = fetch_goal_facts(state, goal_key);
-    let goal_meta = parse_embedded_json(goal.get("metadata_json"));
-    let goal_obj = json!({
-        "key": value_display_or(goal.get("goal_key"), goal_key),
-        "title": value_display(goal.get("title")),
-        "metric": first_nonempty(&[
-            value_display(goal.get("metric")),
-            value_display(goal_meta.get("metric")),
-        ]),
-        "scope_note": first_nonempty(&[
-            value_display(goal.get("scope_note")),
-            value_display(goal_meta.get("scope_note")),
-            value_display(goal.get("detail")),
-        ]),
-        "tick": first_value(&[
-            goal.get("tick"),
-            goal_meta.get("tick"),
-        ]),
-        "status": value_display(goal.get("status")),
-        "priority": goal.get("priority").cloned().unwrap_or(Value::Null),
-        "updated_at": value_display(goal.get("updated_at")),
-    });
-    let mut workstreams = assemble_workstreams(&subgoals, &paths);
-    workstreams.sort_by(|a, b| {
-        value_i64(a.get("order"))
-            .unwrap_or(9999)
-            .cmp(&value_i64(b.get("order")).unwrap_or(9999))
-            .then_with(|| value_display(a.get("id")).cmp(&value_display(b.get("id"))))
-    });
-    Ok(json!({"goal": goal_obj, "workstreams": workstreams, "facts": facts}))
-}
+    let output = std::process::Command::new(&state.cfg.harness_path)
+        .arg("--server")
+        .arg(&state.cfg.harness_server)
+        .arg("--database")
+        .arg(&state.cfg.harness_database)
+        .arg("goal-tree")
+        .arg(goal_key)
+        .arg("--json")
+        .output()
+        .with_context(|| format!("run harness goal-tree {goal_key} --json"))?;
 
-fn fetch_goal_row(state: &AppState, goal_key: &str) -> Option<Value> {
-    let query = format!(
-        "SELECT goal_key, title, detail, status, priority, success_fact_key, metadata_json, completion_report, created_at, updated_at FROM goals WHERE goal_key = '{}'",
-        sql_escape(goal_key)
-    );
-    state
-        .data
-        .sql_query(&query)
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .map(|row| Value::Object(row.into_iter().collect()))
-        .or_else(|| {
-            goals_data(state)
-                .into_iter()
-                .find(|goal| value_display(goal.get("goal_key")) == goal_key)
-        })
-}
-
-fn fetch_subgoal_rows(state: &AppState, goal_key: &str) -> Vec<Value> {
-    let query = format!(
-        "SELECT sub_goal_key, goal_key, owner_agent, title, detail, status, priority, instruction_text, stuck_guidance_text, metadata_json, completion_report, created_at, updated_at FROM sub_goals WHERE goal_key = '{}'",
-        sql_escape(goal_key)
-    );
-    state
-        .data
-        .sql_query(&query)
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| Value::Object(row.into_iter().collect()))
-                .collect()
-        })
-        .unwrap_or_else(|_| {
-            rows_to_values(state.data.harness_table(&["sub-goals"]))
-                .into_iter()
-                .filter(|row| value_display(row.get("goal_key")) == goal_key)
-                .collect()
-        })
-}
-
-fn fetch_path_rows(state: &AppState, goal_key: &str) -> Vec<Value> {
-    let query = format!(
-        "SELECT path_name, goal_key, sub_goal_key, worker, worktree, hypothesis, falsification, status, stall_counter, notes, metadata_json, created_at, updated_at FROM paths WHERE goal_key = '{}'",
-        sql_escape(goal_key)
-    );
-    state
-        .data
-        .sql_query(&query)
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| Value::Object(row.into_iter().collect()))
-                .collect()
-        })
-        .unwrap_or_else(|_| {
-            let text = state
-                .data
-                .harness_stdout(&["path-list", "--goal", goal_key, "--json"]);
-            serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v.as_array().cloned())
-                .unwrap_or_default()
-        })
-}
-
-fn fetch_goal_facts(state: &AppState, goal_key: &str) -> Vec<Value> {
-    let rows = state
-        .data
-        .sql_query(
-            "SELECT fact_key, value_json, confidence, source_type, source_ref, metadata_json FROM facts",
-        )
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| Value::Object(row.into_iter().collect()))
-                .collect()
-        })
-        .unwrap_or_else(|_| facts_data(state, 500));
-    rows.into_iter()
-        .filter(|fact| {
-            value_display(fact.get("fact_key")).contains(goal_key)
-                || value_display(fact.get("source_ref")).contains(goal_key)
-                || value_display(fact.get("metadata_json")).contains(goal_key)
-                || parse_embedded_json(fact.get("metadata_json"))
-                    .get("goal_key")
-                    .is_some_and(|v| value_display(Some(v)) == goal_key)
-        })
-        .collect()
-}
-
-fn assemble_workstreams(subgoals: &[Value], paths: &[Value]) -> Vec<Value> {
-    let mut by_subgoal: std::collections::BTreeMap<String, &Value> =
-        std::collections::BTreeMap::new();
-    for path in paths {
-        let key = value_display(path.get("sub_goal_key"));
-        if !key.is_empty() {
-            by_subgoal.entry(key).or_insert(path);
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow::anyhow!(
+            "harness goal-tree {goal_key} failed: {}{}",
+            stdout,
+            stderr
+        ));
     }
-    let mut out = Vec::new();
-    for sub in subgoals {
-        let id = value_display(sub.get("sub_goal_key"));
-        let path = by_subgoal.get(&id).copied();
-        out.push(workstream_from_rows(&id, sub, path));
-    }
-    let known: std::collections::BTreeSet<String> = subgoals
-        .iter()
-        .map(|sub| value_display(sub.get("sub_goal_key")))
-        .collect();
-    for path in paths {
-        let id = value_display(path.get("sub_goal_key"));
-        if id.is_empty() || !known.contains(&id) {
-            let fallback_id = if id.is_empty() {
-                value_display(path.get("path_name"))
-            } else {
-                id
-            };
-            out.push(workstream_from_rows(&fallback_id, &Value::Null, Some(path)));
-        }
-    }
-    out
-}
 
-fn workstream_from_rows(id: &str, sub: &Value, path: Option<&Value>) -> Value {
-    let sub_meta = parse_embedded_json(sub.get("metadata_json"));
-    let path_meta = parse_embedded_json(path.and_then(|p| p.get("metadata_json")));
-    json!({
-        "id": id,
-        "title": first_nonempty(&[
-            value_display(sub.get("title")),
-            path.map(|p| value_display(p.get("path_name"))).unwrap_or_default(),
-            id.to_string(),
-        ]),
-        "status": first_nonempty(&[
-            value_display(sub.get("status")),
-            path.map(|p| value_display(p.get("status"))).unwrap_or_default(),
-            "pending".to_string(),
-        ]),
-        "stall": first_value(&[
-            sub_meta.get("stall"),
-            path.and_then(|p| p.get("stall_counter")),
-            path_meta.get("stall"),
-        ]),
-        "blocker": first_nonempty(&[
-            value_display(sub.get("stuck_guidance_text")),
-            path.map(|p| value_display(p.get("notes"))).unwrap_or_default(),
-        ]),
-        "next_substep": first_nonempty(&[
-            value_display(sub.get("instruction_text")),
-            path.map(|p| value_display(p.get("hypothesis"))).unwrap_or_default(),
-        ]),
-        "metric": first_nonempty(&[
-            value_display(sub_meta.get("metric")),
-            value_display(path_meta.get("metric")),
-        ]),
-        "done_when": first_nonempty(&[
-            path.map(|p| value_display(parse_embedded_json(p.get("metadata_json")).get("done_when"))).unwrap_or_default(),
-            value_display(sub.get("detail")),
-        ]),
-        "falsification": path.map(|p| value_display(p.get("falsification"))).unwrap_or_default(),
-        "worker": first_nonempty(&[
-            value_display(sub.get("owner_agent")),
-            path.map(|p| value_display(p.get("worker"))).unwrap_or_default(),
-        ]),
-        "path_name": path.map(|p| value_display(p.get("path_name"))).unwrap_or_default(),
-        "order": first_value(&[
-            sub_meta.get("order"),
-            path_meta.get("order"),
-            sub.get("priority"),
-        ]),
-        "updated_at": first_nonempty(&[
-            value_display(sub.get("updated_at")),
-            path.map(|p| value_display(p.get("updated_at"))).unwrap_or_default(),
-        ]),
-    })
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse harness goal-tree {goal_key} JSON"))
 }
 
 fn render_goal_tree(tree: &Value, source_path: &str) -> String {
@@ -1910,30 +1725,12 @@ fn priority_from_order(order: i64) -> String {
     priority.to_string()
 }
 
-fn parse_embedded_json(value: Option<&Value>) -> Value {
-    match value {
-        Some(Value::Object(_)) | Some(Value::Array(_)) => value.cloned().unwrap_or(Value::Null),
-        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
-        _ => Value::Null,
-    }
-}
-
 fn first_nonempty(values: &[String]) -> String {
     values
         .iter()
         .find(|value| !value.is_empty() && value.as_str() != "(none)")
         .cloned()
         .unwrap_or_default()
-}
-
-fn first_value(values: &[Option<&Value>]) -> Value {
-    values
-        .iter()
-        .flatten()
-        .find(|value| !json_is_empty(value) && value_display(Some(value)).as_str() != "(none)")
-        .cloned()
-        .cloned()
-        .unwrap_or(Value::Null)
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<String> {
@@ -1943,10 +1740,6 @@ fn nonempty_string(value: Option<&Value>) -> Option<String> {
     } else {
         Some(rendered)
     }
-}
-
-fn sql_escape(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn adherence_data(state: &AppState) -> Value {

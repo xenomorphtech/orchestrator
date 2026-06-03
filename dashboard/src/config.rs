@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-const DEFAULT_HARNESS: &str = "/home/sdancer/orchestrator/harness";
 const DEFAULT_SERVER: &str = "http://127.0.0.1:3000";
 const DEFAULT_DATABASE: &str = "orchestrator-harness";
 const DEFAULT_BIOME_URL: &str = "http://127.0.0.1:3021";
@@ -42,7 +41,9 @@ struct HarnessToml {
 
 impl DashboardConfig {
     pub fn load() -> Result<Self> {
-        let _ = dotenvy::from_path("/home/sdancer/orchestrator/.env");
+        let home_dir = dirs_home();
+        let orchestrator_dir = home_dir.join("orchestrator");
+        let _ = dotenvy::from_path(orchestrator_dir.join(".env"));
         let harness_toml = read_harness_toml();
         let env_map: HashMap<String, String> = env::vars().collect();
 
@@ -67,7 +68,7 @@ impl DashboardConfig {
             .or_else(|| harness_toml.biome_api_key.clone())
             .unwrap_or_default();
         let sql_url = format!("{harness_server}/v1/database/{harness_database}/sql");
-        let analysis_dir = PathBuf::from("/home/sdancer/orchestrator/analysis");
+        let analysis_dir = orchestrator_dir.join("analysis");
 
         Ok(Self {
             bind_addr: env_map
@@ -77,7 +78,7 @@ impl DashboardConfig {
             harness_path: env_map
                 .get("HARNESS")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_HARNESS)),
+                .unwrap_or_else(|| orchestrator_dir.join("harness")),
             harness_server,
             harness_database,
             sql_url,
@@ -87,8 +88,8 @@ impl DashboardConfig {
                 .get("DASHBOARD_PASSWORD")
                 .cloned()
                 .unwrap_or_else(|| DEFAULT_PASSWORD.to_string()),
-            secret_key_path: PathBuf::from("/home/sdancer/orchestrator/.dash_secret_key"),
-            briefings_dir: PathBuf::from("/home/sdancer/orchestrator/briefings"),
+            secret_key_path: orchestrator_dir.join(".dash_secret_key"),
+            briefings_dir: orchestrator_dir.join("briefings"),
             memory_dir: PathBuf::from(
                 "/home/sdancer/.claude/projects/-home-sdancer-orchestrator/memory",
             ),
