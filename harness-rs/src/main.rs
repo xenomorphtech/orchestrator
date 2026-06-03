@@ -71,6 +71,15 @@ enum Commands {
     SubGoalUpdate(SubGoalUpdateArgs),
     SubGoalRemove(SubGoalRemoveArgs),
     SubGoalSet(SubGoalSetArgs),
+    PathAdd(PathAddArgs),
+    PathSet(PathSetArgs),
+    PathList(PathListArgs),
+    PathRemove(PathRemoveArgs),
+    DraftSet(DraftSetArgs),
+    DraftGet(DraftGetArgs),
+    DraftList(DraftListArgs),
+    AnchorSet(AnchorSetArgs),
+    AnchorGet(AnchorGetArgs),
     AgentAdd(AgentAddArgs),
     /// Create a biome_term pane, run a command, and register the agent
     AgentCreate(AgentCreateArgs),
@@ -336,6 +345,149 @@ struct SubGoalRemoveArgs {
 struct SubGoalSetArgs {
     sub_goal_key: String,
     status: String,
+}
+
+#[derive(Args)]
+struct PathAddArgs {
+    path_name: String,
+    #[arg(long)]
+    goal: String,
+    #[arg(long)]
+    sub_goal: Option<String>,
+    #[arg(long, default_value = "")]
+    worker: String,
+    #[arg(long, default_value = "")]
+    worktree: String,
+    #[arg(long, default_value = "")]
+    hypothesis: String,
+    #[arg(long, default_value = "")]
+    falsification: String,
+    #[arg(long, default_value = "active")]
+    status: String,
+    #[arg(long, default_value_t = 0)]
+    stall_counter: u32,
+    #[arg(long)]
+    last_metric_move_at: Option<String>,
+    #[arg(long)]
+    predicted_delta: Option<f64>,
+    #[arg(long)]
+    substrate: Option<String>,
+    #[arg(long)]
+    notes: Option<String>,
+    #[arg(long)]
+    metadata: Option<String>,
+}
+
+#[derive(Args)]
+struct PathSetArgs {
+    path_name: String,
+    #[arg(long)]
+    goal: Option<String>,
+    #[arg(long)]
+    sub_goal: Option<String>,
+    #[arg(long)]
+    worker: Option<String>,
+    #[arg(long)]
+    worktree: Option<String>,
+    #[arg(long)]
+    hypothesis: Option<String>,
+    #[arg(long)]
+    falsification: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    stall_counter: Option<u32>,
+    #[arg(long)]
+    last_metric_move_at: Option<String>,
+    #[arg(long)]
+    predicted_delta: Option<f64>,
+    #[arg(long)]
+    substrate: Option<String>,
+    #[arg(long)]
+    notes: Option<String>,
+    #[arg(long)]
+    metadata: Option<String>,
+    #[arg(long)]
+    clear_sub_goal: bool,
+    #[arg(long)]
+    clear_last_metric_move_at: bool,
+    #[arg(long)]
+    clear_predicted_delta: bool,
+    #[arg(long)]
+    clear_substrate: bool,
+    #[arg(long)]
+    clear_notes: bool,
+}
+
+#[derive(Args)]
+struct PathListArgs {
+    #[arg(long)]
+    goal: Option<String>,
+    #[arg(long)]
+    sub_goal: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct PathRemoveArgs {
+    path_name: String,
+    #[arg(long)]
+    delete: bool,
+}
+
+#[derive(Args)]
+struct DraftSetArgs {
+    draft_key: String,
+    #[arg(long)]
+    goal: String,
+    #[arg(long)]
+    title: String,
+    #[arg(long)]
+    body: Option<String>,
+    #[arg(long)]
+    body_file: Option<String>,
+}
+
+#[derive(Args)]
+struct DraftGetArgs {
+    draft_key: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DraftListArgs {
+    #[arg(long)]
+    goal: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct AnchorSetArgs {
+    #[arg(long)]
+    goal: String,
+    #[arg(long)]
+    current_understanding: String,
+    #[arg(long)]
+    invariants: Option<String>,
+    #[arg(long)]
+    metric_name: String,
+    #[arg(long)]
+    metric_current: f64,
+    #[arg(long)]
+    metric_target: f64,
+}
+
+#[derive(Args)]
+struct AnchorGetArgs {
+    #[arg(long)]
+    goal: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -981,9 +1133,42 @@ fn agent_row_to_json_object(columns: &[String], values: &[Value]) -> serde_json:
     obj
 }
 
+fn sql_escape(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn row_to_json_object(columns: &[String], values: &[Value]) -> serde_json::Map<String, Value> {
+    let mut obj = serde_json::Map::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
+        let decoded = values
+            .get(idx)
+            .map(cell_to_json)
+            .unwrap_or(Value::Null);
+        let final_val = if col.ends_with("_json") {
+            match &decoded {
+                Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| decoded.clone()),
+                _ => decoded.clone(),
+            }
+        } else {
+            decoded
+        };
+        obj.insert(col.clone(), final_val);
+    }
+    obj
+}
+
+fn sql_result_to_json_array(results: &[Value]) -> Value {
+    let (columns, rows) = extract_columns_and_rows(results);
+    Value::Array(
+        rows.iter()
+            .map(|values| Value::Object(row_to_json_object(&columns, values)))
+            .collect(),
+    )
+}
+
 fn cmd_agent_get(cli: &CliContext, name: &str, as_json: bool) -> Result<()> {
     let Some((columns, values)) = fetch_agent_row(cli, name)? else {
-        eprintln!("agent '{name}' not found");
+        let _ = writeln!(&mut io::stderr().lock(), "agent '{name}' not found");
         std::process::exit(2);
     };
 
@@ -1017,6 +1202,108 @@ fn cmd_agent_list(cli: &CliContext, as_json: bool) -> Result<()> {
     } else {
         // Reuse the existing table renderer that `harness agents` uses.
         sql(cli, "SELECT * FROM agents")
+    }
+}
+
+fn cmd_path_list(cli: &CliContext, args: PathListArgs) -> Result<()> {
+    let mut wheres: Vec<String> = Vec::new();
+    if let Some(goal) = &args.goal {
+        wheres.push(format!("goal_key = '{}'", sql_escape(goal)));
+    }
+    if let Some(sub_goal) = &args.sub_goal {
+        wheres.push(format!("sub_goal_key = '{}'", sql_escape(sub_goal)));
+    }
+    if let Some(status) = &args.status {
+        wheres.push(format!("status = '{}'", sql_escape(status)));
+    }
+    let where_clause = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", wheres.join(" AND "))
+    };
+    let query = format!(
+        "SELECT path_name, goal_key, sub_goal_key, worker, worktree, hypothesis, falsification, status, stall_counter, last_metric_move_at, predicted_delta, substrate, notes, metadata_json, created_at, updated_at FROM paths{where_clause}"
+    );
+    if args.json {
+        let results = sql_query(cli, &query)?;
+        out!("{}", serde_json::to_string(&sql_result_to_json_array(&results))?);
+        Ok(())
+    } else {
+        sql(cli, &query)
+    }
+}
+
+fn cmd_draft_set(cli: &CliContext, args: DraftSetArgs) -> Result<()> {
+    let body = match (args.body, &args.body_file) {
+        (Some(body), _) => body,
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading draft body file {path}"))?,
+        (None, None) => return Err(anyhow!("draft-set requires --body or --body-file")),
+    };
+    call_reducer(
+        cli,
+        "draft_set",
+        Some(vec![json!({
+            "draft_key": args.draft_key,
+            "goal_key": args.goal,
+            "title": args.title,
+            "body": body
+        })]),
+    )
+}
+
+fn cmd_draft_get(cli: &CliContext, args: DraftGetArgs) -> Result<()> {
+    let query = format!(
+        "SELECT draft_key, goal_key, title, body, revision, created_at, updated_at FROM drafts WHERE draft_key = '{}'",
+        sql_escape(&args.draft_key)
+    );
+    let results = sql_query(cli, &query)?;
+    let (columns, rows) = extract_columns_and_rows(&results);
+    let Some(row) = rows.first() else {
+        return Err(anyhow!("no draft named {}", args.draft_key));
+    };
+    let obj = row_to_json_object(&columns, row);
+    if args.json {
+        out!("{}", serde_json::to_string(&Value::Object(obj))?);
+    } else {
+        out!("{}", obj.get("body").and_then(|v| v.as_str()).unwrap_or(""));
+    }
+    Ok(())
+}
+
+fn cmd_draft_list(cli: &CliContext, args: DraftListArgs) -> Result<()> {
+    let where_clause = args
+        .goal
+        .as_ref()
+        .map(|goal| format!(" WHERE goal_key = '{}'", sql_escape(goal)))
+        .unwrap_or_default();
+    let query = format!(
+        "SELECT draft_key, goal_key, title, revision, created_at, updated_at FROM drafts{where_clause}"
+    );
+    if args.json {
+        let results = sql_query(cli, &query)?;
+        out!("{}", serde_json::to_string(&sql_result_to_json_array(&results))?);
+        Ok(())
+    } else {
+        sql(cli, &query)
+    }
+}
+
+fn cmd_anchor_get(cli: &CliContext, args: AnchorGetArgs) -> Result<()> {
+    let query = format!(
+        "SELECT goal_key, current_understanding, invariants, metric_name, metric_current, metric_target, updated_at FROM goal_anchor WHERE goal_key = '{}'",
+        sql_escape(&args.goal)
+    );
+    if args.json {
+        let results = sql_query(cli, &query)?;
+        let (columns, rows) = extract_columns_and_rows(&results);
+        let Some(row) = rows.first() else {
+            return Err(anyhow!("no anchor for goal {}", args.goal));
+        };
+        out!("{}", serde_json::to_string(&Value::Object(row_to_json_object(&columns, row)))?);
+        Ok(())
+    } else {
+        sql(cli, &query)
     }
 }
 
@@ -2169,6 +2456,75 @@ fn run() -> Result<()> {
                 }),
             ]),
         ),
+        Commands::PathAdd(args) => call_reducer(
+            &context,
+            "path_add",
+            Some(vec![json!({
+                "path_name": args.path_name,
+                "goal_key": args.goal,
+                "sub_goal_key": optional_json_string(args.sub_goal),
+                "worker": args.worker,
+                "worktree": args.worktree,
+                "hypothesis": args.hypothesis,
+                "falsification": args.falsification,
+                "status": some_json_string(args.status),
+                "stall_counter": some_json_u32(args.stall_counter),
+                "last_metric_move_at": optional_json_string(args.last_metric_move_at),
+                "predicted_delta": optional_json_f64(args.predicted_delta),
+                "substrate": optional_json_string(args.substrate),
+                "notes": optional_json_string(args.notes),
+                "metadata_json": some_json_string(args.metadata.unwrap_or_else(|| "{}".to_string())),
+            })]),
+        ),
+        Commands::PathSet(args) => call_reducer(
+            &context,
+            "path_update",
+            Some(vec![
+                Value::String(args.path_name),
+                json!({
+                    "goal_key": optional_json_string(args.goal),
+                    "sub_goal_key": optional_json_string(args.sub_goal),
+                    "worker": optional_json_string(args.worker),
+                    "worktree": optional_json_string(args.worktree),
+                    "hypothesis": optional_json_string(args.hypothesis),
+                    "falsification": optional_json_string(args.falsification),
+                    "status": optional_json_string(args.status),
+                    "stall_counter": optional_json_u32(args.stall_counter),
+                    "last_metric_move_at": optional_json_string(args.last_metric_move_at),
+                    "predicted_delta": optional_json_f64(args.predicted_delta),
+                    "substrate": optional_json_string(args.substrate),
+                    "notes": optional_json_string(args.notes),
+                    "metadata_json": optional_json_string(args.metadata),
+                    "clear_sub_goal": args.clear_sub_goal,
+                    "clear_last_metric_move_at": args.clear_last_metric_move_at,
+                    "clear_predicted_delta": args.clear_predicted_delta,
+                    "clear_substrate": args.clear_substrate,
+                    "clear_notes": args.clear_notes,
+                }),
+            ]),
+        ),
+        Commands::PathList(args) => cmd_path_list(&context, args),
+        Commands::PathRemove(args) => call_reducer(
+            &context,
+            "path_remove",
+            Some(vec![Value::String(args.path_name), Value::Bool(args.delete)]),
+        ),
+        Commands::DraftSet(args) => cmd_draft_set(&context, args),
+        Commands::DraftGet(args) => cmd_draft_get(&context, args),
+        Commands::DraftList(args) => cmd_draft_list(&context, args),
+        Commands::AnchorSet(args) => call_reducer(
+            &context,
+            "goal_anchor_set",
+            Some(vec![json!({
+                "goal_key": args.goal,
+                "current_understanding": args.current_understanding,
+                "invariants": optional_json_string(args.invariants),
+                "metric_name": args.metric_name,
+                "metric_current": args.metric_current,
+                "metric_target": args.metric_target,
+            })]),
+        ),
+        Commands::AnchorGet(args) => cmd_anchor_get(&context, args),
         Commands::AgentAdd(args) => {
             let kind = normalize_agent_kind(&args.kind);
             let biome_pane_id = match (kind.as_str(), args.biome_pane_id.clone()) {
@@ -2910,6 +3266,13 @@ fn optional_json_string(value: Option<String>) -> Value {
 fn optional_json_u32(value: Option<u32>) -> Value {
     match value {
         Some(value) => some_json_u32(value),
+        None => none_json(),
+    }
+}
+
+fn optional_json_f64(value: Option<f64>) -> Value {
+    match value {
+        Some(value) => some_json_f64(value),
         None => none_json(),
     }
 }

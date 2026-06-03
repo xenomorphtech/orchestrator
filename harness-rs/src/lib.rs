@@ -165,6 +165,64 @@ pub struct BriefingInput {
     pub metadata_json: Option<String>,
 }
 
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct PathInput {
+    pub path_name: String,
+    pub goal_key: String,
+    pub sub_goal_key: Option<String>,
+    pub worker: String,
+    pub worktree: String,
+    pub hypothesis: String,
+    pub falsification: String,
+    pub status: Option<String>,
+    pub stall_counter: Option<u32>,
+    pub last_metric_move_at: Option<String>,
+    pub predicted_delta: Option<f64>,
+    pub substrate: Option<String>,
+    pub notes: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct PathPatch {
+    pub goal_key: Option<String>,
+    pub sub_goal_key: Option<String>,
+    pub worker: Option<String>,
+    pub worktree: Option<String>,
+    pub hypothesis: Option<String>,
+    pub falsification: Option<String>,
+    pub status: Option<String>,
+    pub stall_counter: Option<u32>,
+    pub last_metric_move_at: Option<String>,
+    pub predicted_delta: Option<f64>,
+    pub substrate: Option<String>,
+    pub notes: Option<String>,
+    pub metadata_json: Option<String>,
+    pub clear_sub_goal: bool,
+    pub clear_last_metric_move_at: bool,
+    pub clear_predicted_delta: bool,
+    pub clear_substrate: bool,
+    pub clear_notes: bool,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct DraftInput {
+    pub draft_key: String,
+    pub goal_key: String,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct GoalAnchorInput {
+    pub goal_key: String,
+    pub current_understanding: String,
+    pub invariants: Option<String>,
+    pub metric_name: String,
+    pub metric_current: f64,
+    pub metric_target: f64,
+}
+
 #[derive(Clone)]
 #[spacetimedb::table(accessor = agents, public)]
 pub struct Agent {
@@ -430,6 +488,58 @@ pub struct Briefing {
     pub metadata_json: String,
 }
 
+#[derive(Clone)]
+#[spacetimedb::table(accessor = paths, public)]
+pub struct Path {
+    #[primary_key]
+    pub path_name: String,
+    #[index(btree)]
+    pub goal_key: String,
+    #[index(btree)]
+    pub sub_goal_key: Option<String>,
+    pub worker: String,
+    pub worktree: String,
+    pub hypothesis: String,
+    pub falsification: String,
+    #[index(btree)]
+    pub status: String,
+    pub stall_counter: u32,
+    pub last_metric_move_at: Option<String>,
+    pub predicted_delta: Option<f64>,
+    pub substrate: Option<String>,
+    pub notes: Option<String>,
+    pub metadata_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = drafts, public)]
+pub struct Draft {
+    #[primary_key]
+    pub draft_key: String,
+    #[index(btree)]
+    pub goal_key: String,
+    pub title: String,
+    pub body: String,
+    pub revision: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = goal_anchor, public)]
+pub struct GoalAnchor {
+    #[primary_key]
+    pub goal_key: String,
+    pub current_understanding: String,
+    pub invariants: Option<String>,
+    pub metric_name: String,
+    pub metric_current: f64,
+    pub metric_target: f64,
+    pub updated_at: String,
+}
+
 fn now(ctx: &ReducerContext) -> String {
     ctx.timestamp.to_string()
 }
@@ -479,6 +589,14 @@ fn require_sub_goal(ctx: &ReducerContext, sub_goal_key: &str) -> Result<SubGoal,
         .sub_goal_key()
         .find(&sub_goal_key.to_string())
         .ok_or_else(|| format!("unknown sub-goal: {sub_goal_key}"))
+}
+
+fn require_path(ctx: &ReducerContext, path_name: &str) -> Result<Path, String> {
+    ctx.db
+        .paths()
+        .path_name()
+        .find(&path_name.to_string())
+        .ok_or_else(|| format!("unknown path: {path_name}"))
 }
 
 fn require_service(ctx: &ReducerContext, name: &str) -> Result<Service, String> {
@@ -1009,6 +1127,64 @@ fn upsert_sub_goal_internal(ctx: &ReducerContext, input: SubGoalInput) -> Result
     Ok(())
 }
 
+fn validate_path_refs(
+    ctx: &ReducerContext,
+    goal_key: &str,
+    sub_goal_key: &Option<String>,
+) -> Result<Option<String>, String> {
+    require_goal(ctx, goal_key)?;
+    let sub_goal_key = opt_text(sub_goal_key.clone());
+    if let Some(ref key) = sub_goal_key {
+        let sub_goal = require_sub_goal(ctx, key)?;
+        if sub_goal.goal_key != goal_key {
+            return Err(format!(
+                "sub-goal {key} belongs to goal {}, not {goal_key}",
+                sub_goal.goal_key
+            ));
+        }
+    }
+    Ok(sub_goal_key)
+}
+
+fn upsert_path_internal(ctx: &ReducerContext, input: PathInput) -> Result<(), String> {
+    let sub_goal_key = validate_path_refs(ctx, &input.goal_key, &input.sub_goal_key)?;
+    let timestamp = now(ctx);
+    let existing = ctx.db.paths().path_name().find(&input.path_name);
+    let row = Path {
+        path_name: input.path_name.clone(),
+        goal_key: input.goal_key,
+        sub_goal_key,
+        worker: input.worker,
+        worktree: input.worktree,
+        hypothesis: input.hypothesis,
+        falsification: input.falsification,
+        status: input
+            .status
+            .or_else(|| existing.as_ref().map(|row| row.status.clone()))
+            .unwrap_or_else(|| "active".to_string()),
+        stall_counter: input
+            .stall_counter
+            .or_else(|| existing.as_ref().map(|row| row.stall_counter))
+            .unwrap_or(0),
+        last_metric_move_at: opt_text(input.last_metric_move_at),
+        predicted_delta: input.predicted_delta,
+        substrate: opt_text(input.substrate),
+        notes: opt_text(input.notes),
+        metadata_json: input
+            .metadata_json
+            .or_else(|| existing.as_ref().map(|row| row.metadata_json.clone()))
+            .unwrap_or_else(|| "{}".to_string()),
+        created_at: existing
+            .as_ref()
+            .map(|row| row.created_at.clone())
+            .unwrap_or_else(|| timestamp.clone()),
+        updated_at: timestamp,
+    };
+    let _ = ctx.db.paths().path_name().delete(&row.path_name);
+    ctx.db.paths().insert(row);
+    Ok(())
+}
+
 #[spacetimedb::reducer(init)]
 pub fn init(_ctx: &ReducerContext) {}
 
@@ -1338,6 +1514,150 @@ pub fn sub_goal_remove(ctx: &ReducerContext, sub_goal_key: String, delete: bool)
         }
         log_event(ctx, Some(current.owner_agent), "sub_goal.cancelled", sub_goal_key, None);
     }
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn path_add(ctx: &ReducerContext, input: PathInput) -> Result<(), String> {
+    let key = input.path_name.clone();
+    let goal_key = input.goal_key.clone();
+    upsert_path_internal(ctx, input)?;
+    log_event(
+        ctx,
+        None,
+        "path.upserted",
+        key,
+        Some(format!("{{\"goal_key\":\"{goal_key}\"}}")),
+    );
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn path_update(ctx: &ReducerContext, path_name: String, patch: PathPatch) -> Result<(), String> {
+    let current = require_path(ctx, &path_name)?;
+    let next_goal_key = patch.goal_key.unwrap_or(current.goal_key);
+    let next_sub_goal_key = if patch.clear_sub_goal {
+        None
+    } else {
+        patch.sub_goal_key.or(current.sub_goal_key)
+    };
+    let next = PathInput {
+        path_name: path_name.clone(),
+        goal_key: next_goal_key,
+        sub_goal_key: next_sub_goal_key,
+        worker: patch.worker.unwrap_or(current.worker),
+        worktree: patch.worktree.unwrap_or(current.worktree),
+        hypothesis: patch.hypothesis.unwrap_or(current.hypothesis),
+        falsification: patch.falsification.unwrap_or(current.falsification),
+        status: patch.status.or(Some(current.status)),
+        stall_counter: patch.stall_counter.or(Some(current.stall_counter)),
+        last_metric_move_at: if patch.clear_last_metric_move_at {
+            None
+        } else {
+            patch.last_metric_move_at.or(current.last_metric_move_at)
+        },
+        predicted_delta: if patch.clear_predicted_delta {
+            None
+        } else {
+            patch.predicted_delta.or(current.predicted_delta)
+        },
+        substrate: if patch.clear_substrate {
+            None
+        } else {
+            patch.substrate.or(current.substrate)
+        },
+        notes: if patch.clear_notes {
+            None
+        } else {
+            patch.notes.or(current.notes)
+        },
+        metadata_json: patch.metadata_json.or(Some(current.metadata_json)),
+    };
+    upsert_path_internal(ctx, next)?;
+    log_event(ctx, None, "path.updated", path_name, None);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn path_update_status(
+    ctx: &ReducerContext,
+    path_name: String,
+    status: String,
+    last_metric_move_at: Option<String>,
+) -> Result<(), String> {
+    let mut row = require_path(ctx, &path_name)?;
+    row.status = status.clone();
+    if let Some(ts) = opt_text(last_metric_move_at) {
+        row.last_metric_move_at = Some(ts);
+    }
+    row.updated_at = now(ctx);
+    ctx.db.paths().path_name().update(row);
+    log_event(
+        ctx,
+        None,
+        "path.status_updated",
+        path_name,
+        Some(format!("{{\"status\":\"{status}\"}}")),
+    );
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn path_remove(ctx: &ReducerContext, path_name: String, delete: bool) -> Result<(), String> {
+    let mut row = require_path(ctx, &path_name)?;
+    if delete {
+        let _ = ctx.db.paths().path_name().delete(&path_name);
+        log_event(ctx, None, "path.deleted", path_name, None);
+    } else {
+        row.status = "path-dropped".to_string();
+        row.updated_at = now(ctx);
+        ctx.db.paths().path_name().update(row);
+        log_event(ctx, None, "path.dropped", path_name, None);
+    }
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn draft_set(ctx: &ReducerContext, input: DraftInput) -> Result<(), String> {
+    require_goal(ctx, &input.goal_key)?;
+    let timestamp = now(ctx);
+    let existing = ctx.db.drafts().draft_key().find(&input.draft_key);
+    let row = Draft {
+        draft_key: input.draft_key.clone(),
+        goal_key: input.goal_key,
+        title: input.title,
+        body: input.body,
+        revision: existing
+            .as_ref()
+            .map(|row| row.revision.saturating_add(1))
+            .unwrap_or(1),
+        created_at: existing
+            .as_ref()
+            .map(|row| row.created_at.clone())
+            .unwrap_or_else(|| timestamp.clone()),
+        updated_at: timestamp,
+    };
+    let _ = ctx.db.drafts().draft_key().delete(&row.draft_key);
+    ctx.db.drafts().insert(row);
+    log_event(ctx, None, "draft.set", input.draft_key, None);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn goal_anchor_set(ctx: &ReducerContext, input: GoalAnchorInput) -> Result<(), String> {
+    require_goal(ctx, &input.goal_key)?;
+    let row = GoalAnchor {
+        goal_key: input.goal_key.clone(),
+        current_understanding: input.current_understanding,
+        invariants: opt_text(input.invariants),
+        metric_name: input.metric_name,
+        metric_current: input.metric_current,
+        metric_target: input.metric_target,
+        updated_at: now(ctx),
+    };
+    let _ = ctx.db.goal_anchor().goal_key().delete(&row.goal_key);
+    ctx.db.goal_anchor().insert(row);
+    log_event(ctx, None, "goal_anchor.set", input.goal_key, None);
     Ok(())
 }
 
