@@ -409,7 +409,67 @@ async fn goal_detail(
 }
 
 async fn paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "paths", "/paths")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let p = read_json_file(&state.cfg.analysis_dir.join("paths.json"));
+    let mut body = String::from("<h1 class=\"text-2xl mb-4\">Path portfolio</h1>");
+    let empty = p.is_null() || p.as_object().is_some_and(|o| o.is_empty());
+    if empty {
+        body.push_str(
+            "<div class=\"text-zinc-500\">(empty / unreadable analysis/paths.json)</div>",
+        );
+    } else if let Some(goals) = p.get("goals").and_then(Value::as_object) {
+        for (gk, g) in goals {
+            body.push_str(
+                "<section class=\"mb-5 bg-zinc-900 border border-zinc-800 rounded p-3\">",
+            );
+            body.push_str(&format!("<h2 class=\"text-lg mb-1\">{}</h2>", html_escape(gk)));
+            body.push_str(&format!(
+                "<div class=\"text-xs text-zinc-500 mb-2\">{} — current {}/{} — last move {}</div>",
+                html_escape(&value_display(g.get("metric_name"))),
+                html_escape(&value_display_or(g.get("current"), "?")),
+                html_escape(&value_display_or(g.get("target"), "?")),
+                html_escape(&value_display_or(g.get("last_move_at"), "?")),
+            ));
+            match g.get("paths").and_then(Value::as_array) {
+                Some(arr) if !arr.is_empty() => {
+                    body.push_str(
+                        "<table class=\"w-full text-xs\"><thead><tr class=\"text-zinc-500 text-left\">\
+                         <th class=\"pr-2\">name</th><th class=\"pr-2\">status</th><th class=\"pr-2\">stall</th>\
+                         <th class=\"pr-2\">worker</th><th>hypothesis / falsification</th></tr></thead><tbody>",
+                    );
+                    for pt in arr {
+                        let status = value_display(pt.get("status"));
+                        let cls = if status == "progressing" {
+                            "b-progressing"
+                        } else {
+                            "b-stalled"
+                        };
+                        body.push_str(&format!(
+                            "<tr><td class=\"pr-2 align-top\">{}</td>\
+                             <td class=\"pr-2 align-top\"><span class=\"badge {}\">{}</span></td>\
+                             <td class=\"pr-2 align-top\">{}</td>\
+                             <td class=\"pr-2 align-top text-zinc-400\">{}</td>\
+                             <td class=\"align-top text-zinc-300\"><div>{}</div>\
+                             <div class=\"text-zinc-500\">{}</div></td></tr>",
+                            html_escape(&value_display(pt.get("name"))),
+                            cls,
+                            html_escape(&status),
+                            html_escape(&value_display_or(pt.get("stall_counter"), "0")),
+                            html_escape(&value_display(pt.get("worker"))),
+                            html_escape(&value_display(pt.get("hypothesis"))),
+                            html_escape(&value_display(pt.get("falsification"))),
+                        ));
+                    }
+                    body.push_str("</tbody></table>");
+                }
+                _ => body.push_str("<div class=\"text-zinc-500 text-xs\">(no paths)</div>"),
+            }
+            body.push_str("</section>");
+        }
+    }
+    render_page("paths", &body, 0).into_response()
 }
 
 async fn agents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
