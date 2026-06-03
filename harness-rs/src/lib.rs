@@ -346,6 +346,7 @@ pub struct Workstream {
 #[derive(Clone)]
 #[spacetimedb::table(accessor = generation, public)]
 pub struct Generation {
+    #[primary_key]
     pub generation_number: u32,
     pub rung: u8,
     pub seconds_to_rung: u64,
