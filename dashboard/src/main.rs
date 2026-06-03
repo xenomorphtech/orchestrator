@@ -3,11 +3,12 @@ mod data;
 
 use std::fs;
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -16,6 +17,7 @@ use config::DashboardConfig;
 use data::DataClient;
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
@@ -74,6 +76,17 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/talk/new", post(talk_new))
         .route("/talk/clear", post(talk_clear))
         .route("/talk/delete", post(talk_delete))
+        .route("/api/cycles", get(api_cycles))
+        .route("/api/goals", get(api_goals))
+        .route("/api/goal/{key}", get(api_goal_detail))
+        .route("/api/paths", get(api_paths))
+        .route("/api/agents", get(api_agents))
+        .route("/api/facts", get(api_facts))
+        .route("/api/services", get(api_services))
+        .route("/api/memory", get(api_memory))
+        .route("/api/briefings", get(api_briefings))
+        .route("/api/adherence", get(api_adherence))
+        .route("/api/progress", get(api_progress))
         .with_state(state)
 }
 
@@ -238,6 +251,378 @@ async fn talk_clear(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 
 async fn talk_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     authed_or_placeholder(&headers, &state, "talk delete", "POST /talk/delete")
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+}
+
+async fn api_cycles(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<LimitQuery>,
+) -> Response {
+    api_authed_json(
+        &headers,
+        &state,
+        || json!({"cycles": latest_episodes(&state, query.limit.unwrap_or(200))}),
+    )
+}
+
+async fn api_goals(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(&headers, &state, || json!({"goals": goals_data(&state)}))
+}
+
+async fn api_goal_detail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return api_unauthorized();
+    }
+    let goals = goals_data(&state);
+    match goals
+        .into_iter()
+        .find(|goal| goal.get("goal_key").and_then(Value::as_str) == Some(key.as_str()))
+    {
+        Some(goal) => axum::Json(json!({"goal": goal})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "goal not found"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(
+        &headers,
+        &state,
+        || json!({"paths": read_json_file(&state.cfg.analysis_dir.join("paths.json"))}),
+    )
+}
+
+async fn api_agents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(
+        &headers,
+        &state,
+        || json!({"agents": rows_to_values(state.data.harness_table(&["agents"]))}),
+    )
+}
+
+async fn api_facts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(
+        &headers,
+        &state,
+        || json!({"facts": facts_data(&state, 80)}),
+    )
+}
+
+async fn api_services(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(
+        &headers,
+        &state,
+        || json!({"services": rows_to_values(state.data.harness_table(&["services"]))}),
+    )
+}
+
+async fn api_memory(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(&headers, &state, || {
+        json!({
+            "memory": {
+                "files": list_md_json(&state.cfg.memory_dir),
+                "index": read_md_file(&state.cfg.memory_dir, "MEMORY.md"),
+            }
+        })
+    })
+}
+
+async fn api_briefings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<BriefingQuery>,
+) -> Response {
+    api_authed_json(
+        &headers,
+        &state,
+        || json!({"briefings": briefings_data(&state, query.show.as_deref().unwrap_or("active"))}),
+    )
+}
+
+async fn api_adherence(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(&headers, &state, || adherence_data(&state))
+}
+
+async fn api_progress(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    api_authed_json(&headers, &state, || progress_data(&state))
+}
+
+fn api_authed_json<F>(headers: &HeaderMap, state: &AppState, build: F) -> Response
+where
+    F: FnOnce() -> Value,
+{
+    if !is_authed(headers, state) {
+        return api_unauthorized();
+    }
+    axum::Json(build()).into_response()
+}
+
+fn api_unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
+}
+
+fn rows_to_values(rows: Vec<data::Row>) -> Vec<Value> {
+    rows.into_iter()
+        .map(|row| {
+            Value::Object(
+                row.into_iter()
+                    .map(|(k, v)| (k, Value::String(v)))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn latest_episodes(state: &AppState, limit: usize) -> Vec<Value> {
+    let limit = limit.clamp(1, 1000);
+    let rows = state
+        .data
+        .sql_query(
+            "SELECT id, created_at, summary, agent_statuses_json, actions_taken_json, goal_progress_json FROM episodes",
+        )
+        .map(|mut rows| {
+            rows.sort_by_key(|row| value_i64(row.get("id")).unwrap_or(0));
+            rows.into_iter()
+                .rev()
+                .take(limit)
+                .map(|mut row| {
+                    parse_json_field(&mut row, "agent_statuses_json");
+                    parse_json_field(&mut row, "actions_taken_json");
+                    parse_json_field(&mut row, "goal_progress_json");
+                    Value::Object(row.into_iter().collect())
+                })
+                .collect()
+        });
+    rows.unwrap_or_else(|_| {
+        let mut rows = state
+            .data
+            .harness_table(&["episodes", "--limit", &limit.to_string()]);
+        rows.reverse();
+        rows_to_values(rows)
+    })
+}
+
+fn goals_data(state: &AppState) -> Vec<Value> {
+    let mut rows = state.data.harness_table(&["goals"]);
+    rows.sort_by(|a, b| {
+        let a_active = a.get("status").is_some_and(|s| s == "active");
+        let b_active = b.get("status").is_some_and(|s| s == "active");
+        b_active
+            .cmp(&a_active)
+            .then_with(|| parse_i64(b.get("priority")).cmp(&parse_i64(a.get("priority"))))
+    });
+    rows_to_values(rows)
+}
+
+fn facts_data(state: &AppState, limit: usize) -> Vec<Value> {
+    let mut rows = state.data.harness_table(&["facts"]);
+    rows.reverse();
+    rows_to_values(rows.into_iter().take(limit).collect())
+}
+
+fn briefings_data(state: &AppState, show: &str) -> Vec<Value> {
+    let args: &[&str] = match show {
+        "archived" => &["briefing-list", "--only-archived"],
+        "all" => &["briefing-list", "--archived"],
+        _ => &["briefing-list"],
+    };
+    rows_to_values(state.data.harness_table(args))
+}
+
+fn read_json_file(path: &FsPath) -> Value {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn list_md_json(dir: &FsPath) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let title = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.trim_start_matches('#')
+                    .trim()
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| name.clone());
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(json!({"name": name, "title": title, "size": meta.len(), "mtime_unix": mtime}));
+    }
+    out.sort_by(|a, b| {
+        b.get("mtime_unix")
+            .and_then(Value::as_u64)
+            .cmp(&a.get("mtime_unix").and_then(Value::as_u64))
+    });
+    out
+}
+
+fn read_md_file(dir: &FsPath, name: &str) -> Option<String> {
+    if name.contains('/') || name.contains("..") {
+        return None;
+    }
+    fs::read_to_string(dir.join(name)).ok()
+}
+
+fn adherence_data(state: &AppState) -> Value {
+    let goals = goals_data(state);
+    let subgoals = rows_to_values(state.data.harness_table(&["sub-goals"]));
+    let briefings_db = briefings_data(state, "all");
+    let briefing_files = list_md_json(&state.cfg.briefings_dir);
+    let paths = read_json_file(&state.cfg.analysis_dir.join("paths.json"));
+    let file_goal_count = paths
+        .get("goals")
+        .and_then(Value::as_object)
+        .map(|goals| goals.len())
+        .unwrap_or(0);
+    let db_goal_keys: std::collections::BTreeSet<String> = goals
+        .iter()
+        .filter_map(|g| {
+            g.get("goal_key")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect();
+    let unlinked_path_goals: Vec<String> = paths
+        .get("goals")
+        .and_then(Value::as_object)
+        .map(|path_goals| {
+            path_goals
+                .keys()
+                .filter(|key| !db_goal_keys.contains(*key))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let fresh_goal_anchors = goals
+        .iter()
+        .filter(|goal| {
+            goal.get("updated_at")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty() && s != "(none)")
+        })
+        .count();
+    let total_checks = goals.len().max(1) + file_goal_count.max(1) + briefing_files.len().max(1);
+    let missing = unlinked_path_goals.len()
+        + goals.len().saturating_sub(fresh_goal_anchors)
+        + briefing_files.len().saturating_sub(briefings_db.len());
+    let score =
+        ((total_checks.saturating_sub(missing)) as f64 / total_checks as f64).clamp(0.0, 1.0);
+    json!({
+        "score": score,
+        "counts": {
+            "db_goals": goals.len(),
+            "db_subgoals": subgoals.len(),
+            "path_file_goals": file_goal_count,
+            "db_briefings": briefings_db.len(),
+            "briefing_files": briefing_files.len(),
+            "fresh_goal_anchors": fresh_goal_anchors,
+        },
+        "issues": {
+            "unlinked_path_goals": unlinked_path_goals,
+            "briefing_files_without_db_rows": briefing_files.len().saturating_sub(briefings_db.len()),
+            "goals_without_updated_at": goals.len().saturating_sub(fresh_goal_anchors),
+        }
+    })
+}
+
+fn progress_data(state: &AppState) -> Value {
+    let facts = facts_data(state, 500);
+    let interesting = [
+        "albion_bot_ladder_rung",
+        "autonomous_fresh_depth",
+        "protocol_nativeness",
+        "reproduction_proven",
+    ];
+    let mut metrics = serde_json::Map::new();
+    for key in interesting {
+        if let Some(fact) = facts
+            .iter()
+            .find(|f| f.get("fact_key").and_then(Value::as_str) == Some(key))
+        {
+            metrics.insert(
+                key.to_string(),
+                fact.get("fact_value").cloned().unwrap_or(Value::Null),
+            );
+        } else {
+            metrics.insert(key.to_string(), Value::Null);
+        }
+    }
+    let latest_cycle = latest_episodes(state, 1).into_iter().next();
+    json!({
+        "campaign": "dgm_self_improving_orchestrator",
+        "metrics": metrics,
+        "time": {
+            "reported_at": Local::now().to_rfc3339(),
+            "latest_cycle_created_at": latest_cycle.as_ref().and_then(|e| e.get("created_at")).cloned().unwrap_or(Value::Null),
+            "rung_budget": Value::Null,
+        },
+        "in_game_progress": {
+            "generations": [],
+            "current_generation": Value::Null,
+            "best_rung": metrics.get("albion_bot_ladder_rung").cloned().unwrap_or(Value::Null),
+        },
+        "latest_cycle": latest_cycle,
+    })
+}
+
+fn parse_i64(value: Option<&String>) -> i64 {
+    value.and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+fn value_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+fn parse_json_field(row: &mut std::collections::HashMap<String, Value>, key: &str) {
+    let parsed = row
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    if let Some(value) = parsed {
+        row.insert(key.to_string(), value);
+    }
 }
 
 fn authed_or_placeholder(
