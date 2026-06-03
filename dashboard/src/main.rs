@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 const AUTH_COOKIE_NAME: &str = "dash_auth";
 const AUTH_COOKIE_MAX_AGE: i64 = 30 * 24 * 3600;
 const PASSWORD_SALT: &str = "dashboard-salt-v1:";
+const GENERAL_TALK_CHANNEL: &str = "general";
 
 #[derive(Clone)]
 struct AppState {
@@ -794,42 +795,155 @@ struct TalkQuery {
     c: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TalkPostForm {
+    from: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TalkNewForm {
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TalkChannelForm {
+    c: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SinceQuery {
+    n: Option<i64>,
+}
+
 async fn talk_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<TalkQuery>,
 ) -> Response {
-    let channel =
-        sanitize_channel_slug(query.c.as_deref()).unwrap_or_else(|| "general".to_string());
-    authed_or_placeholder(&headers, &state, &format!("talk #{channel}"), "/talk")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let channel = sanitize_channel_slug(query.c.as_deref())
+        .unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    render_talk_page(&state, &channel)
 }
 
-async fn talk_post(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "talk post", "POST /talk")
+async fn talk_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TalkQuery>,
+    Form(form): Form<TalkPostForm>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let channel = sanitize_channel_slug(query.c.as_deref())
+        .unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    let sender = form.from.unwrap_or_default();
+    let sender = sender.trim();
+    let sender = if sender.is_empty() { "user" } else { sender };
+    let text = form.text.unwrap_or_default().trim().to_string();
+    if !text.is_empty() {
+        append_talk_entry(&state, &channel, sender, &text);
+        if sender == "user" {
+            notify_orchestrator_pane(&state, &text, &channel, None);
+        }
+        return Redirect::to(&format!("/talk?c={channel}")).into_response();
+    }
+    render_talk_page(&state, &channel)
 }
 
 async fn talk_since(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(channel): Path<String>,
+    Query(query): Query<SinceQuery>,
 ) -> Response {
     if !is_authed(&headers, &state) {
         return Redirect::to("/login").into_response();
     }
-    let slug = sanitize_channel_slug(Some(&channel)).unwrap_or_else(|| "general".to_string());
-    axum::Json(serde_json::json!({"channel": slug, "count": 0, "messages": []})).into_response()
+    let slug =
+        sanitize_channel_slug(Some(&channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    let since_n = query.n.unwrap_or(0).max(0) as usize;
+    let entries = talk_entries(&state, &slug, 100_000);
+    let total = entries.len();
+    let new_entries = if since_n < total {
+        entries[since_n..].to_vec()
+    } else {
+        Vec::new()
+    };
+    axum::Json(json!({"channel": slug, "count": total, "messages": new_entries})).into_response()
 }
 
-async fn talk_new(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "talk new", "POST /talk/new")
+async fn talk_new(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TalkQuery>,
+    Form(form): Form<TalkNewForm>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let current = sanitize_channel_slug(query.c.as_deref())
+        .unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    match sanitize_channel_slug(form.name.as_deref()) {
+        None => Redirect::to(&format!("/talk?c={current}")).into_response(),
+        Some(channel) => {
+            ensure_talk_channels(&state);
+            let _ = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(talk_channel_path(&state, &channel));
+            Redirect::to(&format!("/talk?c={channel}")).into_response()
+        }
+    }
 }
 
-async fn talk_clear(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "talk clear", "POST /talk/clear")
+async fn talk_clear(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TalkQuery>,
+    Form(form): Form<TalkChannelForm>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let channel = sanitize_channel_slug(form.c.as_deref().or(query.c.as_deref()))
+        .unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    ensure_talk_channels(&state);
+    let _ = fs::File::create(talk_channel_path(&state, &channel));
+    notify_orchestrator_pane(
+        &state,
+        &format!("truncated analysis/talk_channels/{channel}.jsonl"),
+        &channel,
+        Some(&format!("[/talk#{channel} ADMIN clear]")),
+    );
+    Redirect::to(&format!("/talk?c={channel}")).into_response()
 }
 
-async fn talk_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "talk delete", "POST /talk/delete")
+async fn talk_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TalkQuery>,
+    Form(form): Form<TalkChannelForm>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let channel = sanitize_channel_slug(form.c.as_deref().or(query.c.as_deref()))
+        .unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    if channel == GENERAL_TALK_CHANNEL {
+        return (StatusCode::BAD_REQUEST, "cannot delete the default channel").into_response();
+    }
+    let _ = fs::remove_file(talk_channel_path(&state, &channel));
+    notify_orchestrator_pane(
+        &state,
+        &format!("removed analysis/talk_channels/{channel}.jsonl"),
+        &channel,
+        Some(&format!("[/talk#{channel} ADMIN delete]")),
+    );
+    Redirect::to(&format!("/talk?c={GENERAL_TALK_CHANNEL}")).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1289,6 +1403,359 @@ fn authed_or_placeholder(
         html_escape(route)
     );
     render_page(title, &body, 0).into_response()
+}
+
+const TALK_SCRIPT: &str = r#"<script>
+        (function () {
+          const channel = __CHANNEL_JSON__;
+          let seen = __INITIAL_COUNT__;
+          const ta = document.querySelector('textarea[name="text"]');
+          const list = document.getElementById('talk-messages');
+          const empty = document.getElementById('talk-empty');
+
+          // ---- draft persistence + Ctrl+Enter send (unchanged behavior) ----
+          if (ta) {
+            const KEY = 'talk_draft_v2:' + channel;
+            const saved = sessionStorage.getItem(KEY);
+            if (saved && !ta.value) ta.value = saved;
+            ta.addEventListener('input', function () {
+              sessionStorage.setItem(KEY, ta.value);
+            });
+            ta.addEventListener('keydown', function (e) {
+              if (e.ctrlKey && e.key === 'Enter') {
+                e.preventDefault();
+                if (ta.form && typeof ta.form.requestSubmit === 'function') {
+                  ta.form.requestSubmit();
+                  return;
+                }
+                if (ta.form) ta.form.submit();
+              }
+            });
+            if (ta.form) {
+              ta.form.addEventListener('submit', function () {
+                sessionStorage.removeItem(KEY);
+              });
+            }
+          }
+
+          // Defuse any legacy meta-refresh that might still be present.
+          document.querySelectorAll('meta[http-equiv="refresh"]').forEach(function (meta) {
+            meta.remove();
+          });
+
+          // ---- incremental append (no full-page reload) ----
+          function badgeClass(sender) {
+            if (sender === 'user') return 'bg-sky-500 text-white';
+            if (sender === 'orchestrator') return 'bg-emerald-500 text-white';
+            return 'bg-amber-500 text-black';
+          }
+          function buildMessage(entry) {
+            const sender = String(entry.from || 'worker');
+            const ts = String(entry.ts || '');
+            const text = String(entry.text || '');
+            const replyTo = String(entry.reply_to || '');
+            const article = document.createElement('article');
+            article.className = 'border border-zinc-800 rounded bg-zinc-950/70 p-3' + (replyTo ? ' pl-6' : '');
+            const head = document.createElement('div');
+            head.className = 'flex items-center gap-2 mb-2';
+            const badge = document.createElement('span');
+            badge.className = 'inline-block rounded px-2 py-0.5 text-xs ' + badgeClass(sender);
+            badge.textContent = sender;
+            const tsEl = document.createElement('span');
+            tsEl.className = 'text-zinc-500 text-xs';
+            tsEl.textContent = ts;
+            head.appendChild(badge);
+            head.appendChild(tsEl);
+            if (replyTo) {
+              const r = document.createElement('span');
+              r.className = 'ml-2 text-zinc-600';
+              r.textContent = 'reply_to ' + replyTo;
+              head.appendChild(r);
+            }
+            const pre = document.createElement('pre');
+            pre.className = 'text-sm text-zinc-200 whitespace-pre-wrap';
+            pre.textContent = text;
+            article.appendChild(head);
+            article.appendChild(pre);
+            return article;
+          }
+          function nearBottom() {
+            const doc = document.documentElement;
+            return (window.innerHeight + window.scrollY) >= (doc.scrollHeight - 80);
+          }
+          let polling = false;
+          async function poll() {
+            if (polling || !list) return;
+            polling = true;
+            try {
+              const res = await fetch('/talk/' + encodeURIComponent(channel) + '/since?n=' + seen, {
+                headers: {'Accept': 'application/json'},
+                credentials: 'same-origin',
+              });
+              if (!res.ok) return;
+              const data = await res.json();
+              if (!Array.isArray(data.messages) || data.messages.length === 0) {
+                if (typeof data.count === 'number') seen = data.count;
+                return;
+              }
+              const stick = nearBottom();
+              for (const entry of data.messages) {
+                list.appendChild(buildMessage(entry));
+              }
+              if (empty) empty.classList.add('hidden');
+              seen = (typeof data.count === 'number') ? data.count : (seen + data.messages.length);
+              if (stick) window.scrollTo(0, document.documentElement.scrollHeight);
+            } catch (e) {
+              /* transient network error: keep marker, retry next tick */
+            } finally {
+              polling = false;
+            }
+          }
+          window.setInterval(poll, 3000);
+        })();
+        </script>"#;
+
+fn now_iso() -> String {
+    Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+fn talk_channel_path(state: &AppState, channel: &str) -> std::path::PathBuf {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    state.cfg.talk_channels_dir.join(format!("{slug}.jsonl"))
+}
+
+fn ensure_talk_channels(state: &AppState) {
+    let _ = fs::create_dir_all(&state.cfg.talk_channels_dir);
+    let general = talk_channel_path(state, GENERAL_TALK_CHANNEL);
+    if general.exists() {
+        return;
+    }
+    if state.cfg.talk_log.exists() {
+        if let Ok(text) = fs::read_to_string(&state.cfg.talk_log) {
+            let _ = fs::write(&general, text);
+            return;
+        }
+    }
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&general);
+}
+
+fn list_talk_channels(state: &AppState) -> Vec<String> {
+    ensure_talk_channels(state);
+    let mut others: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&state.cfg.talk_channels_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(slug) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|stem| sanitize_channel_slug(Some(stem)))
+            {
+                if slug != GENERAL_TALK_CHANNEL && !others.contains(&slug) {
+                    others.push(slug);
+                }
+            }
+        }
+    }
+    others.sort();
+    let mut out = vec![GENERAL_TALK_CHANNEL.to_string()];
+    out.extend(others);
+    out
+}
+
+fn talk_entries(state: &AppState, channel: &str, limit: usize) -> Vec<Value> {
+    ensure_talk_channels(state);
+    let path = talk_channel_path(state, channel);
+    let _ = fs::OpenOptions::new().create(true).append(true).open(&path);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Value> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            if value.is_object() {
+                rows.push(value);
+            }
+        }
+    }
+    if rows.len() > limit {
+        rows = rows.split_off(rows.len() - limit);
+    }
+    rows
+}
+
+fn append_talk_entry(state: &AppState, channel: &str, sender: &str, text: &str) {
+    ensure_talk_channels(state);
+    let payload = json!({"ts": now_iso(), "from": sender, "text": text});
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(talk_channel_path(state, channel))
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", serde_json::to_string(&payload).unwrap_or_default());
+    }
+}
+
+fn notify_orchestrator_pane(state: &AppState, text: &str, channel: &str, prefix: Option<&str>) {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    let payload = match prefix {
+        Some(p) if !text.is_empty() => format!("{p} {text}"),
+        Some(p) => p.to_string(),
+        None => format!("[/talk#{slug} @ {}] {text}", now_iso()),
+    };
+    let _ = std::process::Command::new(&state.cfg.harness_path)
+        .args(["send", "orchestrator", &payload])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+fn talk_admin_controls(channel: &str) -> String {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    let clear_confirm =
+        serde_json::to_string(&format!("Clear all messages in #{slug}?")).unwrap_or_default();
+    let mut parts = format!(
+        "<form method=\"post\" action=\"/talk/clear\" style=\"display:inline\" onsubmit='return confirm({});'>\
+         <input type=\"hidden\" name=\"c\" value=\"{}\">\
+         <button type=\"submit\" class=\"ml-1 text-xs text-zinc-500 hover:text-amber-400\" title=\"clear\">clr</button></form>",
+        clear_confirm,
+        html_escape(&slug)
+    );
+    if slug != GENERAL_TALK_CHANNEL {
+        let delete_confirm =
+            serde_json::to_string(&format!("Delete channel #{slug}?")).unwrap_or_default();
+        parts.push_str(&format!(
+            "<form method=\"post\" action=\"/talk/delete\" style=\"display:inline\" onsubmit='return confirm({});'>\
+             <input type=\"hidden\" name=\"c\" value=\"{}\">\
+             <button type=\"submit\" class=\"ml-1 text-xs text-zinc-500 hover:text-red-500\" title=\"delete\">&times;</button></form>",
+            delete_confirm,
+            html_escape(&slug)
+        ));
+    }
+    parts
+}
+
+fn render_talk_page(state: &AppState, channel: &str) -> Response {
+    let channels = list_talk_channels(state);
+    let channel_store = format!("analysis/talk_channels/{channel}.jsonl");
+    let mut body = String::from("<h1 class=\"text-2xl mb-4\">Talk</h1>");
+    body.push_str("<div class=\"flex flex-col gap-4 lg:flex-row\">");
+    // sidebar
+    body.push_str("<aside class=\"w-full shrink-0 lg:w-48\">");
+    body.push_str("<section class=\"bg-zinc-900 border border-zinc-800 rounded p-4\">");
+    body.push_str(&format!(
+        "<form action=\"/talk/new?c={}\" method=\"post\" class=\"mb-4 flex gap-2\">\
+         <input type=\"text\" name=\"name\" maxlength=\"64\" placeholder=\"new channel\" \
+         class=\"min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500 focus:outline-none\">\
+         <button type=\"submit\" class=\"rounded bg-zinc-800 px-3 py-2 text-sm text-zinc-100 hover:bg-zinc-700\">+</button>\
+         </form>",
+        html_escape(channel)
+    ));
+    body.push_str("<nav class=\"space-y-1\">");
+    for slug in &channels {
+        let link_cls = if slug == channel {
+            "bg-sky-600/20 border-sky-500 text-sky-200"
+        } else {
+            "border-transparent text-zinc-300 hover:border-zinc-700 hover:bg-zinc-950/70 hover:text-white"
+        };
+        body.push_str(&format!(
+            "<div class=\"flex items-center\">\
+             <a href=\"/talk?c={}\" class=\"block min-w-0 flex-1 rounded border px-3 py-2 text-sm {}\">#{}</a>{}</div>",
+            html_escape(slug),
+            link_cls,
+            html_escape(slug),
+            talk_admin_controls(slug)
+        ));
+    }
+    body.push_str("</nav></section></aside>");
+    // main column
+    body.push_str("<section class=\"min-w-0 flex-1 bg-zinc-900 border border-zinc-800 rounded p-4\">");
+    body.push_str(&format!(
+        "<div class=\"mb-4 flex flex-wrap items-center justify-between gap-3\"><div>\
+         <div class=\"flex items-center\"><h2 class=\"text-lg text-zinc-100\">#{}</h2>{}</div>\
+         <div class=\"text-xs text-zinc-500\">Channel thread backed by {}.</div></div>\
+         <div class=\"text-xs text-zinc-500\">Ctrl+Enter sends. Enter inserts a newline.</div></div>",
+        html_escape(channel),
+        talk_admin_controls(channel),
+        html_escape(&channel_store)
+    ));
+    let entries = talk_entries(state, channel, 200);
+    let initial_count = entries.len();
+    let empty_cls = if entries.is_empty() { "" } else { " hidden" };
+    body.push_str(&format!(
+        "<div id=\"talk-empty\" class=\"text-zinc-500 mb-4{empty_cls}\">(no messages yet)</div>"
+    ));
+    body.push_str("<div id=\"talk-messages\" class=\"space-y-3 mb-5\">");
+    for entry in &entries {
+        let sender = value_display(entry.get("from"));
+        let sender = if sender.is_empty() { "worker" } else { &sender };
+        let ts = value_display(entry.get("ts"));
+        let text = value_display(entry.get("text"));
+        let reply_to = value_display(entry.get("reply_to"));
+        let badge = if sender == "user" {
+            "bg-sky-500 text-white"
+        } else if sender == "orchestrator" {
+            "bg-emerald-500 text-white"
+        } else {
+            "bg-amber-500 text-black"
+        };
+        let indent = if reply_to.is_empty() { "" } else { " pl-6" };
+        let reply_meta = if reply_to.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<span class=\"ml-2 text-zinc-600\">reply_to {}</span>",
+                html_escape(&reply_to)
+            )
+        };
+        body.push_str(&format!(
+            "<article class=\"border border-zinc-800 rounded bg-zinc-950/70 p-3{}\">\
+             <div class=\"flex items-center gap-2 mb-2\">\
+             <span class=\"inline-block rounded px-2 py-0.5 text-xs {}\">{}</span>\
+             <span class=\"text-zinc-500 text-xs\">{}</span>{}</div>\
+             <pre class=\"text-sm text-zinc-200 whitespace-pre-wrap\">{}</pre></article>",
+            indent,
+            badge,
+            html_escape(sender),
+            html_escape(&ts),
+            reply_meta,
+            html_escape(&text)
+        ));
+    }
+    body.push_str("</div>");
+    body.push_str(&format!(
+        "<form method=\"post\" action=\"/talk?c={}\" class=\"border-t border-zinc-800 pt-4\">\
+         <input type=\"hidden\" name=\"from\" value=\"user\">\
+         <label for=\"talk-text\" class=\"block text-xs text-zinc-500 mb-2\">Post a message</label>\
+         <textarea id=\"talk-text\" name=\"text\" rows=\"3\" class=\"w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500 focus:outline-none\" placeholder=\"Ask the orchestrator something...\"></textarea>\
+         <div class=\"mt-3 flex items-center justify-between gap-3\">\
+         <div class=\"text-xs text-zinc-500\">Drafts are stored per channel in sessionStorage.</div>\
+         <button type=\"submit\" class=\"rounded bg-sky-600 px-4 py-2 text-sm text-white hover:bg-sky-500\">Send</button>\
+         </div></form>",
+        html_escape(channel)
+    ));
+    body.push_str("</section></div>");
+    let script = TALK_SCRIPT
+        .replace(
+            "__CHANNEL_JSON__",
+            &serde_json::to_string(channel).unwrap_or_else(|_| "\"general\"".to_string()),
+        )
+        .replace("__INITIAL_COUNT__", &initial_count.to_string());
+    body.push_str(&script);
+    render_page("talk", &body, 0).into_response()
 }
 
 fn not_found_page() -> Response {
