@@ -566,7 +566,41 @@ async fn services(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 }
 
 async fn memory_index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "memory", "/memory")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let files = list_md_json(&state.cfg.memory_dir);
+    let mut body = format!(
+        "<h1 class=\"text-2xl mb-4\">Memory <span class=\"text-sm text-zinc-500\">({})</span></h1>",
+        files.len()
+    );
+    if let Some(idx) = read_md_file(&state.cfg.memory_dir, "MEMORY.md") {
+        body.push_str(&format!(
+            "<details open class=\"mb-4 bg-zinc-900 border border-zinc-800 rounded p-3\">\
+             <summary class=\"cursor-pointer text-zinc-100\">MEMORY.md (index)</summary>\
+             <pre class=\"text-xs mt-2\">{}</pre></details>",
+            html_escape(&idx)
+        ));
+    }
+    body.push_str("<ul class=\"space-y-1\">");
+    for f in &files {
+        let name = value_display(f.get("name"));
+        if name == "MEMORY.md" {
+            continue;
+        }
+        let mtime = f.get("mtime_unix").and_then(Value::as_u64).unwrap_or(0);
+        body.push_str(&format!(
+            "<li><a class=\"text-sky-400 hover:underline\" href=\"/memory/{}\">{}</a> \
+             <span class=\"text-zinc-500 text-xs\">— {} ({}B, {})</span></li>",
+            html_escape(&name),
+            html_escape(&name),
+            html_escape(&value_display(f.get("title"))),
+            value_display(f.get("size")),
+            html_escape(&format_mtime(mtime)),
+        ));
+    }
+    body.push_str("</ul>");
+    render_page("memory", &body, 0).into_response()
 }
 
 async fn memory_detail(
@@ -574,7 +608,23 @@ async fn memory_detail(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    authed_or_placeholder(&headers, &state, &name, "/memory/<name>")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    match read_md_file(&state.cfg.memory_dir, &name) {
+        Some(content) => {
+            let mut body = format!("<h1 class=\"text-xl mb-2\">{}</h1>", html_escape(&name));
+            body.push_str(&format!(
+                "<div class=\"bg-zinc-900 border border-zinc-800 rounded p-3\"><pre class=\"text-xs\">{}</pre></div>",
+                html_escape(&content)
+            ));
+            body.push_str(
+                "<div class=\"mt-3\"><a class=\"text-sky-400 hover:underline\" href=\"/memory\">← all memory</a></div>",
+            );
+            render_page(&name, &body, 0).into_response()
+        }
+        None => not_found_page(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1026,6 +1076,16 @@ fn value_display_or(value: Option<&Value>, default: &str) -> String {
 /// Truncate to `n` Unicode scalar values (matches Python `s[:n]` closely enough for display).
 fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+/// Format a unix mtime to local "%Y-%m-%d %H:%M" (matches Flask `datetime.fromtimestamp(...).strftime`).
+fn format_mtime(secs: u64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(secs as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
 }
 
 fn parse_json_field(row: &mut std::collections::HashMap<String, Value>, key: &str) {
