@@ -63,6 +63,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/cycles", get(cycles))
         .route("/cycle/{cid}", get(cycle_detail))
         .route("/goals", get(goals))
+        .route("/goaltree", get(goaltree))
         .route("/goal/{key}", get(goal_detail))
         .route("/paths", get(paths))
         .route("/agents", get(agents))
@@ -423,6 +424,37 @@ async fn goals(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     render_page("goals", &body, 0).into_response()
 }
 
+async fn goaltree(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let path = goal_tree_path();
+    let mut body = String::from("<h1 class=\"text-2xl mb-4\">Goal Tree</h1>");
+    let tree = match fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(value) => value,
+            Err(err) => {
+                body.push_str(&format!(
+                    "<div class=\"rounded border border-red-900/60 bg-red-950/60 p-3 text-red-200\">Could not parse {}: {}</div>",
+                    html_escape(&path.display().to_string()),
+                    html_escape(&err.to_string())
+                ));
+                return render_page("goaltree", &body, 0).into_response();
+            }
+        },
+        Err(err) => {
+            body.push_str(&format!(
+                "<div class=\"rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400\">Goal tree file is absent or unreadable: <span class=\"text-zinc-200\">{}</span><br><span class=\"text-xs\">{}</span></div>",
+                html_escape(&path.display().to_string()),
+                html_escape(&err.to_string())
+            ));
+            return render_page("goaltree", &body, 0).into_response();
+        }
+    };
+    body.push_str(&render_goal_tree(&tree, &path.display().to_string()));
+    render_page("goaltree", &body, 0).into_response()
+}
+
 async fn goal_detail(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -432,7 +464,10 @@ async fn goal_detail(
         return Redirect::to("/login").into_response();
     }
     let goals = goals_data(&state);
-    let Some(g) = goals.iter().find(|g| value_display(g.get("goal_key")) == key) else {
+    let Some(g) = goals
+        .iter()
+        .find(|g| value_display(g.get("goal_key")) == key)
+    else {
         return not_found_page();
     };
     let status = value_display(g.get("status"));
@@ -493,7 +528,10 @@ async fn paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
             body.push_str(
                 "<section class=\"mb-5 bg-zinc-900 border border-zinc-800 rounded p-3\">",
             );
-            body.push_str(&format!("<h2 class=\"text-lg mb-1\">{}</h2>", html_escape(gk)));
+            body.push_str(&format!(
+                "<h2 class=\"text-lg mb-1\">{}</h2>",
+                html_escape(gk)
+            ));
             body.push_str(&format!(
                 "<div class=\"text-xs text-zinc-500 mb-2\">{} — current {}/{} — last move {}</div>",
                 html_escape(&value_display(g.get("metric_name"))),
@@ -592,7 +630,10 @@ async fn facts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
             "<tr><td class=\"pr-3 align-top text-xs text-zinc-500\">{}</td>\
              <td class=\"pr-3 align-top\">{}</td>\
              <td class=\"align-top text-zinc-300\">{}</td></tr>",
-            html_escape(&truncate_chars(&first_field(f, &["created_at", "updated_at"]), 19)),
+            html_escape(&truncate_chars(
+                &first_field(f, &["created_at", "updated_at"]),
+                19
+            )),
             html_escape(&value_display(f.get("fact_key"))),
             html_escape(&first_field(f, &["fact_value", "value_json"])),
         ));
@@ -629,7 +670,10 @@ async fn services(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
             html_escape(&value_display(sv.get("service_type"))),
             cls,
             html_escape(&status),
-            html_escape(&truncate_chars(&value_display(sv.get("last_polled_at")), 19)),
+            html_escape(&truncate_chars(
+                &value_display(sv.get("last_polled_at")),
+                19
+            )),
             html_escape(&value_display(sv.get("check_target"))),
         ));
     }
@@ -1265,6 +1309,146 @@ fn read_md_file(dir: &FsPath, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
+fn goal_tree_path() -> std::path::PathBuf {
+    std::env::var_os("GOAL_TREE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from("/home/sdanced/clientless/analysis/goal_tree.json")
+        })
+}
+
+fn render_goal_tree(tree: &Value, source_path: &str) -> String {
+    let goal = tree.get("goal").unwrap_or(&Value::Null);
+    let goal_key = value_display_or(goal.get("key"), "albion_bot");
+    let goal_title = value_display_or(goal.get("title"), &goal_key);
+    let metric = value_display(goal.get("metric"));
+    let scope_note = value_display(goal.get("scope_note"));
+    let tick = value_display(goal.get("tick"));
+    let workstreams = tree
+        .get("workstreams")
+        .and_then(Value::as_array)
+        .or_else(|| tree.get("subgoals").and_then(Value::as_array));
+    let items: &[Value] = workstreams.map(Vec::as_slice).unwrap_or(&[]);
+    let done = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                value_display(item.get("status")).as_str(),
+                "done" | "complete" | "verified"
+            )
+        })
+        .count();
+
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<section class=\"mb-5 rounded border border-zinc-800 bg-zinc-900 p-4\">\
+         <div class=\"mb-2 flex flex-wrap items-baseline gap-3\">\
+         <h2 class=\"text-xl text-zinc-100\">{}</h2>\
+         <span class=\"text-sm text-zinc-500\">{}</span>\
+         <span class=\"rounded bg-sky-950 px-2 py-0.5 text-xs text-sky-200\">{}/{}</span>\
+         </div>",
+        html_escape(&goal_key),
+        html_escape(&goal_title),
+        done,
+        items.len()
+    ));
+    body.push_str("<div class=\"grid gap-2 text-xs text-zinc-400 md:grid-cols-3\">");
+    body.push_str(&format!(
+        "<div><span class=\"text-zinc-600\">metric</span><br>{}</div>",
+        html_escape(if metric.is_empty() {
+            "unknown"
+        } else {
+            &metric
+        })
+    ));
+    body.push_str(&format!(
+        "<div><span class=\"text-zinc-600\">tick</span><br>{}</div>",
+        html_escape(if tick.is_empty() { "unknown" } else { &tick })
+    ));
+    body.push_str(&format!(
+        "<div><span class=\"text-zinc-600\">source</span><br>{}</div>",
+        html_escape(source_path)
+    ));
+    body.push_str("</div>");
+    if !scope_note.is_empty() {
+        body.push_str(&format!(
+            "<div class=\"mt-3 rounded border border-zinc-800 bg-zinc-950/70 p-3 text-sm text-zinc-300\">{}</div>",
+            html_escape(&scope_note)
+        ));
+    }
+    body.push_str("</section>");
+
+    if items.is_empty() {
+        body.push_str("<div class=\"text-zinc-500\">(no workstreams in goal_tree.json)</div>");
+        return body;
+    }
+
+    body.push_str("<section class=\"relative ml-2 border-l border-zinc-700 pl-6\">");
+    for (idx, item) in items.iter().enumerate() {
+        let id = value_display_or(item.get("id"), &format!("WS{}", idx + 1));
+        let title = value_display_or(item.get("title"), &id);
+        let status = value_display_or(item.get("status"), "pending");
+        let stall = value_display_or(item.get("stall"), "0");
+        let blocker = value_display(item.get("blocker"));
+        let next_substep = value_display(item.get("next_substep"));
+        let metric = value_display(item.get("metric"));
+        let done_when = value_display(item.get("done_when"));
+        body.push_str(&format!(
+            "<article class=\"relative mb-4 rounded border border-zinc-800 bg-zinc-900 p-4\">\
+             <span class=\"absolute -left-[31px] top-5 h-3 w-3 rounded-full border border-zinc-950 {}\"></span>\
+             <div class=\"mb-2 flex flex-wrap items-center gap-2\">\
+             <span class=\"text-zinc-500\">{}</span>\
+             <h3 class=\"text-base text-zinc-100\">{}</h3>\
+             <span class=\"badge {}\">{}</span>\
+             <span class=\"text-xs text-zinc-500\">stall {}</span>\
+             </div>",
+            goal_tree_dot_class(&status),
+            html_escape(&id),
+            html_escape(&title),
+            goal_tree_badge_class(&status),
+            html_escape(&status),
+            html_escape(&stall)
+        ));
+        body.push_str("<dl class=\"grid gap-3 text-xs md:grid-cols-2\">");
+        body.push_str(&goal_tree_field("blocker", &blocker));
+        body.push_str(&goal_tree_field("next_substep", &next_substep));
+        body.push_str(&goal_tree_field("metric", &metric));
+        body.push_str(&goal_tree_field("done_when", &done_when));
+        body.push_str("</dl></article>");
+    }
+    body.push_str("</section>");
+    body
+}
+
+fn goal_tree_field(label: &str, value: &str) -> String {
+    let rendered = if value.is_empty() { "—" } else { value };
+    format!(
+        "<div><dt class=\"mb-1 text-zinc-600\">{}</dt><dd class=\"text-zinc-300\">{}</dd></div>",
+        html_escape(label),
+        html_escape(rendered)
+    )
+}
+
+fn goal_tree_badge_class(status: &str) -> &'static str {
+    match status {
+        "active" | "progressing" => "b-active",
+        "pending" => "b-pending",
+        "done" | "complete" | "verified" => "b-done",
+        "cancelled" => "b-cancelled",
+        _ => "b-pending",
+    }
+}
+
+fn goal_tree_dot_class(status: &str) -> &'static str {
+    match status {
+        "active" | "progressing" => "bg-emerald-500",
+        "pending" => "bg-yellow-500",
+        "done" | "complete" | "verified" => "bg-zinc-500",
+        "cancelled" => "bg-zinc-600",
+        _ => "bg-sky-500",
+    }
+}
+
 fn adherence_data(state: &AppState) -> Value {
     let goals = goals_data(state);
     let subgoals = rows_to_values(state.data.harness_table(&["sub-goals"]));
@@ -1668,7 +1852,11 @@ fn append_talk_entry(state: &AppState, channel: &str, sender: &str, text: &str) 
         .open(talk_channel_path(state, channel))
     {
         use std::io::Write;
-        let _ = writeln!(file, "{}", serde_json::to_string(&payload).unwrap_or_default());
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_default()
+        );
     }
 }
 
@@ -1747,7 +1935,9 @@ fn render_talk_page(state: &AppState, channel: &str) -> Response {
     }
     body.push_str("</nav></section></aside>");
     // main column
-    body.push_str("<section class=\"min-w-0 flex-1 bg-zinc-900 border border-zinc-800 rounded p-4\">");
+    body.push_str(
+        "<section class=\"min-w-0 flex-1 bg-zinc-900 border border-zinc-800 rounded p-4\">",
+    );
     body.push_str(&format!(
         "<div class=\"mb-4 flex flex-wrap items-center justify-between gap-3\"><div>\
          <div class=\"flex items-center\"><h2 class=\"text-lg text-zinc-100\">#{}</h2>{}</div>\
@@ -1882,7 +2072,7 @@ fn render_page(title: &str, body: &str, refresh: u64) -> Html<String> {
          <nav class=\"bg-zinc-900 border-b border-zinc-800 px-4 py-2 flex gap-4 items-center\">\
          <a href=\"/\" class=\"font-bold text-zinc-100\">orchestrator</a>\
          <a href=\"/\" class=\"hover:text-white\">dashboard</a><a href=\"/cycles\" class=\"hover:text-white\">cycles</a>\
-         <a href=\"/goals\" class=\"hover:text-white\">goals</a><a href=\"/paths\" class=\"hover:text-white\">paths</a>\
+         <a href=\"/goals\" class=\"hover:text-white\">goals</a><a href=\"/goaltree\" class=\"hover:text-white\">goal tree</a><a href=\"/paths\" class=\"hover:text-white\">paths</a>\
          <a href=\"/agents\" class=\"hover:text-white\">agents</a><a href=\"/facts\" class=\"hover:text-white\">facts</a>\
          <a href=\"/services\" class=\"hover:text-white\">services</a><a href=\"/memory\" class=\"hover:text-white\">memory</a>\
          <a href=\"/briefings\" class=\"hover:text-white\">briefings</a><a href=\"/talk\" class=\"hover:text-white\">talk</a>\
