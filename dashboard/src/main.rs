@@ -312,7 +312,75 @@ async fn cycle_detail(
     headers: HeaderMap,
     Path(cid): Path<i64>,
 ) -> Response {
-    authed_or_placeholder(&headers, &state, &format!("cycle {cid}"), "/cycle/<cid>")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let Some(e) = fetch_episode(&state, cid) else {
+        return not_found_page();
+    };
+    let mut body = format!(
+        "<h1 class=\"text-2xl mb-1\">Cycle {}</h1>",
+        html_escape(&value_display(e.get("id")))
+    );
+    body.push_str(&format!(
+        "<div class=\"text-zinc-500 text-xs mb-3\">{}</div>",
+        html_escape(&value_display(e.get("created_at")))
+    ));
+    body.push_str(&format!(
+        "<div class=\"bg-zinc-900 border border-zinc-800 rounded p-3 mb-3\"><pre>{}</pre></div>",
+        html_escape(&value_display(e.get("summary")))
+    ));
+    body.push_str("<div class=\"grid grid-cols-3 gap-3\">");
+    for (k, label) in [
+        ("agent_statuses_json", "Agents"),
+        ("actions_taken_json", "Actions"),
+        ("goal_progress_json", "Goal progress"),
+    ] {
+        let rendered = match e.get(k) {
+            Some(v) if !json_is_empty(v) => {
+                serde_json::to_string_pretty(v).unwrap_or_else(|_| "(none)".to_string())
+            }
+            _ => "(none)".to_string(),
+        };
+        body.push_str(&format!(
+            "<div class=\"bg-zinc-900 border border-zinc-800 rounded p-3\">\
+             <div class=\"text-xs text-zinc-500 mb-1\">{}</div>\
+             <pre class=\"text-xs\">{}</pre></div>",
+            label,
+            html_escape(&rendered)
+        ));
+    }
+    body.push_str("</div>");
+    body.push_str(
+        "<div class=\"mt-4\"><a class=\"text-sky-400 hover:underline\" href=\"/cycles\">← all cycles</a></div>",
+    );
+    render_page(&format!("cycle {cid}"), &body, 0).into_response()
+}
+
+fn fetch_episode(state: &AppState, cid: i64) -> Option<Value> {
+    if let Ok(rows) = state.data.sql_query(&format!(
+        "SELECT id, created_at, summary, agent_statuses_json, actions_taken_json, goal_progress_json FROM episodes WHERE id = {cid}"
+    )) {
+        if let Some(mut row) = rows.into_iter().next() {
+            parse_json_field(&mut row, "agent_statuses_json");
+            parse_json_field(&mut row, "actions_taken_json");
+            parse_json_field(&mut row, "goal_progress_json");
+            return Some(Value::Object(row.into_iter().collect()));
+        }
+    }
+    latest_episodes(state, 500)
+        .into_iter()
+        .find(|e| value_i64(e.get("id")) == Some(cid))
+}
+
+fn json_is_empty(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Object(m) => m.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::String(s) => s.is_empty(),
+        _ => false,
+    }
 }
 
 async fn goals(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1386,23 +1454,6 @@ fn parse_json_field(row: &mut std::collections::HashMap<String, Value>, key: &st
     if let Some(value) = parsed {
         row.insert(key.to_string(), value);
     }
-}
-
-fn authed_or_placeholder(
-    headers: &HeaderMap,
-    state: &AppState,
-    title: &str,
-    route: &str,
-) -> Response {
-    if !is_authed(headers, state) {
-        return Redirect::to("/login").into_response();
-    }
-    let body = format!(
-        "<h1 class=\"text-2xl mb-4\">{}</h1><p class=\"text-zinc-500\">Rust dashboard scaffold route: <code>{}</code>.</p>",
-        html_escape(title),
-        html_escape(route)
-    );
-    render_page(title, &body, 0).into_response()
 }
 
 const TALK_SCRIPT: &str = r#"<script>
