@@ -637,8 +637,97 @@ async fn briefings_index(
     headers: HeaderMap,
     Query(query): Query<BriefingQuery>,
 ) -> Response {
-    let show = query.show.unwrap_or_else(|| "active".to_string());
-    authed_or_placeholder(&headers, &state, &format!("briefings {show}"), "/briefings")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let show = match query.show.as_deref() {
+        Some("archived") => "archived",
+        Some("all") => "all",
+        _ => "active",
+    };
+    let rows = briefings_data(&state, show);
+    let mut body = format!(
+        "<h1 class=\"text-2xl mb-1\">Briefings <span class=\"text-sm text-zinc-500\">({} {})</span></h1>",
+        rows.len(),
+        html_escape(show)
+    );
+    body.push_str("<div class=\"flex gap-2 mb-4\">");
+    for (label, val) in [
+        ("active", "active"),
+        ("archived", "archived"),
+        ("all", "all"),
+    ] {
+        let cls = if show == val {
+            "bg-sky-600/20 border-sky-500 text-sky-200"
+        } else {
+            "border-zinc-700 text-zinc-400 hover:text-white"
+        };
+        body.push_str(&format!(
+            "<a href=\"/briefings?show={}\" class=\"rounded border px-2 py-1 text-xs {}\">{}</a>",
+            val, cls, label
+        ));
+    }
+    body.push_str("</div>");
+    if rows.is_empty() {
+        body.push_str("<div class=\"text-zinc-500\">(none)</div>");
+        return render_page("briefings", &body, 0).into_response();
+    }
+    // Group by category (uncategorized last), names sorted within each group.
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    for r in &rows {
+        let cat = briefing_norm(&value_display(r.get("category")));
+        let cat = if cat.is_empty() {
+            "(uncategorized)".to_string()
+        } else {
+            cat
+        };
+        match groups.iter_mut().find(|(c, _)| *c == cat) {
+            Some((_, v)) => v.push(r),
+            None => groups.push((cat, vec![r])),
+        }
+    }
+    groups.sort_by(|(a, _), (b, _)| {
+        (a == "(uncategorized)")
+            .cmp(&(b == "(uncategorized)"))
+            .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+    });
+    for (cat, items) in &mut groups {
+        items.sort_by(|a, b| value_display(a.get("name")).cmp(&value_display(b.get("name"))));
+        body.push_str(&format!(
+            "<details open class=\"mb-3 bg-zinc-900 border border-zinc-800 rounded p-3\">\
+             <summary class=\"cursor-pointer text-zinc-100\">{} <span class=\"text-zinc-500 text-xs\">({})</span></summary>",
+            html_escape(cat),
+            items.len()
+        ));
+        body.push_str(
+            "<table class=\"w-full mt-2\"><thead><tr class=\"text-zinc-500 text-left text-xs\">\
+             <th class=\"pr-3 py-1\">name</th><th class=\"pr-3\">goal</th>\
+             <th class=\"pr-3\">tags</th><th>updated</th></tr></thead><tbody>",
+        );
+        for r in items.iter() {
+            let nm = value_display(r.get("name"));
+            let arch = if value_display(r.get("archived")) == "true" {
+                "<span class=\"ml-1 rounded bg-amber-900/40 text-amber-300 text-[10px] px-1\">archived</span>"
+            } else {
+                ""
+            };
+            let goal = briefing_norm(&value_display(r.get("goal_key")));
+            body.push_str(&format!(
+                "<tr><td class=\"pr-3 align-top\"><a class=\"text-sky-400 hover:underline\" href=\"/briefings/{}\">{}</a>{}</td>\
+                 <td class=\"pr-3 align-top\">{}</td>\
+                 <td class=\"pr-3 align-top\">{}</td>\
+                 <td class=\"align-top text-xs text-zinc-500\">{}</td></tr>",
+                html_escape(&nm),
+                html_escape(&nm),
+                arch,
+                goal_chip(&goal),
+                tag_chips(&value_display(r.get("tags"))),
+                html_escape(&truncate_chars(&value_display(r.get("updated_at")), 19)),
+            ));
+        }
+        body.push_str("</tbody></table></details>");
+    }
+    render_page("briefings", &body, 0).into_response()
 }
 
 async fn briefing_detail(
@@ -646,7 +735,58 @@ async fn briefing_detail(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    authed_or_placeholder(&headers, &state, &name, "/briefings/<name>")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let base = name.strip_suffix(".md").unwrap_or(&name).to_string();
+    let meta_rows = briefings_data(&state, "all");
+    let meta = meta_rows
+        .iter()
+        .find(|r| value_display(r.get("name")) == base);
+    let mut body_md = state.data.harness_stdout(&["briefing-get", &base]);
+    if body_md.trim().is_empty() || body_md.starts_with("(error") {
+        match read_md_file(&state.cfg.briefings_dir, &format!("{base}.md")) {
+            Some(content) => body_md = content,
+            None => return not_found_page(),
+        }
+    }
+    let mut body = format!("<h1 class=\"text-xl mb-2\">{}</h1>", html_escape(&base));
+    if let Some(m) = meta {
+        let mut chips = String::new();
+        let goal = briefing_norm(&value_display(m.get("goal_key")));
+        let cat = briefing_norm(&value_display(m.get("category")));
+        if !goal.is_empty() {
+            chips.push_str(&format!(
+                "<span class=\"rounded bg-indigo-900/40 text-indigo-300 text-xs px-1.5 py-0.5\">goal: {}</span>",
+                html_escape(&goal)
+            ));
+        }
+        if !cat.is_empty() {
+            chips.push_str(&format!(
+                "<span class=\"rounded bg-emerald-900/40 text-emerald-300 text-xs px-1.5 py-0.5\">{}</span>",
+                html_escape(&cat)
+            ));
+        }
+        if value_display(m.get("archived")) == "true" {
+            chips.push_str(
+                "<span class=\"rounded bg-amber-900/40 text-amber-300 text-xs px-1.5 py-0.5\">archived</span>",
+            );
+        }
+        body.push_str(&format!(
+            "<div class=\"flex flex-wrap gap-1 items-center mb-3\">{}{}<span class=\"text-zinc-500 text-xs ml-2\">updated {}</span></div>",
+            chips,
+            tag_chips(&value_display(m.get("tags"))),
+            html_escape(&truncate_chars(&value_display(m.get("updated_at")), 19)),
+        ));
+    }
+    body.push_str(&format!(
+        "<div class=\"bg-zinc-900 border border-zinc-800 rounded p-3\"><pre class=\"text-xs\">{}</pre></div>",
+        html_escape(&body_md)
+    ));
+    body.push_str(
+        "<div class=\"mt-3\"><a class=\"text-sky-400 hover:underline\" href=\"/briefings\">← all briefings</a></div>",
+    );
+    render_page(&base, &body, 0).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1086,6 +1226,42 @@ fn format_mtime(secs: u64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
+}
+
+/// Normalize a CLI-table cell: treat (none)/empty as "" (Flask `_briefing_norm`).
+fn briefing_norm(v: &str) -> String {
+    if v.is_empty() || v == "(none)" {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+/// Render comma-separated tags as chips (Flask `_tag_chips`).
+fn tag_chips(tags_str: &str) -> String {
+    tags_str
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            format!(
+                "<span class=\"inline-block rounded bg-zinc-800 text-zinc-300 text-[10px] px-1.5 py-0.5 mr-1 mb-1\">#{}</span>",
+                html_escape(t)
+            )
+        })
+        .collect()
+}
+
+/// Render a goal chip, or an em-dash when absent (Flask `_goal_chip`).
+fn goal_chip(goal: &str) -> String {
+    if goal.is_empty() {
+        "<span class=\"text-zinc-600 text-xs\">—</span>".to_string()
+    } else {
+        format!(
+            "<span class=\"inline-block rounded bg-indigo-900/40 text-indigo-300 text-[10px] px-1.5 py-0.5\">{}</span>",
+            html_escape(goal)
+        )
+    }
 }
 
 fn parse_json_field(row: &mut std::collections::HashMap<String, Value>, key: &str) {
