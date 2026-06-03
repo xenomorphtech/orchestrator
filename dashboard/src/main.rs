@@ -359,7 +359,53 @@ async fn goal_detail(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Response {
-    authed_or_placeholder(&headers, &state, &format!("goal {key}"), "/goal/<key>")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let goals = goals_data(&state);
+    let Some(g) = goals.iter().find(|g| value_display(g.get("goal_key")) == key) else {
+        return not_found_page();
+    };
+    let status = value_display(g.get("status"));
+    let mut body = format!(
+        "<h1 class=\"text-2xl mb-2\">{}</h1>",
+        html_escape(&value_display(g.get("goal_key")))
+    );
+    body.push_str(&format!(
+        "<div class=\"mb-2\"><span class=\"badge b-{}\">{}</span> \
+         <span class=\"text-zinc-500 text-xs\">prio {}</span></div>",
+        html_escape(&status),
+        html_escape(&status),
+        html_escape(&value_display(g.get("priority"))),
+    ));
+    body.push_str(&format!(
+        "<div class=\"mb-3 text-zinc-300\">{}</div>",
+        html_escape(&value_display(g.get("title")))
+    ));
+    let detail = value_display(g.get("detail"));
+    if !detail.is_empty() && detail != "(none)" {
+        body.push_str(&format!(
+            "<div class=\"bg-zinc-900 border border-zinc-800 rounded p-3 mb-3\"><pre>{}</pre></div>",
+            html_escape(&detail)
+        ));
+    }
+    body.push_str("<div class=\"grid grid-cols-2 gap-3 text-xs\">");
+    for k in [
+        "success_fact_key",
+        "completion_report",
+        "created_at",
+        "updated_at",
+    ] {
+        body.push_str(&format!(
+            "<div class=\"bg-zinc-900 border border-zinc-800 rounded p-2\">\
+             <div class=\"text-zinc-500\">{}</div>\
+             <div>{}</div></div>",
+            k,
+            html_escape(&value_display(g.get(k))),
+        ));
+    }
+    body.push_str("</div>");
+    render_page(&format!("goal {key}"), &body, 0).into_response()
 }
 
 async fn paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -870,6 +916,18 @@ fn authed_or_placeholder(
         html_escape(route)
     );
     render_page(title, &body, 0).into_response()
+}
+
+fn not_found_page() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        render_page(
+            "404",
+            "<h1 class=\"text-2xl mb-2\">404</h1><p class=\"text-zinc-500\">Not found.</p>",
+            0,
+        ),
+    )
+        .into_response()
 }
 
 fn render_login(error: Option<&str>) -> Html<String> {
