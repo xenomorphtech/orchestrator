@@ -19,9 +19,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use orchestrator_harness::codex_app_server::{InboundEvent, Session};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy)]
 enum Variant {
@@ -444,7 +444,10 @@ fn main() -> Result<()> {
         eprintln!("[probe] PASS");
         Ok(())
     } else {
-        eprintln!("[probe] FAIL (see summary above and {})", events_path.display());
+        eprintln!(
+            "[probe] FAIL (see summary above and {})",
+            events_path.display()
+        );
         // exit code 1 for FAIL but don't unwind a panic
         std::process::exit(1);
     }

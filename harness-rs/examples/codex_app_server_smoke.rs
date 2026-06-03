@@ -12,8 +12,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
-use orchestrator_harness::codex_app_server::{append_event_jsonl, Session};
+use anyhow::{Context, Result, anyhow};
+use orchestrator_harness::codex_app_server::{Session, append_event_jsonl};
 
 fn main() -> Result<()> {
     let now = chrono::Utc::now();
@@ -61,7 +61,10 @@ fn main() -> Result<()> {
     let mut turn_event_count: u64 = 0;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match session.events.recv_timeout(remaining.min(Duration::from_secs(5))) {
+        match session
+            .events
+            .recv_timeout(remaining.min(Duration::from_secs(5)))
+        {
             Ok(ev) => {
                 append_event_jsonl(&events_path, &ev).ok();
                 turn_event_count += 1;

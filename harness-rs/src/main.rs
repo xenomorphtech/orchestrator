@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 /// Workaround: SpacetimeDB publish greps for the literal `println` macro
@@ -8,13 +9,13 @@ macro_rules! out {
     ($($arg:tt)*) => { writeln!(std::io::stdout(), $($arg)*).unwrap() };
 }
 
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_BIOME_TERM_URL: &str = "http://127.0.0.1:3021";
@@ -67,6 +68,10 @@ enum Commands {
     GoalUpdate(GoalUpdateArgs),
     GoalRemove(GoalRemoveArgs),
     GoalSet(GoalSetArgs),
+    GoalTree(GoalTreeArgs),
+    GoalTick(GoalTickArgs),
+    WsSet(WsSetArgs),
+    ImportGoalTree(ImportGoalTreeArgs),
     SubGoalAdd(SubGoalAddArgs),
     SubGoalUpdate(SubGoalUpdateArgs),
     SubGoalRemove(SubGoalRemoveArgs),
@@ -139,7 +144,10 @@ struct CliContext {
 
 impl CliContext {
     fn biome_get(&self, url: &str) -> reqwest::blocking::RequestBuilder {
-        let mut req = self.client.get(url).timeout(std::time::Duration::from_millis(2000));
+        let mut req = self
+            .client
+            .get(url)
+            .timeout(std::time::Duration::from_millis(2000));
         if !self.biome_api_key.is_empty() {
             req = req.header("X-Api-Key", &self.biome_api_key);
         }
@@ -147,7 +155,10 @@ impl CliContext {
     }
 
     fn biome_post(&self, url: &str) -> reqwest::blocking::RequestBuilder {
-        let mut req = self.client.post(url).timeout(std::time::Duration::from_millis(2000));
+        let mut req = self
+            .client
+            .post(url)
+            .timeout(std::time::Duration::from_millis(2000));
         if !self.biome_api_key.is_empty() {
             req = req.header("X-Api-Key", &self.biome_api_key);
         }
@@ -155,7 +166,10 @@ impl CliContext {
     }
 
     fn biome_delete(&self, url: &str) -> reqwest::blocking::RequestBuilder {
-        let mut req = self.client.delete(url).timeout(std::time::Duration::from_millis(2000));
+        let mut req = self
+            .client
+            .delete(url)
+            .timeout(std::time::Duration::from_millis(2000));
         if !self.biome_api_key.is_empty() {
             req = req.header("X-Api-Key", &self.biome_api_key);
         }
@@ -238,6 +252,10 @@ struct GoalAddArgs {
     /// JSON metadata (e.g. '{"domain":"nmss"}')
     #[arg(long)]
     metadata: Option<String>,
+    #[arg(long)]
+    tick: Option<u32>,
+    #[arg(long)]
+    scope_note: Option<String>,
 }
 
 #[derive(Args)]
@@ -259,6 +277,12 @@ struct GoalUpdateArgs {
     clear_depends: bool,
     #[arg(long)]
     clear_success_fact: bool,
+    #[arg(long)]
+    tick: Option<u32>,
+    #[arg(long)]
+    scope_note: Option<String>,
+    #[arg(long)]
+    clear_scope_note: bool,
 }
 
 #[derive(Args)]
@@ -273,7 +297,75 @@ struct GoalRemoveArgs {
 #[derive(Args)]
 struct GoalSetArgs {
     goal_key: String,
-    status: String,
+    status: Option<String>,
+    #[arg(long)]
+    scope_note: Option<String>,
+    #[arg(long)]
+    metric: Option<String>,
+    #[arg(long)]
+    tick: Option<u32>,
+    #[arg(long)]
+    clear_scope_note: bool,
+}
+
+#[derive(Args)]
+struct GoalTreeArgs {
+    goal_key: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct GoalTickArgs {
+    goal_key: String,
+}
+
+#[derive(Args)]
+struct WsSetArgs {
+    goal_key: String,
+    ws_id: String,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    stall: Option<u32>,
+    #[arg(long)]
+    blocker: Option<String>,
+    #[arg(long)]
+    next_substep: Option<String>,
+    #[arg(long)]
+    metric: Option<String>,
+    #[arg(long)]
+    done_when: Option<String>,
+    #[arg(long)]
+    falsification: Option<String>,
+    #[arg(long)]
+    worker: Option<String>,
+    #[arg(long)]
+    ord: Option<u32>,
+    /// JSON metadata
+    #[arg(long)]
+    metadata: Option<String>,
+    #[arg(long)]
+    clear_metric: bool,
+    #[arg(long)]
+    clear_done_when: bool,
+    #[arg(long)]
+    clear_falsification: bool,
+    #[arg(long)]
+    clear_blocker: bool,
+    #[arg(long)]
+    clear_next_substep: bool,
+    #[arg(long)]
+    clear_worker: bool,
+}
+
+#[derive(Args)]
+struct ImportGoalTreeArgs {
+    path: PathBuf,
+    #[arg(long)]
+    goal_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -765,7 +857,8 @@ struct BiomePaneCreated {
 }
 
 fn biome_screen(cli: &CliContext, pane_id: &str, lines: usize) -> Result<String> {
-    let resp = cli.biome_get(&format!("{}/panes/{pane_id}/screen", cli.biome_url))
+    let resp = cli
+        .biome_get(&format!("{}/panes/{pane_id}/screen", cli.biome_url))
         .send()
         .with_context(|| format!("biome screen request for {pane_id}"))?;
     if !resp.status().is_success() {
@@ -779,7 +872,8 @@ fn biome_screen(cli: &CliContext, pane_id: &str, lines: usize) -> Result<String>
 
 fn biome_send_raw(cli: &CliContext, pane_id: &str, data: &[u8]) -> Result<()> {
     let payload = json!({ "data": BASE64_STANDARD.encode(data) });
-    let resp = cli.biome_post(&format!("{}/panes/{pane_id}/input", cli.biome_url))
+    let resp = cli
+        .biome_post(&format!("{}/panes/{pane_id}/input", cli.biome_url))
         .json(&payload)
         .send()
         .with_context(|| format!("biome send for {pane_id}"))?;
@@ -794,7 +888,12 @@ fn biome_send_text(cli: &CliContext, pane_id: &str, text: &str) -> Result<()> {
     biome_send_raw(cli, pane_id, format!("{text}\r").as_bytes())
 }
 
-fn biome_send_text_delayed(cli: &CliContext, pane_id: &str, text: &str, delay_ms: u64) -> Result<()> {
+fn biome_send_text_delayed(
+    cli: &CliContext,
+    pane_id: &str,
+    text: &str,
+    delay_ms: u64,
+) -> Result<()> {
     biome_send_raw(cli, pane_id, text.as_bytes())?;
     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     biome_send_raw(cli, pane_id, b"\r")
@@ -806,7 +905,8 @@ fn biome_resolve_pane(cli: &CliContext, name_or_id: &str) -> Result<String> {
         return Ok(name_or_id.to_string());
     }
     // Otherwise resolve by name
-    let resp = cli.biome_get(&format!("{}/panes", cli.biome_url))
+    let resp = cli
+        .biome_get(&format!("{}/panes", cli.biome_url))
         .send()
         .context("listing panes")?;
     let panes: Vec<Value> = resp.json().context("parsing panes list")?;
@@ -848,7 +948,8 @@ fn biome_create_pane(cli: &CliContext, name: &str, group: Option<&str>) -> Resul
 }
 
 fn biome_delete_pane(cli: &CliContext, pane_id: &str) -> Result<()> {
-    let resp = cli.biome_delete(&format!("{}/panes/{pane_id}", cli.biome_url))
+    let resp = cli
+        .biome_delete(&format!("{}/panes/{pane_id}", cli.biome_url))
         .send()
         .with_context(|| format!("biome delete pane {pane_id}"))?;
     if resp.status().is_success() {
@@ -859,7 +960,8 @@ fn biome_delete_pane(cli: &CliContext, pane_id: &str) -> Result<()> {
 }
 
 fn cmd_panes(cli: &CliContext) -> Result<()> {
-    let resp = cli.biome_get(&format!("{}/panes", cli.biome_url))
+    let resp = cli
+        .biome_get(&format!("{}/panes", cli.biome_url))
         .send()
         .context("listing panes")?;
     if !resp.status().is_success() {
@@ -1018,7 +1120,11 @@ fn bsatn_unwrap_or(val: &Value, default: &str) -> String {
 fn metadata_matches_domain(metadata_json: &str, domain: &str) -> bool {
     serde_json::from_str::<Value>(metadata_json)
         .ok()
-        .and_then(|v| v.get("domain").and_then(|d| d.as_str()).map(|d| d == domain))
+        .and_then(|v| {
+            v.get("domain")
+                .and_then(|d| d.as_str())
+                .map(|d| d == domain)
+        })
         .unwrap_or(false)
 }
 
@@ -1071,7 +1177,9 @@ fn extract_columns_and_rows(results: &[Value]) -> (Vec<String>, Vec<Vec<Value>>)
                     if let Some(s) = name.as_str() {
                         Some(s.to_string())
                     } else {
-                        name.get("some").and_then(|s| s.as_str()).map(|s| s.to_string())
+                        name.get("some")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
                     }
                 })
                 .collect()
@@ -1113,7 +1221,10 @@ fn fetch_all_agent_rows(cli: &CliContext) -> Result<(Vec<String>, Vec<Vec<Value>
 /// Convert a single agent row into the canonical JSON object shape used by both
 /// `agent-get --json` and `agent-list --json`. `metadata_json` is parsed as
 /// nested JSON so consumers can `jq '.metadata_json.kind'` directly.
-fn agent_row_to_json_object(columns: &[String], values: &[Value]) -> serde_json::Map<String, Value> {
+fn agent_row_to_json_object(
+    columns: &[String],
+    values: &[Value],
+) -> serde_json::Map<String, Value> {
     let mut obj = serde_json::Map::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
         let raw = values.get(idx).cloned().unwrap_or(Value::Null);
@@ -1140,13 +1251,12 @@ fn sql_escape(value: &str) -> String {
 fn row_to_json_object(columns: &[String], values: &[Value]) -> serde_json::Map<String, Value> {
     let mut obj = serde_json::Map::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
-        let decoded = values
-            .get(idx)
-            .map(cell_to_json)
-            .unwrap_or(Value::Null);
+        let decoded = values.get(idx).map(cell_to_json).unwrap_or(Value::Null);
         let final_val = if col.ends_with("_json") {
             match &decoded {
-                Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| decoded.clone()),
+                Value::String(s) => {
+                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| decoded.clone())
+                }
                 _ => decoded.clone(),
             }
         } else {
@@ -1226,11 +1336,332 @@ fn cmd_path_list(cli: &CliContext, args: PathListArgs) -> Result<()> {
     );
     if args.json {
         let results = sql_query(cli, &query)?;
-        out!("{}", serde_json::to_string(&sql_result_to_json_array(&results))?);
+        out!(
+            "{}",
+            serde_json::to_string(&sql_result_to_json_array(&results))?
+        );
         Ok(())
     } else {
         sql(cli, &query)
     }
+}
+
+fn first_row_object(
+    cli: &CliContext,
+    query: &str,
+) -> Result<Option<serde_json::Map<String, Value>>> {
+    let results = sql_query(cli, query)?;
+    let (columns, rows) = extract_columns_and_rows(&results);
+    Ok(rows.first().map(|row| row_to_json_object(&columns, row)))
+}
+
+fn parse_json_object(value: Option<&Value>) -> serde_json::Map<String, Value> {
+    match value {
+        Some(Value::Object(obj)) => obj.clone(),
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default(),
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn decode_value_json(raw: &Value) -> Value {
+    match raw {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| raw.clone()),
+        _ => raw.clone(),
+    }
+}
+
+fn cmd_goal_tree(cli: &CliContext, args: GoalTreeArgs) -> Result<()> {
+    let goal_query = format!(
+        "SELECT goal_key, title, detail, status, priority, depends_on_goal_key, success_fact_key, metadata_json, completion_report, created_at, updated_at, tick, scope_note FROM goals WHERE goal_key = '{}'",
+        sql_escape(&args.goal_key)
+    );
+    let Some(mut goal) = first_row_object(cli, &goal_query)? else {
+        let _ = writeln!(
+            &mut io::stderr().lock(),
+            "goal '{}' not found",
+            args.goal_key
+        );
+        std::process::exit(2);
+    };
+
+    if let Some(goal_key) = goal.get("goal_key").cloned() {
+        goal.insert("key".to_string(), goal_key);
+    }
+    let metadata = parse_json_object(goal.get("metadata_json"));
+    for key in ["metric", "done_when", "surfaces"] {
+        if let Some(value) = metadata.get(key) {
+            goal.insert(key.to_string(), value.clone());
+        }
+    }
+
+    let ws_query = format!(
+        "SELECT ws_uid, goal_key, ws_id, title, metric, done_when, falsification, status, stall, blocker, next_substep, ord, worker, created_at, updated_at, metadata_json FROM workstreams WHERE goal_key = '{}' ORDER BY ord",
+        sql_escape(&args.goal_key)
+    );
+    let ws_results = sql_query(cli, &ws_query)?;
+    let (ws_columns, ws_rows) = extract_columns_and_rows(&ws_results);
+    let mut workstreams = Vec::with_capacity(ws_rows.len());
+    for row in &ws_rows {
+        let mut obj = row_to_json_object(&ws_columns, row);
+        if let Some(ord) = obj.get("ord").cloned() {
+            obj.insert("order".to_string(), ord);
+        }
+        workstreams.push(Value::Object(obj));
+    }
+
+    let fact_results = sql_query(
+        cli,
+        "SELECT fact_key, value_json, confidence, source_type, source_ref, updated_at, metadata_json FROM facts",
+    )?;
+    let (fact_columns, fact_rows) = extract_columns_and_rows(&fact_results);
+    let mut scoped_facts: Vec<(String, Value)> = Vec::new();
+    let prefix = format!("{}.", args.goal_key);
+    for row in &fact_rows {
+        let obj = row_to_json_object(&fact_columns, row);
+        let fact_key = obj
+            .get("fact_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let metadata = parse_json_object(obj.get("metadata_json"));
+        let metadata_goal = metadata
+            .get("goal_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s == args.goal_key)
+            .unwrap_or(false);
+        if metadata_goal || fact_key.starts_with(&prefix) {
+            scoped_facts.push((
+                fact_key,
+                decode_value_json(obj.get("value_json").unwrap_or(&Value::Null)),
+            ));
+        }
+    }
+    scoped_facts.sort_by(|a, b| a.0.cmp(&b.0));
+    let facts = scoped_facts
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+
+    let tree = json!({
+        "goal": Value::Object(goal),
+        "workstreams": workstreams,
+        "facts": facts,
+    });
+    if args.json {
+        out!("{}", serde_json::to_string(&tree)?);
+    } else {
+        out!("{}", serde_json::to_string_pretty(&tree)?);
+    }
+    Ok(())
+}
+
+fn cmd_ws_set(cli: &CliContext, args: WsSetArgs) -> Result<()> {
+    if args.goal_key.contains("::") || args.ws_id.contains("::") {
+        return Err(anyhow!("goal_key and ws_id must not contain '::'"));
+    }
+    call_reducer(
+        cli,
+        "workstream_set",
+        Some(vec![json!({
+            "goal_key": args.goal_key,
+            "ws_id": args.ws_id,
+            "title": optional_json_string(args.title),
+            "metric": optional_json_string(args.metric),
+            "done_when": optional_json_string(args.done_when),
+            "falsification": optional_json_string(args.falsification),
+            "status": optional_json_string(args.status),
+            "stall": optional_json_u32(args.stall),
+            "blocker": optional_json_string(args.blocker),
+            "next_substep": optional_json_string(args.next_substep),
+            "ord": optional_json_u32(args.ord),
+            "worker": optional_json_string(args.worker),
+            "metadata_json": optional_json_string(args.metadata),
+            "clear_metric": args.clear_metric,
+            "clear_done_when": args.clear_done_when,
+            "clear_falsification": args.clear_falsification,
+            "clear_blocker": args.clear_blocker,
+            "clear_next_substep": args.clear_next_substep,
+            "clear_worker": args.clear_worker,
+        })]),
+    )
+}
+
+fn cmd_goal_set(cli: &CliContext, args: GoalSetArgs) -> Result<()> {
+    let metadata_json = if let Some(metric) = args.metric {
+        let query = format!(
+            "SELECT metadata_json FROM goals WHERE goal_key = '{}'",
+            sql_escape(&args.goal_key)
+        );
+        let mut metadata = first_row_object(cli, &query)?
+            .map(|obj| parse_json_object(obj.get("metadata_json")))
+            .unwrap_or_default();
+        metadata.insert("metric".to_string(), Value::String(metric));
+        Some(serde_json::to_string(&Value::Object(metadata))?)
+    } else {
+        None
+    };
+    call_reducer(
+        cli,
+        "goal_update",
+        Some(vec![
+            Value::String(args.goal_key),
+            json!({
+                "title": none_json(),
+                "detail": none_json(),
+                "status": optional_json_string(args.status),
+                "priority": none_json(),
+                "depends_on_goal_key": none_json(),
+                "success_fact_key": none_json(),
+                "metadata_json": optional_json_string(metadata_json),
+                "completion_report": none_json(),
+                "tick": optional_json_u32(args.tick),
+                "scope_note": optional_json_string(args.scope_note),
+                "clear_depends": false,
+                "clear_success_fact": false,
+                "clear_scope_note": args.clear_scope_note,
+            }),
+        ]),
+    )
+}
+
+fn value_string(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn value_u32(value: Option<&Value>) -> Option<u32> {
+    value.and_then(|v| {
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
+    })
+}
+
+fn cmd_import_goal_tree(cli: &CliContext, args: ImportGoalTreeArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.path)
+        .with_context(|| format!("reading {}", args.path.display()))?;
+    let tree: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", args.path.display()))?;
+    let goal = tree
+        .get("goal")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow!("goal_tree JSON must contain a goal object"))?;
+    let goal_key = args
+        .goal_key
+        .or_else(|| value_string(goal.get("goal_key")))
+        .or_else(|| value_string(goal.get("key")))
+        .unwrap_or_else(|| "albion_bot".to_string());
+    if goal_key.contains("::") {
+        return Err(anyhow!("goal_key must not contain '::'"));
+    }
+
+    let mut metadata = parse_json_object(goal.get("metadata_json"));
+    for key in ["metric", "surfaces", "done_when"] {
+        if let Some(value) = goal.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+    let title = value_string(goal.get("title")).unwrap_or_else(|| goal_key.clone());
+    call_reducer_silent(
+        cli,
+        "goal_add",
+        Some(vec![json!({
+            "goal_key": goal_key,
+            "title": title,
+            "detail": some_json_string(value_string(goal.get("done_when")).unwrap_or_default()),
+            "status": some_json_string(value_string(goal.get("status")).unwrap_or_else(|| "active".to_string())),
+            "priority": some_json_u32(value_u32(goal.get("priority")).unwrap_or(50)),
+            "depends_on_goal_key": optional_json_string(value_string(goal.get("depends_on_goal_key"))),
+            "success_fact_key": optional_json_string(value_string(goal.get("success_fact_key"))),
+            "metadata_json": some_json_string(serde_json::to_string(&Value::Object(metadata))?),
+            "completion_report": null,
+            "tick": optional_json_u32(value_u32(goal.get("tick"))),
+            "scope_note": optional_json_string(value_string(goal.get("scope_note"))),
+            "clear_scope_note": false,
+        })]),
+    )?;
+
+    let mut workstream_count = 0u32;
+    if let Some(items) = tree
+        .get("workstreams")
+        .or_else(|| tree.get("subgoals"))
+        .and_then(|v| v.as_array())
+    {
+        for (idx, item) in items.iter().enumerate() {
+            let obj = item
+                .as_object()
+                .ok_or_else(|| anyhow!("workstream at index {idx} is not an object"))?;
+            let ws_id = value_string(obj.get("ws_id"))
+                .or_else(|| value_string(obj.get("id")))
+                .or_else(|| value_string(obj.get("key")))
+                .ok_or_else(|| anyhow!("workstream at index {idx} is missing ws_id/id/key"))?;
+            if ws_id.contains("::") {
+                return Err(anyhow!("workstream id must not contain '::': {ws_id}"));
+            }
+            let mut metadata = parse_json_object(obj.get("metadata_json"));
+            if metadata.is_empty() {
+                metadata.insert(
+                    "source".to_string(),
+                    Value::String("import-goal-tree".to_string()),
+                );
+            }
+            call_reducer_silent(
+                cli,
+                "workstream_set",
+                Some(vec![json!({
+                    "goal_key": goal_key,
+                    "ws_id": ws_id,
+                    "title": optional_json_string(value_string(obj.get("title"))),
+                    "metric": optional_json_string(value_string(obj.get("metric"))),
+                    "done_when": optional_json_string(value_string(obj.get("done_when"))),
+                    "falsification": optional_json_string(value_string(obj.get("falsification"))),
+                    "status": optional_json_string(value_string(obj.get("status"))),
+                    "stall": optional_json_u32(value_u32(obj.get("stall")).or_else(|| value_u32(obj.get("stall_counter")))),
+                    "blocker": optional_json_string(value_string(obj.get("blocker"))),
+                    "next_substep": optional_json_string(value_string(obj.get("next_substep"))),
+                    "ord": optional_json_u32(value_u32(obj.get("ord")).or_else(|| value_u32(obj.get("order"))).or(Some(idx as u32))),
+                    "worker": optional_json_string(value_string(obj.get("worker"))),
+                    "metadata_json": some_json_string(serde_json::to_string(&Value::Object(metadata))?),
+                    "clear_metric": false,
+                    "clear_done_when": false,
+                    "clear_falsification": false,
+                    "clear_blocker": false,
+                    "clear_next_substep": false,
+                    "clear_worker": false,
+                })]),
+            )?;
+            workstream_count += 1;
+        }
+    }
+
+    let mut fact_count = 0u32;
+    if let Some(facts) = tree.get("facts").and_then(|v| v.as_array()) {
+        for (idx, fact) in facts.iter().enumerate() {
+            call_reducer_silent(
+                cli,
+                "fact_set",
+                Some(vec![json!({
+                    "fact_key": format!("{goal_key}.note{idx:02}"),
+                    "value_json": serde_json::to_string(fact)?,
+                    "confidence": some_json_f64(1.0),
+                    "source_type": some_json_string("import-goal-tree".to_string()),
+                    "source_ref": some_json_string(args.path.display().to_string()),
+                    "metadata_json": some_json_string(json!({"goal_key": goal_key, "ord": idx}).to_string()),
+                })]),
+            )?;
+            fact_count += 1;
+        }
+    }
+
+    out!("imported goal {goal_key}: {workstream_count} workstreams, {fact_count} facts");
+    Ok(())
 }
 
 fn cmd_draft_set(cli: &CliContext, args: DraftSetArgs) -> Result<()> {
@@ -1282,7 +1713,10 @@ fn cmd_draft_list(cli: &CliContext, args: DraftListArgs) -> Result<()> {
     );
     if args.json {
         let results = sql_query(cli, &query)?;
-        out!("{}", serde_json::to_string(&sql_result_to_json_array(&results))?);
+        out!(
+            "{}",
+            serde_json::to_string(&sql_result_to_json_array(&results))?
+        );
         Ok(())
     } else {
         sql(cli, &query)
@@ -1300,7 +1734,10 @@ fn cmd_anchor_get(cli: &CliContext, args: AnchorGetArgs) -> Result<()> {
         let Some(row) = rows.first() else {
             return Err(anyhow!("no anchor for goal {}", args.goal));
         };
-        out!("{}", serde_json::to_string(&Value::Object(row_to_json_object(&columns, row)))?);
+        out!(
+            "{}",
+            serde_json::to_string(&Value::Object(row_to_json_object(&columns, row)))?
+        );
         Ok(())
     } else {
         sql(cli, &query)
@@ -1401,7 +1838,12 @@ fn cmd_poll_biome(cli: &CliContext, lines: u32, domain: Option<&str>) -> Result<
     Ok(())
 }
 
-fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>, group: Option<&str>) -> Result<()> {
+fn cmd_execute_biome(
+    cli: &CliContext,
+    limit: u32,
+    domain: Option<&str>,
+    group: Option<&str>,
+) -> Result<()> {
     let limit = limit as usize;
     // Fetch pending actions
     let rows = sql_rows(
@@ -1419,7 +1861,8 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>, group: 
 
         if let Some(domain) = domain {
             if let Some(ref agent_name) = agent_name {
-                let metadata = get_agent_metadata(cli, agent_name).unwrap_or_else(|_| "{}".to_string());
+                let metadata =
+                    get_agent_metadata(cli, agent_name).unwrap_or_else(|_| "{}".to_string());
                 if !metadata_matches_domain(&metadata, domain) {
                     continue;
                 }
@@ -1429,17 +1872,21 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>, group: 
         let (status, result_text) = match action_type.as_str() {
             "send_prompt" | "restart_agent" => {
                 match agent_name.as_deref().filter(|s| !s.is_empty()) {
-                    None => ("failed".to_string(), format!("action {action_id} missing agent_name")),
+                    None => (
+                        "failed".to_string(),
+                        format!("action {action_id} missing agent_name"),
+                    ),
                     Some(agent_name) if action_type == "send_prompt" => {
                         match get_agent_pane_id(cli, agent_name)? {
-                            None => ("failed".to_string(), format!("agent {agent_name} has no biome_pane_id")),
+                            None => (
+                                "failed".to_string(),
+                                format!("agent {agent_name} has no biome_pane_id"),
+                            ),
                             Some(pane_id) => {
                                 let payload: Value = serde_json::from_str(&payload_json_str)
                                     .unwrap_or_else(|_| json!({}));
-                                let text = payload
-                                    .get("text")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let text =
+                                    payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
                                 match biome_send_text(cli, &pane_id, text) {
                                     Ok(()) => ("done".to_string(), "sent".to_string()),
                                     Err(err) => ("failed".to_string(), format!("{err:#}")),
@@ -1482,7 +1929,14 @@ fn cmd_execute_biome(cli: &CliContext, limit: u32, domain: Option<&str>, group: 
     Ok(())
 }
 
-fn cmd_run_once_biome(cli: &CliContext, lines: u32, execute: bool, limit: u32, domain: Option<&str>, group: Option<&str>) -> Result<()> {
+fn cmd_run_once_biome(
+    cli: &CliContext,
+    lines: u32,
+    execute: bool,
+    limit: u32,
+    domain: Option<&str>,
+    group: Option<&str>,
+) -> Result<()> {
     cmd_poll_biome(cli, lines, domain)?;
     match domain {
         Some(d) => call_reducer_silent(
@@ -1521,7 +1975,10 @@ fn cmd_poll_services(cli: &CliContext, timeout_ms: u64) -> Result<()> {
             "ssh_systemd" => check_ssh_systemd(&host, &check_target, timeout),
             "http" => check_http(&cli.client, &check_target, timeout),
             "tcp" => check_tcp(&check_target, timeout),
-            _ => ("unhealthy".to_string(), format!("unknown service_type: {svc_type}")),
+            _ => (
+                "unhealthy".to_string(),
+                format!("unknown service_type: {svc_type}"),
+            ),
         };
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -1551,10 +2008,7 @@ fn cmd_poll_services(cli: &CliContext, timeout_ms: u64) -> Result<()> {
 }
 
 fn check_systemd(unit: &str, _timeout: std::time::Duration) -> (String, String) {
-    match Command::new("systemctl")
-        .args(["is-active", unit])
-        .output()
-    {
+    match Command::new("systemctl").args(["is-active", unit]).output() {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if stdout == "active" {
@@ -1571,10 +2025,14 @@ fn check_ssh_systemd(host: &str, unit: &str, timeout: std::time::Duration) -> (S
     let timeout_secs = (timeout.as_secs()).max(1).to_string();
     match Command::new("ssh")
         .args([
-            "-o", &format!("ConnectTimeout={timeout_secs}"),
-            "-o", "StrictHostKeyChecking=accept-new",
+            "-o",
+            &format!("ConnectTimeout={timeout_secs}"),
+            "-o",
+            "StrictHostKeyChecking=accept-new",
             host,
-            "systemctl", "is-active", unit,
+            "systemctl",
+            "is-active",
+            unit,
         ])
         .output()
     {
@@ -1586,7 +2044,10 @@ fn check_ssh_systemd(host: &str, unit: &str, timeout: std::time::Duration) -> (S
                 ("unhealthy".to_string(), stdout)
             }
         }
-        Err(err) => ("unhealthy".to_string(), format!("ssh systemctl failed: {err}")),
+        Err(err) => (
+            "unhealthy".to_string(),
+            format!("ssh systemctl failed: {err}"),
+        ),
     }
 }
 
@@ -1597,7 +2058,10 @@ fn check_http(client: &Client, url: &str, timeout: std::time::Duration) -> (Stri
             if status_code.is_success() {
                 ("healthy".to_string(), format!("{}", status_code.as_u16()))
             } else {
-                ("unhealthy".to_string(), format!("HTTP {}", status_code.as_u16()))
+                (
+                    "unhealthy".to_string(),
+                    format!("HTTP {}", status_code.as_u16()),
+                )
             }
         }
         Err(err) => ("unhealthy".to_string(), format!("{err}")),
@@ -1625,7 +2089,12 @@ fn boot_command_for_backend(backend: &str, workdir: &str) -> String {
     }
 }
 
-fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &str, group_override: Option<&str>) -> (String, String) {
+fn execute_restart_agent(
+    cli: &CliContext,
+    agent_name: &str,
+    payload_json_str: &str,
+    group_override: Option<&str>,
+) -> (String, String) {
     // Get agent's workdir, current pane, and metadata.
     let agent_info = match sql_rows(
         cli,
@@ -1635,7 +2104,12 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
         ),
     ) {
         Ok(rows) if !rows.is_empty() => rows.into_iter().next().unwrap(),
-        Ok(_) => return ("failed".to_string(), format!("agent {agent_name} not found")),
+        Ok(_) => {
+            return (
+                "failed".to_string(),
+                format!("agent {agent_name} not found"),
+            );
+        }
         Err(err) => return ("failed".to_string(), format!("{err:#}")),
     };
 
@@ -1657,9 +2131,7 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
         .map(str::to_string);
 
     // Resolve group: explicit override > domain from metadata.
-    let group = group_override
-        .map(str::to_string)
-        .or(domain_from_meta);
+    let group = group_override.map(str::to_string).or(domain_from_meta);
 
     // Extract task from payload, fall back to default_task.
     let task = serde_json::from_str::<Value>(payload_json_str)
@@ -1705,7 +2177,11 @@ fn execute_restart_agent(cli: &CliContext, agent_name: &str, payload_json_str: &
     )
 }
 
-fn execute_spawn_agent(cli: &CliContext, payload_json_str: &str, group_override: Option<&str>) -> (String, String) {
+fn execute_spawn_agent(
+    cli: &CliContext,
+    payload_json_str: &str,
+    group_override: Option<&str>,
+) -> (String, String) {
     let payload: Value = match serde_json::from_str(payload_json_str) {
         Ok(v) => v,
         Err(err) => return ("failed".to_string(), format!("bad spawn payload: {err}")),
@@ -1713,7 +2189,12 @@ fn execute_spawn_agent(cli: &CliContext, payload_json_str: &str, group_override:
 
     let name = match payload.get("name").and_then(|v| v.as_str()) {
         Some(name) => name.to_string(),
-        None => return ("failed".to_string(), "spawn_agent payload missing 'name'".to_string()),
+        None => {
+            return (
+                "failed".to_string(),
+                "spawn_agent payload missing 'name'".to_string(),
+            );
+        }
     };
     let workdir = payload
         .get("workdir")
@@ -1742,9 +2223,7 @@ fn execute_spawn_agent(cli: &CliContext, payload_json_str: &str, group_override:
         .and_then(|v| v.get("domain"))
         .and_then(|d| d.as_str())
         .map(str::to_string);
-    let group = group_override
-        .map(str::to_string)
-        .or(domain_from_meta);
+    let group = group_override.map(str::to_string).or(domain_from_meta);
 
     let pane_id = match biome_create_pane(cli, &name, group.as_deref()) {
         Ok(id) => id,
@@ -1787,16 +2266,26 @@ fn execute_restart_service(payload_json_str: &str) -> (String, String) {
         Err(err) => return ("failed".to_string(), format!("bad payload: {err}")),
     };
 
-    let svc_name = payload.get("service_name").and_then(|v| v.as_str()).unwrap_or("");
-    let svc_type = payload.get("service_type").and_then(|v| v.as_str()).unwrap_or("");
-    let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
-    let check_target = payload.get("check_target").and_then(|v| v.as_str()).unwrap_or("");
+    let svc_name = payload
+        .get("service_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let svc_type = payload
+        .get("service_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let host = payload
+        .get("host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("localhost");
+    let check_target = payload
+        .get("check_target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let custom_cmd = payload.get("restart_command").and_then(|v| v.as_str());
 
     let result = if let Some(cmd) = custom_cmd {
-        Command::new("sh")
-            .args(["-c", cmd])
-            .output()
+        Command::new("sh").args(["-c", cmd]).output()
     } else {
         match svc_type {
             "systemd" => Command::new("systemctl")
@@ -1804,12 +2293,20 @@ fn execute_restart_service(payload_json_str: &str) -> (String, String) {
                 .output(),
             "ssh_systemd" => Command::new("ssh")
                 .args([
-                    "-o", "ConnectTimeout=10",
+                    "-o",
+                    "ConnectTimeout=10",
                     host,
-                    "systemctl", "restart", check_target,
+                    "systemctl",
+                    "restart",
+                    check_target,
                 ])
                 .output(),
-            _ => return ("failed".to_string(), format!("no restart method for service type: {svc_type}")),
+            _ => {
+                return (
+                    "failed".to_string(),
+                    format!("no restart method for service type: {svc_type}"),
+                );
+            }
         }
     };
 
@@ -1888,7 +2385,9 @@ fn lookup_agent_for_send(cli: &CliContext, name: &str) -> Result<Option<AgentFor
             name.replace('\'', "''")
         ),
     )?;
-    let Some(row) = rows.into_iter().next() else { return Ok(None) };
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
     if row.len() < 6 {
         return Ok(None);
     }
@@ -1923,7 +2422,10 @@ fn persist_codex_thread_id(cli: &CliContext, agent: &AgentForSend, thread_id: &s
         Some(m) => m,
         None => serde_json::Map::new(),
     };
-    meta_obj.insert("kind".to_string(), Value::String("codex_app_server".to_string()));
+    meta_obj.insert(
+        "kind".to_string(),
+        Value::String("codex_app_server".to_string()),
+    );
     meta_obj.insert(
         "codex_thread_id".to_string(),
         Value::String(thread_id.to_string()),
@@ -1952,14 +2454,16 @@ fn persist_codex_thread_id(cli: &CliContext, agent: &AgentForSend, thread_id: &s
 /// JSONL, optionally to stdout, until turn/completed (or timeout).
 #[cfg(feature = "cli")]
 fn cmd_codex_send(cli: &CliContext, args: &SendArgs, agent: &AgentForSend) -> Result<()> {
-    use orchestrator_harness::codex_app_server::{append_event_jsonl, Session};
+    use orchestrator_harness::codex_app_server::{Session, append_event_jsonl};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    let workdir = agent
-        .workdir
-        .clone()
-        .ok_or_else(|| anyhow!("agent '{}' has no workdir; cannot spawn codex app-server", agent.name))?;
+    let workdir = agent.workdir.clone().ok_or_else(|| {
+        anyhow!(
+            "agent '{}' has no workdir; cannot spawn codex app-server",
+            agent.name
+        )
+    })?;
     let workdir_path = PathBuf::from(&workdir);
     if !workdir_path.is_dir() {
         return Err(anyhow!(
@@ -1971,9 +2475,7 @@ fn cmd_codex_send(cli: &CliContext, args: &SendArgs, agent: &AgentForSend) -> Re
     let run_id = now.format("%Y%m%dT%H%M%SZ").to_string();
     let session_root = std::env::var("HARNESS_CODEX_SESSION_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from("/home/sdancer/orchestrator/analysis/codex-sessions")
-        });
+        .unwrap_or_else(|_| PathBuf::from("/home/sdancer/orchestrator/analysis/codex-sessions"));
     let session_dir = session_root.join(&agent.name).join(&run_id);
     std::fs::create_dir_all(&session_dir)
         .with_context(|| format!("create session dir {}", session_dir.display()))?;
@@ -2023,12 +2525,16 @@ fn cmd_codex_send(cli: &CliContext, args: &SendArgs, agent: &AgentForSend) -> Re
                     &mut io::stderr().lock(),
                     "[codex-send] thread/resume failed ({err:#}); starting fresh thread"
                 );
-                let started = session.thread_start(&workdir_path).context("thread/start fallback")?;
+                let started = session
+                    .thread_start(&workdir_path)
+                    .context("thread/start fallback")?;
                 started.thread_id
             }
         }
     } else {
-        let started = session.thread_start(&workdir_path).context("thread/start")?;
+        let started = session
+            .thread_start(&workdir_path)
+            .context("thread/start")?;
         let _ = writeln!(
             &mut io::stderr().lock(),
             "[codex-send] started new thread {}",
@@ -2210,11 +2716,15 @@ fn load_toml_config() {
     // Search: ./harness.toml, then ~/.config/harness/harness.toml
     let candidates = [
         std::path::PathBuf::from("harness.toml"),
-        dirs_next().map(|d| d.join("harness").join("harness.toml")).unwrap_or_default(),
+        dirs_next()
+            .map(|d| d.join("harness").join("harness.toml"))
+            .unwrap_or_default(),
     ];
     let path = candidates.iter().find(|p| p.exists());
     let Some(path) = path else { return };
-    let Ok(contents) = std::fs::read_to_string(path) else { return };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
     let Ok(table) = contents.parse::<toml::Table>() else {
         let _ = writeln!(
             &mut io::stderr().lock(),
@@ -2238,7 +2748,9 @@ fn load_toml_config() {
         }
         if let Some(val) = table.get(*toml_key).and_then(|v| v.as_str()) {
             // SAFETY: called before any threads are spawned (single-threaded init)
-            unsafe { std::env::set_var(env_key, val); }
+            unsafe {
+                std::env::set_var(env_key, val);
+            }
         }
     }
 }
@@ -2271,37 +2783,68 @@ fn run() -> Result<()> {
         client: Client::new(),
     };
     match cli.command {
-        Commands::Build => run_status(Command::new("spacetime").args(["build", "-p", "harness-rs"])),
+        Commands::Build => {
+            run_status(Command::new("spacetime").args(["build", "-p", "harness-rs"]))
+        }
         Commands::SeedAgents => call_reducer(&context, "seed_agents", None),
         Commands::BootstrapKnownGoals => call_reducer(&context, "bootstrap_known_goals", None),
         Commands::Agents => sql(&context, "SELECT * FROM agents"),
         Commands::Goals => sql(&context, "SELECT * FROM goals"),
+        Commands::GoalTree(args) => cmd_goal_tree(&context, args),
         Commands::SubGoals => sql(&context, "SELECT * FROM sub_goals"),
         Commands::Facts => sql(
             &context,
             "SELECT fact_key, value_json, confidence, source_type, source_ref, updated_at FROM facts",
         ),
         Commands::Summary => {
-            sql(&context, "SELECT name, status, current_goal_key, current_sub_goal_key, last_seen_at, last_capture_preview FROM agents")?;
-            sql(&context, "SELECT goal_key, status, priority, success_fact_key FROM goals")?;
-            sql(&context, "SELECT sub_goal_key, goal_key, owner_agent, status, priority FROM sub_goals")?;
-            sql(&context, "SELECT name, service_type, host, status, last_checked_at, consecutive_failures FROM services")?;
-            sql(&context, "SELECT id, agent_name, action_type, status, reason FROM actions LIMIT 10")
+            sql(
+                &context,
+                "SELECT name, status, current_goal_key, current_sub_goal_key, last_seen_at, last_capture_preview FROM agents",
+            )?;
+            sql(
+                &context,
+                "SELECT goal_key, status, priority, success_fact_key FROM goals",
+            )?;
+            sql(
+                &context,
+                "SELECT sub_goal_key, goal_key, owner_agent, status, priority FROM sub_goals",
+            )?;
+            sql(
+                &context,
+                "SELECT name, service_type, host, status, last_checked_at, consecutive_failures FROM services",
+            )?;
+            sql(
+                &context,
+                "SELECT id, agent_name, action_type, status, reason FROM actions LIMIT 10",
+            )
         }
         Commands::DecideActions => call_reducer(&context, "decide_actions", None),
         Commands::ResolveActiveSubGoals => call_reducer(&context, "resolve_active_sub_goals", None),
         Commands::PollBiome(args) => cmd_poll_biome(&context, args.lines, args.domain.as_deref()),
         Commands::ExecuteBiome(args) => {
             let effective_group = args.group.as_deref().or(args.domain.as_deref());
-            cmd_execute_biome(&context, args.limit, args.domain.as_deref(), effective_group)
+            cmd_execute_biome(
+                &context,
+                args.limit,
+                args.domain.as_deref(),
+                effective_group,
+            )
         }
-        Commands::RunOnceBiome(args) => {
-            cmd_run_once_biome(&context, args.lines, args.execute, args.limit, args.domain.as_deref(), args.group.as_deref())
-        }
+        Commands::RunOnceBiome(args) => cmd_run_once_biome(
+            &context,
+            args.lines,
+            args.execute,
+            args.limit,
+            args.domain.as_deref(),
+            args.group.as_deref(),
+        ),
         Commands::QueuePrompt(args) => call_reducer(
             &context,
             "queue_prompt",
-            Some(vec![Value::String(args.agent_name), Value::String(args.text)]),
+            Some(vec![
+                Value::String(args.agent_name),
+                Value::String(args.text),
+            ]),
         ),
         Commands::FactSet(args) => call_reducer(
             &context,
@@ -2327,7 +2870,10 @@ fn run() -> Result<()> {
                 "depends_on_goal_key": optional_json_string(args.depends_on_goal_key),
                 "success_fact_key": optional_json_string(args.success_fact_key),
                 "metadata_json": some_json_string(args.metadata.unwrap_or_else(|| "{}".to_string())),
-                "completion_report": null
+                "completion_report": null,
+                "tick": optional_json_u32(args.tick),
+                "scope_note": optional_json_string(args.scope_note),
+                "clear_scope_note": false
             })]),
         ),
         Commands::GoalUpdate(args) => call_reducer(
@@ -2344,8 +2890,11 @@ fn run() -> Result<()> {
                     "success_fact_key": optional_json_string(args.success_fact_key),
                     "metadata_json": none_json(),
                     "completion_report": none_json(),
+                    "tick": optional_json_u32(args.tick),
+                    "scope_note": optional_json_string(args.scope_note),
                     "clear_depends": args.clear_depends,
-                    "clear_success_fact": args.clear_success_fact
+                    "clear_success_fact": args.clear_success_fact,
+                    "clear_scope_note": args.clear_scope_note
                 }),
             ]),
         ),
@@ -2358,25 +2907,14 @@ fn run() -> Result<()> {
                 Value::Bool(args.cascade),
             ]),
         ),
-        Commands::GoalSet(args) => call_reducer(
+        Commands::GoalSet(args) => cmd_goal_set(&context, args),
+        Commands::GoalTick(args) => call_reducer(
             &context,
-            "goal_update",
-            Some(vec![
-                Value::String(args.goal_key),
-                json!({
-                    "title": none_json(),
-                    "detail": none_json(),
-                    "status": some_json_string(args.status),
-                    "priority": none_json(),
-                    "depends_on_goal_key": none_json(),
-                    "success_fact_key": none_json(),
-                    "metadata_json": none_json(),
-                    "completion_report": none_json(),
-                    "clear_depends": false,
-                    "clear_success_fact": false
-                }),
-            ]),
+            "goal_tick",
+            Some(vec![Value::String(args.goal_key)]),
         ),
+        Commands::WsSet(args) => cmd_ws_set(&context, args),
+        Commands::ImportGoalTree(args) => cmd_import_goal_tree(&context, args),
         Commands::SubGoalAdd(args) => call_reducer(
             &context,
             "sub_goal_add",
@@ -2427,7 +2965,10 @@ fn run() -> Result<()> {
         Commands::SubGoalRemove(args) => call_reducer(
             &context,
             "sub_goal_remove",
-            Some(vec![Value::String(args.sub_goal_key), Value::Bool(args.delete)]),
+            Some(vec![
+                Value::String(args.sub_goal_key),
+                Value::Bool(args.delete),
+            ]),
         ),
         Commands::SubGoalSet(args) => call_reducer(
             &context,
@@ -2507,7 +3048,10 @@ fn run() -> Result<()> {
         Commands::PathRemove(args) => call_reducer(
             &context,
             "path_remove",
-            Some(vec![Value::String(args.path_name), Value::Bool(args.delete)]),
+            Some(vec![
+                Value::String(args.path_name),
+                Value::Bool(args.delete),
+            ]),
         ),
         Commands::DraftSet(args) => cmd_draft_set(&context, args),
         Commands::DraftGet(args) => cmd_draft_get(&context, args),
@@ -2690,7 +3234,12 @@ fn run() -> Result<()> {
                     "metadata_json": some_json_string(format!("{{\"domain\":\"{}\"}}", args.domain))
                 })]),
             )?;
-            out!("heartbeat: {}.supervisor.status={}, last_heartbeat={}", args.domain, args.status, timestamp);
+            out!(
+                "heartbeat: {}.supervisor.status={}, last_heartbeat={}",
+                args.domain,
+                args.status,
+                timestamp
+            );
             Ok(())
         }
         Commands::EpisodeAdd(args) => call_reducer(
@@ -2795,8 +3344,9 @@ fn briefing_sync_file(name: &str, archived: bool) {
 fn cmd_briefing_set(cli: &CliContext, args: BriefingSetArgs) -> Result<()> {
     let body = match (args.body, &args.body_file) {
         (Some(b), _) => b,
-        (None, Some(path)) => std::fs::read_to_string(path)
-            .with_context(|| format!("reading body file {path}"))?,
+        (None, Some(path)) => {
+            std::fs::read_to_string(path).with_context(|| format!("reading body file {path}"))?
+        }
         (None, None) => {
             // Default: mirror the existing on-disk briefings/<name>.md if present.
             let p = briefing_active_path(&args.name);
@@ -2928,7 +3478,10 @@ fn cmd_dump(cli: &CliContext) -> Result<()> {
         out!("{}", serde_json::to_string(&obj)?);
     }
 
-    let rows = sql_rows(cli, "SELECT goal_key, title, detail, status, priority, depends_on_goal_key, success_fact_key, metadata_json FROM goals")?;
+    let rows = sql_rows(
+        cli,
+        "SELECT goal_key, title, detail, status, priority, depends_on_goal_key, success_fact_key, metadata_json, tick, scope_note FROM goals",
+    )?;
     for row in &rows {
         let obj = json!({
             "type": "goal",
@@ -2940,11 +3493,40 @@ fn cmd_dump(cli: &CliContext) -> Result<()> {
             "depends_on_goal_key": bsatn_unwrap(&row[5]),
             "success_fact_key": bsatn_unwrap(&row[6]),
             "metadata_json": bsatn_unwrap_or(&row[7], "{}"),
+            "tick": row[8].as_u64().unwrap_or(0),
+            "scope_note": bsatn_unwrap(&row[9]),
         });
         out!("{}", serde_json::to_string(&obj)?);
     }
 
-    let rows = sql_rows(cli, "SELECT sub_goal_key, goal_key, owner_agent, title, detail, status, priority, depends_on_sub_goal_key, blocked_by, success_fact_key, instruction_text, stuck_guidance_text, metadata_json FROM sub_goals")?;
+    let rows = sql_rows(
+        cli,
+        "SELECT goal_key, ws_id, title, metric, done_when, falsification, status, stall, blocker, next_substep, ord, worker, metadata_json FROM workstreams",
+    )?;
+    for row in &rows {
+        let obj = json!({
+            "type": "workstream",
+            "goal_key": bsatn_unwrap_or(&row[0], ""),
+            "ws_id": bsatn_unwrap_or(&row[1], ""),
+            "title": bsatn_unwrap_or(&row[2], ""),
+            "metric": bsatn_unwrap(&row[3]),
+            "done_when": bsatn_unwrap(&row[4]),
+            "falsification": bsatn_unwrap(&row[5]),
+            "status": bsatn_unwrap_or(&row[6], "pending"),
+            "stall": row[7].as_u64().unwrap_or(0),
+            "blocker": bsatn_unwrap(&row[8]),
+            "next_substep": bsatn_unwrap(&row[9]),
+            "ord": row[10].as_u64().unwrap_or(0),
+            "worker": bsatn_unwrap(&row[11]),
+            "metadata_json": bsatn_unwrap_or(&row[12], "{}"),
+        });
+        out!("{}", serde_json::to_string(&obj)?);
+    }
+
+    let rows = sql_rows(
+        cli,
+        "SELECT sub_goal_key, goal_key, owner_agent, title, detail, status, priority, depends_on_sub_goal_key, blocked_by, success_fact_key, instruction_text, stuck_guidance_text, metadata_json FROM sub_goals",
+    )?;
     for row in &rows {
         let obj = json!({
             "type": "sub_goal",
@@ -2988,6 +3570,7 @@ fn cmd_dump(cli: &CliContext) -> Result<()> {
 fn cmd_restore(cli: &CliContext) -> Result<()> {
     let stdin = io::stdin();
     let mut goal_count = 0u32;
+    let mut workstream_count = 0u32;
     let mut sub_goal_count = 0u32;
     let mut fact_count = 0u32;
 
@@ -3003,68 +3586,123 @@ fn cmd_restore(cli: &CliContext) -> Result<()> {
 
         match record_type {
             "agent" => {
-                call_reducer_silent(cli, "agent_add", Some(vec![
-                    Value::String(obj["name"].as_str().unwrap_or("").to_string()),
-                    Value::String(obj["biome_pane_id"].as_str().unwrap_or("placeholder").to_string()),
-                    optional_json_string(obj["workdir"].as_str().map(str::to_string)),
-                    optional_json_string(obj["default_task"].as_str().map(str::to_string)),
-                    optional_json_string(obj["tmux_target"].as_str().map(str::to_string)),
-                    optional_json_string(obj["metadata_json"].as_str().map(str::to_string)),
-                ]))?;
+                call_reducer_silent(
+                    cli,
+                    "agent_add",
+                    Some(vec![
+                        Value::String(obj["name"].as_str().unwrap_or("").to_string()),
+                        Value::String(
+                            obj["biome_pane_id"]
+                                .as_str()
+                                .unwrap_or("placeholder")
+                                .to_string(),
+                        ),
+                        optional_json_string(obj["workdir"].as_str().map(str::to_string)),
+                        optional_json_string(obj["default_task"].as_str().map(str::to_string)),
+                        optional_json_string(obj["tmux_target"].as_str().map(str::to_string)),
+                        optional_json_string(obj["metadata_json"].as_str().map(str::to_string)),
+                    ]),
+                )?;
             }
             "goal" => {
-                call_reducer_silent(cli, "goal_add", Some(vec![json!({
-                    "goal_key": obj["goal_key"],
-                    "title": obj["title"],
-                    "detail": some_json_string(obj["detail"].as_str().unwrap_or("").to_string()),
-                    "status": some_json_string(obj["status"].as_str().unwrap_or("active").to_string()),
-                    "priority": some_json_u32(obj["priority"].as_u64().unwrap_or(50) as u32),
-                    "depends_on_goal_key": optional_json_string(obj["depends_on_goal_key"].as_str().map(str::to_string)),
-                    "success_fact_key": optional_json_string(obj["success_fact_key"].as_str().map(str::to_string)),
-                    "metadata_json": some_json_string(obj["metadata_json"].as_str().unwrap_or("{}").to_string()),
-                    "completion_report": null
-                })]))?;
+                call_reducer_silent(
+                    cli,
+                    "goal_add",
+                    Some(vec![json!({
+                        "goal_key": obj["goal_key"],
+                        "title": obj["title"],
+                        "detail": some_json_string(obj["detail"].as_str().unwrap_or("").to_string()),
+                        "status": some_json_string(obj["status"].as_str().unwrap_or("active").to_string()),
+                        "priority": some_json_u32(obj["priority"].as_u64().unwrap_or(50) as u32),
+                        "depends_on_goal_key": optional_json_string(obj["depends_on_goal_key"].as_str().map(str::to_string)),
+                        "success_fact_key": optional_json_string(obj["success_fact_key"].as_str().map(str::to_string)),
+                        "metadata_json": some_json_string(obj["metadata_json"].as_str().unwrap_or("{}").to_string()),
+                        "completion_report": null,
+                        "tick": optional_json_u32(obj["tick"].as_u64().and_then(|n| u32::try_from(n).ok())),
+                        "scope_note": optional_json_string(obj["scope_note"].as_str().map(str::to_string)),
+                        "clear_scope_note": false
+                    })]),
+                )?;
                 goal_count += 1;
             }
+            "workstream" => {
+                call_reducer_silent(
+                    cli,
+                    "workstream_set",
+                    Some(vec![json!({
+                        "goal_key": obj["goal_key"],
+                        "ws_id": obj["ws_id"],
+                        "title": optional_json_string(obj["title"].as_str().map(str::to_string)),
+                        "metric": optional_json_string(obj["metric"].as_str().map(str::to_string)),
+                        "done_when": optional_json_string(obj["done_when"].as_str().map(str::to_string)),
+                        "falsification": optional_json_string(obj["falsification"].as_str().map(str::to_string)),
+                        "status": optional_json_string(obj["status"].as_str().map(str::to_string)),
+                        "stall": optional_json_u32(obj["stall"].as_u64().and_then(|n| u32::try_from(n).ok())),
+                        "blocker": optional_json_string(obj["blocker"].as_str().map(str::to_string)),
+                        "next_substep": optional_json_string(obj["next_substep"].as_str().map(str::to_string)),
+                        "ord": optional_json_u32(obj["ord"].as_u64().and_then(|n| u32::try_from(n).ok())),
+                        "worker": optional_json_string(obj["worker"].as_str().map(str::to_string)),
+                        "metadata_json": some_json_string(obj["metadata_json"].as_str().unwrap_or("{}").to_string()),
+                        "clear_metric": false,
+                        "clear_done_when": false,
+                        "clear_falsification": false,
+                        "clear_blocker": false,
+                        "clear_next_substep": false,
+                        "clear_worker": false
+                    })]),
+                )?;
+                workstream_count += 1;
+            }
             "sub_goal" => {
-                call_reducer_silent(cli, "sub_goal_add", Some(vec![json!({
-                    "sub_goal_key": obj["sub_goal_key"],
-                    "goal_key": obj["goal_key"],
-                    "owner_agent": obj["owner_agent"],
-                    "title": obj["title"],
-                    "detail": some_json_string(obj["detail"].as_str().unwrap_or("").to_string()),
-                    "status": some_json_string(obj["status"].as_str().unwrap_or("pending").to_string()),
-                    "priority": some_json_u32(obj["priority"].as_u64().unwrap_or(50) as u32),
-                    "depends_on_sub_goal_key": optional_json_string(obj["depends_on_sub_goal_key"].as_str().map(str::to_string)),
-                    "blocked_by": optional_json_string(obj["blocked_by"].as_str().map(str::to_string)),
-                    "success_fact_key": optional_json_string(obj["success_fact_key"].as_str().map(str::to_string)),
-                    "instruction_text": optional_json_string(obj["instruction_text"].as_str().map(str::to_string)),
-                    "stuck_guidance_text": optional_json_string(obj["stuck_guidance_text"].as_str().map(str::to_string)),
-                    "metadata_json": some_json_string(obj["metadata_json"].as_str().unwrap_or("{}").to_string()),
-                    "completion_report": null
-                })]))?;
+                call_reducer_silent(
+                    cli,
+                    "sub_goal_add",
+                    Some(vec![json!({
+                        "sub_goal_key": obj["sub_goal_key"],
+                        "goal_key": obj["goal_key"],
+                        "owner_agent": obj["owner_agent"],
+                        "title": obj["title"],
+                        "detail": some_json_string(obj["detail"].as_str().unwrap_or("").to_string()),
+                        "status": some_json_string(obj["status"].as_str().unwrap_or("pending").to_string()),
+                        "priority": some_json_u32(obj["priority"].as_u64().unwrap_or(50) as u32),
+                        "depends_on_sub_goal_key": optional_json_string(obj["depends_on_sub_goal_key"].as_str().map(str::to_string)),
+                        "blocked_by": optional_json_string(obj["blocked_by"].as_str().map(str::to_string)),
+                        "success_fact_key": optional_json_string(obj["success_fact_key"].as_str().map(str::to_string)),
+                        "instruction_text": optional_json_string(obj["instruction_text"].as_str().map(str::to_string)),
+                        "stuck_guidance_text": optional_json_string(obj["stuck_guidance_text"].as_str().map(str::to_string)),
+                        "metadata_json": some_json_string(obj["metadata_json"].as_str().unwrap_or("{}").to_string()),
+                        "completion_report": null
+                    })]),
+                )?;
                 sub_goal_count += 1;
             }
             "fact" => {
-                call_reducer_silent(cli, "fact_set", Some(vec![json!({
-                    "fact_key": obj["fact_key"],
-                    "value_json": obj["value_json"],
-                    "confidence": some_json_f64(obj["confidence"].as_f64().unwrap_or(1.0)),
-                    "source_type": some_json_string(obj["source_type"].as_str().unwrap_or("manual").to_string()),
-                    "source_ref": optional_json_string(obj["source_ref"].as_str().map(str::to_string)),
-                    "metadata_json": some_json_string(obj["metadata_json"].as_str().unwrap_or("{}").to_string())
-                })]))?;
+                call_reducer_silent(
+                    cli,
+                    "fact_set",
+                    Some(vec![json!({
+                        "fact_key": obj["fact_key"],
+                        "value_json": obj["value_json"],
+                        "confidence": some_json_f64(obj["confidence"].as_f64().unwrap_or(1.0)),
+                        "source_type": some_json_string(obj["source_type"].as_str().unwrap_or("manual").to_string()),
+                        "source_ref": optional_json_string(obj["source_ref"].as_str().map(str::to_string)),
+                        "metadata_json": some_json_string(obj["metadata_json"].as_str().unwrap_or("{}").to_string())
+                    })]),
+                )?;
                 fact_count += 1;
             }
             _ => {
-                let _ = writeln!(&mut io::stderr().lock(), "skipping unknown type: {record_type}");
+                let _ = writeln!(
+                    &mut io::stderr().lock(),
+                    "skipping unknown type: {record_type}"
+                );
             }
         }
     }
 
     let _ = writeln!(
         &mut io::stderr().lock(),
-        "restored {goal_count} goals, {sub_goal_count} sub-goals, {fact_count} facts"
+        "restored {goal_count} goals, {workstream_count} workstreams, {sub_goal_count} sub-goals, {fact_count} facts"
     );
     Ok(())
 }
@@ -3153,7 +3791,9 @@ fn print_sql_result(json: &Value) {
                         if let Some(s) = name.as_str() {
                             Some(s.to_string())
                         } else {
-                            name.get("some").and_then(|s| s.as_str()).map(|s| s.to_string())
+                            name.get("some")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string())
                         }
                     })
                     .collect();

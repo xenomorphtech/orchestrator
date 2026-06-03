@@ -14,13 +14,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
 
 /// Anything inbound from codex that isn't a response to one of our requests.
 /// `id` is `Some` for server-initiated requests (we must reply), `None` for
@@ -95,9 +95,18 @@ impl Session {
             .spawn()
             .context("spawn `codex app-server`")?;
 
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("child stdin missing"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("child stdout missing"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("child stderr missing"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("child stdin missing"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("child stdout missing"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("child stderr missing"))?;
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (writer_tx, writer_rx) = std::sync::mpsc::channel::<WriteCmd>();
@@ -129,9 +138,15 @@ impl Session {
             for cmd in writer_rx {
                 match cmd {
                     WriteCmd::Send(line) => {
-                        if stdin.write_all(line.as_bytes()).is_err() { break; }
-                        if stdin.write_all(b"\n").is_err() { break; }
-                        if stdin.flush().is_err() { break; }
+                        if stdin.write_all(line.as_bytes()).is_err() {
+                            break;
+                        }
+                        if stdin.write_all(b"\n").is_err() {
+                            break;
+                        }
+                        if stdin.flush().is_err() {
+                            break;
+                        }
                     }
                     WriteCmd::Shutdown => break,
                 }
@@ -152,7 +167,9 @@ impl Session {
                     Err(_) => break,
                 }
                 let trimmed = line.trim_end_matches(['\r', '\n']);
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
                 let parsed: Value = match serde_json::from_str(trimmed) {
                     Ok(v) => v,
                     Err(_) => {
@@ -169,8 +186,8 @@ impl Session {
                 // Response to one of our requests has `id` and either `result`
                 // or `error`, with no `method`.
                 let has_method = parsed.get("method").is_some();
-                let has_result_or_error = parsed.get("result").is_some()
-                    || parsed.get("error").is_some();
+                let has_result_or_error =
+                    parsed.get("result").is_some() || parsed.get("error").is_some();
                 let id_val = parsed.get("id").cloned();
                 if !has_method && has_result_or_error {
                     if let Some(num) = id_val.as_ref().and_then(|v| v.as_i64()) {
@@ -179,7 +196,8 @@ impl Session {
                             if let Some(err) = parsed.get("error") {
                                 let _ = tx.send(Err(err.to_string()));
                             } else {
-                                let _ = tx.send(Ok(parsed.get("result").cloned().unwrap_or(Value::Null)));
+                                let _ = tx
+                                    .send(Ok(parsed.get("result").cloned().unwrap_or(Value::Null)));
                             }
                             continue;
                         }
@@ -279,7 +297,12 @@ impl Session {
         self.send_raw(payload)
     }
 
-    pub fn initialize(&self, client_name: &str, client_title: &str, client_version: &str) -> Result<InitializeResult> {
+    pub fn initialize(
+        &self,
+        client_name: &str,
+        client_title: &str,
+        client_version: &str,
+    ) -> Result<InitializeResult> {
         let result = self.request(
             "initialize",
             json!({
@@ -292,13 +315,31 @@ impl Session {
             }),
             Duration::from_secs(15),
         )?;
-        let user_agent = result.get("userAgent").and_then(|v| v.as_str()).map(String::from);
-        let codex_home = result.get("codexHome").and_then(|v| v.as_str()).map(String::from);
-        let platform_family = result.get("platformFamily").and_then(|v| v.as_str()).map(String::from);
-        let platform_os = result.get("platformOs").and_then(|v| v.as_str()).map(String::from);
+        let user_agent = result
+            .get("userAgent")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let codex_home = result
+            .get("codexHome")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let platform_family = result
+            .get("platformFamily")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let platform_os = result
+            .get("platformOs")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         // Per protocol: send `initialized` notification right after.
         self.notify("initialized", json!({}))?;
-        Ok(InitializeResult { user_agent, codex_home, platform_family, platform_os, raw: result })
+        Ok(InitializeResult {
+            user_agent,
+            codex_home,
+            platform_family,
+            platform_os,
+            raw: result,
+        })
     }
 
     pub fn thread_start(&self, cwd: &Path) -> Result<ThreadStartResult> {
@@ -320,10 +361,19 @@ impl Session {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("thread/start missing thread.id: {result}"))?
             .to_string();
-        Ok(ThreadStartResult { thread_id, raw: result })
+        Ok(ThreadStartResult {
+            thread_id,
+            raw: result,
+        })
     }
 
-    pub fn turn_start(&self, thread_id: &str, prompt: &str, cwd: &Path, title: &str) -> Result<TurnStartResult> {
+    pub fn turn_start(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        cwd: &Path,
+        title: &str,
+    ) -> Result<TurnStartResult> {
         let result = self.request(
             "turn/start",
             json!({
@@ -342,7 +392,10 @@ impl Session {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("turn/start missing turn.id: {result}"))?
             .to_string();
-        Ok(TurnStartResult { turn_id, raw: result })
+        Ok(TurnStartResult {
+            turn_id,
+            raw: result,
+        })
     }
 
     pub fn turn_interrupt(&self, thread_id: &str, turn_id: &str) -> Result<Value> {
@@ -357,7 +410,9 @@ impl Session {
     /// Returns true if it was an approval/tool-call request and we replied,
     /// false if the caller should handle this event itself.
     pub fn auto_reply(&self, ev: &InboundEvent) -> Result<bool> {
-        let Some(id) = ev.id.clone() else { return Ok(false) };
+        let Some(id) = ev.id.clone() else {
+            return Ok(false);
+        };
         let result = match ev.method.as_str() {
             // Approval-family server requests (v2): accept for the session.
             "item/commandExecution/requestApproval"

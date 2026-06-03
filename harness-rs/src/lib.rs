@@ -50,6 +50,9 @@ pub struct GoalInput {
     pub success_fact_key: Option<String>,
     pub metadata_json: Option<String>,
     pub completion_report: Option<String>,
+    pub tick: Option<u32>,
+    pub scope_note: Option<String>,
+    pub clear_scope_note: bool,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -62,8 +65,55 @@ pub struct GoalPatch {
     pub success_fact_key: Option<String>,
     pub metadata_json: Option<String>,
     pub completion_report: Option<String>,
+    pub tick: Option<u32>,
+    pub scope_note: Option<String>,
     pub clear_depends: bool,
     pub clear_success_fact: bool,
+    pub clear_scope_note: bool,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct WorkstreamInput {
+    pub goal_key: String,
+    pub ws_id: String,
+    pub title: Option<String>,
+    pub metric: Option<String>,
+    pub done_when: Option<String>,
+    pub falsification: Option<String>,
+    pub status: Option<String>,
+    pub stall: Option<u32>,
+    pub blocker: Option<String>,
+    pub next_substep: Option<String>,
+    pub ord: Option<u32>,
+    pub worker: Option<String>,
+    pub metadata_json: Option<String>,
+    pub clear_metric: bool,
+    pub clear_done_when: bool,
+    pub clear_falsification: bool,
+    pub clear_blocker: bool,
+    pub clear_next_substep: bool,
+    pub clear_worker: bool,
+}
+
+#[derive(Clone, Debug, SpacetimeType)]
+pub struct WorkstreamPatch {
+    pub title: Option<String>,
+    pub metric: Option<String>,
+    pub done_when: Option<String>,
+    pub falsification: Option<String>,
+    pub status: Option<String>,
+    pub stall: Option<u32>,
+    pub blocker: Option<String>,
+    pub next_substep: Option<String>,
+    pub ord: Option<u32>,
+    pub worker: Option<String>,
+    pub metadata_json: Option<String>,
+    pub clear_metric: bool,
+    pub clear_done_when: bool,
+    pub clear_falsification: bool,
+    pub clear_blocker: bool,
+    pub clear_next_substep: bool,
+    pub clear_worker: bool,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -262,6 +312,35 @@ pub struct Goal {
     pub completion_report: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[default(0u32)]
+    pub tick: u32,
+    #[default(None::<String>)]
+    pub scope_note: Option<String>,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = workstreams, public)]
+pub struct Workstream {
+    #[primary_key]
+    pub ws_uid: String,
+    #[index(btree)]
+    pub goal_key: String,
+    #[index(btree)]
+    pub ws_id: String,
+    pub title: String,
+    pub metric: Option<String>,
+    pub done_when: Option<String>,
+    pub falsification: Option<String>,
+    #[index(btree)]
+    pub status: String,
+    pub stall: u32,
+    pub blocker: Option<String>,
+    pub next_substep: Option<String>,
+    pub ord: u32,
+    pub worker: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata_json: String,
 }
 
 #[derive(Clone)]
@@ -607,7 +686,13 @@ fn require_service(ctx: &ReducerContext, name: &str) -> Result<Service, String> 
         .ok_or_else(|| format!("unknown service: {name}"))
 }
 
-fn log_event(ctx: &ReducerContext, agent_name: Option<String>, event_type: &str, message: String, payload_json: Option<String>) {
+fn log_event(
+    ctx: &ReducerContext,
+    agent_name: Option<String>,
+    event_type: &str,
+    message: String,
+    payload_json: Option<String>,
+) {
     ctx.db.events().insert(Event {
         id: 0,
         agent_name,
@@ -702,9 +787,15 @@ fn corrective_prompt(ctx: &ReducerContext, agent_name: &str, preview: &str) -> S
         }
     }
     match agent_name {
-        "crypto" => format!("{base}Try hooking sub_20bb48 and sub_2070a8 deeper with Capstone. If static analysis is already sufficient, move to Unicorn emulation using nmss_emu.py against output/decrypted/nmsscr.dec."),
-        "oracle" => format!("{base}If the build is complete, run the oracle now and record the output."),
-        "hybrid" => format!("{base}If crypto is not solved yet, stub the computation and validate the capture path anyway."),
+        "crypto" => format!(
+            "{base}Try hooking sub_20bb48 and sub_2070a8 deeper with Capstone. If static analysis is already sufficient, move to Unicorn emulation using nmss_emu.py against output/decrypted/nmsscr.dec."
+        ),
+        "oracle" => {
+            format!("{base}If the build is complete, run the oracle now and record the output.")
+        }
+        "hybrid" => format!(
+            "{base}If crypto is not solved yet, stub the computation and validate the capture path anyway."
+        ),
         _ => base,
     }
 }
@@ -849,7 +940,6 @@ fn decide_actions_internal(ctx: &ReducerContext) {
     queue_index_actions_internal(ctx);
 }
 
-
 fn default_agents() -> Vec<AgentInput> {
     vec![
         AgentInput {
@@ -881,35 +971,53 @@ fn bootstrap_goals() -> Vec<GoalInput> {
         GoalInput {
             goal_key: "orchestrator.deliver_tested_oracle".to_string(),
             title: "Deliver tested oracle and indexed evidence".to_string(),
-            detail: Some("Drive the oracle from implementation through execution and VikingDB indexing.".to_string()),
+            detail: Some(
+                "Drive the oracle from implementation through execution and VikingDB indexing."
+                    .to_string(),
+            ),
             status: Some("pending".to_string()),
             priority: Some(10),
             depends_on_goal_key: None,
             success_fact_key: Some("oracle.indexed".to_string()),
             metadata_json: None,
             completion_report: None,
+            tick: None,
+            scope_note: None,
+            clear_scope_note: false,
         },
         GoalInput {
             goal_key: "orchestrator.recover_crypto".to_string(),
             title: "Recover the crypto algorithm".to_string(),
-            detail: Some("Drive crypto from static analysis through emulation to an identified algorithm.".to_string()),
+            detail: Some(
+                "Drive crypto from static analysis through emulation to an identified algorithm."
+                    .to_string(),
+            ),
             status: Some("pending".to_string()),
             priority: Some(20),
             depends_on_goal_key: None,
             success_fact_key: Some("crypto.algorithm_identified".to_string()),
             metadata_json: None,
             completion_report: None,
+            tick: None,
+            scope_note: None,
+            clear_scope_note: false,
         },
         GoalInput {
             goal_key: "orchestrator.validate_capture_path".to_string(),
             title: "Validate the capture path".to_string(),
-            detail: Some("Build and test the capture flow; use a stub until the crypto is fully solved.".to_string()),
+            detail: Some(
+                "Build and test the capture flow; use a stub until the crypto is fully solved."
+                    .to_string(),
+            ),
             status: Some("pending".to_string()),
             priority: Some(30),
             depends_on_goal_key: None,
             success_fact_key: Some("hybrid.capture_tested".to_string()),
             metadata_json: None,
             completion_report: None,
+            tick: None,
+            scope_note: None,
+            clear_scope_note: false,
         },
     ]
 }
@@ -1038,15 +1146,30 @@ fn upsert_agent_internal(ctx: &ReducerContext, input: AgentInput, biome_pane_id:
         tmux_target: input.tmux_target,
         workdir: opt_text(input.workdir),
         default_task: input.default_task,
-        status: existing.as_ref().map(|row| row.status.clone()).unwrap_or_else(|| "unknown".to_string()),
-        current_goal_key: existing.as_ref().and_then(|row| row.current_goal_key.clone()),
-        current_sub_goal_key: existing.as_ref().and_then(|row| row.current_sub_goal_key.clone()),
+        status: existing
+            .as_ref()
+            .map(|row| row.status.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        current_goal_key: existing
+            .as_ref()
+            .and_then(|row| row.current_goal_key.clone()),
+        current_sub_goal_key: existing
+            .as_ref()
+            .and_then(|row| row.current_sub_goal_key.clone()),
         last_seen_at: existing.as_ref().and_then(|row| row.last_seen_at.clone()),
         idle_since: existing.as_ref().and_then(|row| row.idle_since.clone()),
-        rolling_description: existing.as_ref().and_then(|row| row.rolling_description.clone()),
-        last_capture_hash: existing.as_ref().and_then(|row| row.last_capture_hash.clone()),
-        last_capture_preview: existing.as_ref().and_then(|row| row.last_capture_preview.clone()),
-        metadata_json: input.metadata_json.clone()
+        rolling_description: existing
+            .as_ref()
+            .and_then(|row| row.rolling_description.clone()),
+        last_capture_hash: existing
+            .as_ref()
+            .and_then(|row| row.last_capture_hash.clone()),
+        last_capture_preview: existing
+            .as_ref()
+            .and_then(|row| row.last_capture_preview.clone()),
+        metadata_json: input
+            .metadata_json
+            .clone()
             .or_else(|| existing.as_ref().map(|row| row.metadata_json.clone()))
             .unwrap_or_else(|| "{}".to_string()),
         biome_pane_id: biome_pane_id.or_else(|| existing.and_then(|row| row.biome_pane_id)),
@@ -1070,15 +1193,102 @@ fn upsert_goal_internal(ctx: &ReducerContext, input: GoalInput) -> Result<(), St
         depends_on_goal_key: opt_text(input.depends_on_goal_key),
         success_fact_key: opt_text(input.success_fact_key),
         metadata_json: json_or_empty(input.metadata_json),
-        completion_report: input.completion_report.or_else(|| existing.as_ref().and_then(|r| r.completion_report.clone())),
+        completion_report: input
+            .completion_report
+            .or_else(|| existing.as_ref().and_then(|r| r.completion_report.clone())),
         created_at: existing
             .as_ref()
             .map(|row| row.created_at.clone())
             .unwrap_or_else(|| timestamp.clone()),
         updated_at: timestamp,
+        tick: input
+            .tick
+            .or_else(|| existing.as_ref().map(|row| row.tick))
+            .unwrap_or(0),
+        scope_note: if input.clear_scope_note {
+            None
+        } else {
+            opt_text(input.scope_note)
+                .or_else(|| existing.as_ref().and_then(|row| row.scope_note.clone()))
+        },
     };
     let _ = ctx.db.goals().goal_key().delete(&row.goal_key);
     ctx.db.goals().insert(row);
+    Ok(())
+}
+
+fn upsert_workstream_internal(ctx: &ReducerContext, input: WorkstreamInput) -> Result<(), String> {
+    require_goal(ctx, &input.goal_key)?;
+    if input.goal_key.contains("::") || input.ws_id.contains("::") {
+        return Err("goal_key and ws_id must not contain '::'".to_string());
+    }
+    let timestamp = now(ctx);
+    let ws_uid = format!("{}::{}", input.goal_key, input.ws_id);
+    let existing = ctx.db.workstreams().ws_uid().find(&ws_uid);
+    let row = Workstream {
+        ws_uid: ws_uid.clone(),
+        goal_key: input.goal_key,
+        ws_id: input.ws_id.clone(),
+        title: opt_text(input.title)
+            .or_else(|| existing.as_ref().map(|row| row.title.clone()))
+            .unwrap_or(input.ws_id),
+        metric: if input.clear_metric {
+            None
+        } else {
+            opt_text(input.metric).or_else(|| existing.as_ref().and_then(|row| row.metric.clone()))
+        },
+        done_when: if input.clear_done_when {
+            None
+        } else {
+            opt_text(input.done_when)
+                .or_else(|| existing.as_ref().and_then(|row| row.done_when.clone()))
+        },
+        falsification: if input.clear_falsification {
+            None
+        } else {
+            opt_text(input.falsification)
+                .or_else(|| existing.as_ref().and_then(|row| row.falsification.clone()))
+        },
+        status: opt_text(input.status)
+            .or_else(|| existing.as_ref().map(|row| row.status.clone()))
+            .unwrap_or_else(|| "pending".to_string()),
+        stall: input
+            .stall
+            .or_else(|| existing.as_ref().map(|row| row.stall))
+            .unwrap_or(0),
+        blocker: if input.clear_blocker {
+            None
+        } else {
+            opt_text(input.blocker)
+                .or_else(|| existing.as_ref().and_then(|row| row.blocker.clone()))
+        },
+        next_substep: if input.clear_next_substep {
+            None
+        } else {
+            opt_text(input.next_substep)
+                .or_else(|| existing.as_ref().and_then(|row| row.next_substep.clone()))
+        },
+        ord: input
+            .ord
+            .or_else(|| existing.as_ref().map(|row| row.ord))
+            .unwrap_or(0),
+        worker: if input.clear_worker {
+            None
+        } else {
+            opt_text(input.worker).or_else(|| existing.as_ref().and_then(|row| row.worker.clone()))
+        },
+        created_at: existing
+            .as_ref()
+            .map(|row| row.created_at.clone())
+            .unwrap_or_else(|| timestamp.clone()),
+        updated_at: timestamp,
+        metadata_json: input
+            .metadata_json
+            .or_else(|| existing.as_ref().map(|row| row.metadata_json.clone()))
+            .unwrap_or_else(|| "{}".to_string()),
+    };
+    let _ = ctx.db.workstreams().ws_uid().delete(&ws_uid);
+    ctx.db.workstreams().insert(row);
     Ok(())
 }
 
@@ -1093,9 +1303,23 @@ fn upsert_sub_goal_internal(ctx: &ReducerContext, input: SubGoalInput) -> Result
     let existing = ctx.db.sub_goals().sub_goal_key().find(&input.sub_goal_key);
     // Validate blocked_by references (comma-separated goal_keys or sub_goal_keys)
     if let Some(ref blocked_by) = input.blocked_by {
-        for dep_key in blocked_by.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let goal_exists = ctx.db.goals().goal_key().find(&dep_key.to_string()).is_some();
-            let sub_goal_exists = ctx.db.sub_goals().sub_goal_key().find(&dep_key.to_string()).is_some();
+        for dep_key in blocked_by
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let goal_exists = ctx
+                .db
+                .goals()
+                .goal_key()
+                .find(&dep_key.to_string())
+                .is_some();
+            let sub_goal_exists = ctx
+                .db
+                .sub_goals()
+                .sub_goal_key()
+                .find(&dep_key.to_string())
+                .is_some();
             if !goal_exists && !sub_goal_exists {
                 return Err(format!("blocked_by references unknown key: {dep_key}"));
             }
@@ -1115,7 +1339,9 @@ fn upsert_sub_goal_internal(ctx: &ReducerContext, input: SubGoalInput) -> Result
         instruction_text: opt_text(input.instruction_text),
         stuck_guidance_text: opt_text(input.stuck_guidance_text),
         metadata_json: json_or_empty(input.metadata_json),
-        completion_report: input.completion_report.or_else(|| existing.as_ref().and_then(|r| r.completion_report.clone())),
+        completion_report: input
+            .completion_report
+            .or_else(|| existing.as_ref().and_then(|r| r.completion_report.clone())),
         created_at: existing
             .as_ref()
             .map(|row| row.created_at.clone())
@@ -1193,7 +1419,13 @@ pub fn seed_agents(ctx: &ReducerContext) {
     for agent in default_agents() {
         let name = agent.name.clone();
         upsert_agent_internal(ctx, agent, None);
-        log_event(ctx, Some(name), "agent.seeded", "seeded default agent".to_string(), None);
+        log_event(
+            ctx,
+            Some(name),
+            "agent.seeded",
+            "seeded default agent".to_string(),
+            None,
+        );
     }
 }
 
@@ -1231,16 +1463,40 @@ pub fn agent_add(
 pub fn agent_remove(ctx: &ReducerContext, name: String, delete: bool) -> Result<(), String> {
     let agent = require_agent(ctx, &name)?;
     if delete {
-        for sub_goal in ctx.db.sub_goals().iter().filter(|row| row.owner_agent == name) {
-            let _ = ctx.db.sub_goals().sub_goal_key().delete(&sub_goal.sub_goal_key);
+        for sub_goal in ctx
+            .db
+            .sub_goals()
+            .iter()
+            .filter(|row| row.owner_agent == name)
+        {
+            let _ = ctx
+                .db
+                .sub_goals()
+                .sub_goal_key()
+                .delete(&sub_goal.sub_goal_key);
         }
-        for observation in ctx.db.observations().iter().filter(|row| row.agent_name == name) {
+        for observation in ctx
+            .db
+            .observations()
+            .iter()
+            .filter(|row| row.agent_name == name)
+        {
             let _ = ctx.db.observations().id().delete(observation.id);
         }
-        for action in ctx.db.actions().iter().filter(|row| row.agent_name.as_deref() == Some(name.as_str())) {
+        for action in ctx
+            .db
+            .actions()
+            .iter()
+            .filter(|row| row.agent_name.as_deref() == Some(name.as_str()))
+        {
             let _ = ctx.db.actions().id().delete(action.id);
         }
-        for event in ctx.db.events().iter().filter(|row| row.agent_name.as_deref() == Some(name.as_str())) {
+        for event in ctx
+            .db
+            .events()
+            .iter()
+            .filter(|row| row.agent_name.as_deref() == Some(name.as_str()))
+        {
             let _ = ctx.db.events().id().delete(event.id);
         }
         let _ = ctx.db.agents().name().delete(&name);
@@ -1272,11 +1528,10 @@ pub fn agent_prune_stale(ctx: &ReducerContext, name: String) -> Result<(), Strin
         ctx.db.sub_goals().sub_goal_key().update(updated);
     }
 
-    for action in ctx
-        .db
-        .actions()
-        .iter()
-        .filter(|row| row.agent_name.as_deref() == Some(name.as_str()) && row.status == "pending")
+    for action in
+        ctx.db.actions().iter().filter(|row| {
+            row.agent_name.as_deref() == Some(name.as_str()) && row.status == "pending"
+        })
     {
         let mut updated = action;
         updated.status = "failed".to_string();
@@ -1302,13 +1557,25 @@ pub fn bootstrap_known_goals(ctx: &ReducerContext) -> Result<(), String> {
     for goal in bootstrap_goals() {
         let key = goal.goal_key.clone();
         upsert_goal_internal(ctx, goal)?;
-        log_event(ctx, None, "goal.upserted", key, Some("{\"bootstrap\":true}".to_string()));
+        log_event(
+            ctx,
+            None,
+            "goal.upserted",
+            key,
+            Some("{\"bootstrap\":true}".to_string()),
+        );
     }
     for sub_goal in bootstrap_sub_goals() {
         let key = sub_goal.sub_goal_key.clone();
         let owner = sub_goal.owner_agent.clone();
         upsert_sub_goal_internal(ctx, sub_goal)?;
-        log_event(ctx, Some(owner), "sub_goal.upserted", key, Some("{\"bootstrap\":true}".to_string()));
+        log_event(
+            ctx,
+            Some(owner),
+            "sub_goal.upserted",
+            key,
+            Some("{\"bootstrap\":true}".to_string()),
+        );
     }
     Ok(())
 }
@@ -1316,7 +1583,10 @@ pub fn bootstrap_known_goals(ctx: &ReducerContext) -> Result<(), String> {
 #[spacetimedb::reducer]
 pub fn goal_add(ctx: &ReducerContext, input: GoalInput) -> Result<(), String> {
     let key = input.goal_key.clone();
-    let status = input.status.clone().unwrap_or_else(|| "pending".to_string());
+    let status = input
+        .status
+        .clone()
+        .unwrap_or_else(|| "pending".to_string());
     upsert_goal_internal(ctx, input)?;
     log_event(
         ctx,
@@ -1349,6 +1619,13 @@ pub fn goal_update(ctx: &ReducerContext, goal_key: String, patch: GoalPatch) -> 
         },
         metadata_json: patch.metadata_json.or(Some(current.metadata_json)),
         completion_report: patch.completion_report.or(current.completion_report),
+        tick: patch.tick.or(Some(current.tick)),
+        scope_note: if patch.clear_scope_note {
+            None
+        } else {
+            patch.scope_note.or(current.scope_note)
+        },
+        clear_scope_note: patch.clear_scope_note,
     };
     upsert_goal_internal(ctx, next)?;
     log_event(ctx, None, "goal.updated", goal_key, None);
@@ -1356,10 +1633,72 @@ pub fn goal_update(ctx: &ReducerContext, goal_key: String, patch: GoalPatch) -> 
 }
 
 #[spacetimedb::reducer]
-pub fn goal_remove(ctx: &ReducerContext, goal_key: String, delete: bool, cascade: bool) -> Result<(), String> {
+pub fn workstream_set(ctx: &ReducerContext, input: WorkstreamInput) -> Result<(), String> {
+    let goal_key = input.goal_key.clone();
+    let ws_id = input.ws_id.clone();
+    upsert_workstream_internal(ctx, input)?;
+    log_event(
+        ctx,
+        None,
+        "workstream.set",
+        format!("{goal_key}::{ws_id}"),
+        Some(format!(
+            "{{\"goal_key\":\"{goal_key}\",\"ws_id\":\"{ws_id}\"}}"
+        )),
+    );
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn goal_tick(ctx: &ReducerContext, goal_key: String) -> Result<(), String> {
+    let mut goal = require_goal(ctx, &goal_key)?;
+    goal.tick = goal.tick.saturating_add(1);
+    goal.updated_at = now(ctx);
+    ctx.db.goals().goal_key().update(goal);
+    log_event(ctx, None, "goal.tick", goal_key, None);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn workstream_remove(
+    ctx: &ReducerContext,
+    goal_key: String,
+    ws_id: String,
+    delete: bool,
+) -> Result<(), String> {
+    require_goal(ctx, &goal_key)?;
+    let ws_uid = format!("{goal_key}::{ws_id}");
+    let Some(current) = ctx.db.workstreams().ws_uid().find(&ws_uid) else {
+        return Err(format!("unknown workstream: {ws_uid}"));
+    };
+    if delete {
+        let _ = ctx.db.workstreams().ws_uid().delete(&ws_uid);
+        log_event(ctx, None, "workstream.deleted", ws_uid, None);
+    } else {
+        let mut updated = current;
+        updated.status = "cancelled".to_string();
+        updated.updated_at = now(ctx);
+        ctx.db.workstreams().ws_uid().update(updated);
+        log_event(ctx, None, "workstream.cancelled", ws_uid, None);
+    }
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn goal_remove(
+    ctx: &ReducerContext,
+    goal_key: String,
+    delete: bool,
+    cascade: bool,
+) -> Result<(), String> {
     require_goal(ctx, &goal_key)?;
     if delete {
-        let children: Vec<_> = ctx.db.sub_goals().iter().filter(|row| row.goal_key == goal_key).collect();
+        let children: Vec<_> = ctx
+            .db
+            .sub_goals()
+            .iter()
+            .filter(|row| row.goal_key == goal_key)
+            .collect();
         if !children.is_empty() && !cascade {
             return Err(format!(
                 "goal {goal_key} still has {} sub-goal(s); use --cascade or cancel instead",
@@ -1367,7 +1706,19 @@ pub fn goal_remove(ctx: &ReducerContext, goal_key: String, delete: bool, cascade
             ));
         }
         for child in children {
-            let _ = ctx.db.sub_goals().sub_goal_key().delete(&child.sub_goal_key);
+            let _ = ctx
+                .db
+                .sub_goals()
+                .sub_goal_key()
+                .delete(&child.sub_goal_key);
+        }
+        for workstream in ctx
+            .db
+            .workstreams()
+            .iter()
+            .filter(|row| row.goal_key == goal_key)
+        {
+            let _ = ctx.db.workstreams().ws_uid().delete(&workstream.ws_uid);
         }
         for agent in ctx
             .db
@@ -1401,15 +1752,34 @@ pub fn goal_remove(ctx: &ReducerContext, goal_key: String, delete: bool, cascade
                 success_fact_key: None,
                 metadata_json: None,
                 completion_report: None,
+                tick: None,
+                scope_note: None,
                 clear_depends: false,
                 clear_success_fact: false,
+                clear_scope_note: false,
             },
         )?;
-        for sub_goal in ctx.db.sub_goals().iter().filter(|row| row.goal_key == goal_key && row.status != "done") {
+        for sub_goal in ctx
+            .db
+            .sub_goals()
+            .iter()
+            .filter(|row| row.goal_key == goal_key && row.status != "done")
+        {
             let mut updated = sub_goal;
             updated.status = "cancelled".to_string();
             updated.updated_at = now(ctx);
             ctx.db.sub_goals().sub_goal_key().update(updated);
+        }
+        for workstream in ctx
+            .db
+            .workstreams()
+            .iter()
+            .filter(|row| row.goal_key == goal_key && row.status != "done")
+        {
+            let mut updated = workstream;
+            updated.status = "cancelled".to_string();
+            updated.updated_at = now(ctx);
+            ctx.db.workstreams().ws_uid().update(updated);
         }
         for agent in ctx
             .db
@@ -1437,9 +1807,16 @@ pub fn sub_goal_add(ctx: &ReducerContext, input: SubGoalInput) -> Result<(), Str
 }
 
 #[spacetimedb::reducer]
-pub fn sub_goal_update(ctx: &ReducerContext, sub_goal_key: String, patch: SubGoalPatch) -> Result<(), String> {
+pub fn sub_goal_update(
+    ctx: &ReducerContext,
+    sub_goal_key: String,
+    patch: SubGoalPatch,
+) -> Result<(), String> {
     let current = require_sub_goal(ctx, &sub_goal_key)?;
-    let owner = patch.owner_agent.clone().unwrap_or_else(|| current.owner_agent.clone());
+    let owner = patch
+        .owner_agent
+        .clone()
+        .unwrap_or_else(|| current.owner_agent.clone());
     let next = SubGoalInput {
         sub_goal_key: sub_goal_key.clone(),
         goal_key: patch.goal_key.unwrap_or(current.goal_key),
@@ -1451,7 +1828,9 @@ pub fn sub_goal_update(ctx: &ReducerContext, sub_goal_key: String, patch: SubGoa
         depends_on_sub_goal_key: if patch.clear_depends {
             None
         } else {
-            patch.depends_on_sub_goal_key.or(current.depends_on_sub_goal_key)
+            patch
+                .depends_on_sub_goal_key
+                .or(current.depends_on_sub_goal_key)
         },
         success_fact_key: if patch.clear_success_fact {
             None
@@ -1482,7 +1861,11 @@ pub fn sub_goal_update(ctx: &ReducerContext, sub_goal_key: String, patch: SubGoa
 }
 
 #[spacetimedb::reducer]
-pub fn sub_goal_remove(ctx: &ReducerContext, sub_goal_key: String, delete: bool) -> Result<(), String> {
+pub fn sub_goal_remove(
+    ctx: &ReducerContext,
+    sub_goal_key: String,
+    delete: bool,
+) -> Result<(), String> {
     let current = require_sub_goal(ctx, &sub_goal_key)?;
     if delete {
         for agent in ctx
@@ -1496,7 +1879,13 @@ pub fn sub_goal_remove(ctx: &ReducerContext, sub_goal_key: String, delete: bool)
             ctx.db.agents().name().update(updated);
         }
         let _ = ctx.db.sub_goals().sub_goal_key().delete(&sub_goal_key);
-        log_event(ctx, Some(current.owner_agent), "sub_goal.deleted", sub_goal_key, None);
+        log_event(
+            ctx,
+            Some(current.owner_agent),
+            "sub_goal.deleted",
+            sub_goal_key,
+            None,
+        );
     } else {
         let mut updated = current.clone();
         updated.status = "cancelled".to_string();
@@ -1512,7 +1901,13 @@ pub fn sub_goal_remove(ctx: &ReducerContext, sub_goal_key: String, delete: bool)
             updated.current_sub_goal_key = None;
             ctx.db.agents().name().update(updated);
         }
-        log_event(ctx, Some(current.owner_agent), "sub_goal.cancelled", sub_goal_key, None);
+        log_event(
+            ctx,
+            Some(current.owner_agent),
+            "sub_goal.cancelled",
+            sub_goal_key,
+            None,
+        );
     }
     Ok(())
 }
@@ -1533,7 +1928,11 @@ pub fn path_add(ctx: &ReducerContext, input: PathInput) -> Result<(), String> {
 }
 
 #[spacetimedb::reducer]
-pub fn path_update(ctx: &ReducerContext, path_name: String, patch: PathPatch) -> Result<(), String> {
+pub fn path_update(
+    ctx: &ReducerContext,
+    path_name: String,
+    patch: PathPatch,
+) -> Result<(), String> {
     let current = require_path(ctx, &path_name)?;
     let next_goal_key = patch.goal_key.unwrap_or(current.goal_key);
     let next_sub_goal_key = if patch.clear_sub_goal {
@@ -1713,7 +2112,11 @@ pub fn internal_auth_session_upsert(ctx: &ReducerContext, input: InternalAuthSes
 
 #[spacetimedb::reducer]
 pub fn internal_auth_session_remove(ctx: &ReducerContext, token_hash: String) {
-    let _ = ctx.db.internal_auth_sessions().token_hash().delete(&token_hash);
+    let _ = ctx
+        .db
+        .internal_auth_sessions()
+        .token_hash()
+        .delete(&token_hash);
 }
 
 #[spacetimedb::reducer]
@@ -1733,7 +2136,13 @@ pub fn observation_add(
         content_hash,
         created_at: now(ctx),
     });
-    log_event(ctx, Some(agent_name), "observation.recorded", "stored observation".to_string(), None);
+    log_event(
+        ctx,
+        Some(agent_name),
+        "observation.recorded",
+        "stored observation".to_string(),
+        None,
+    );
     Ok(())
 }
 
@@ -1747,7 +2156,13 @@ pub fn episode_add(ctx: &ReducerContext, input: EpisodeInput) {
         actions_taken_json: input.actions_taken_json,
         goal_progress_json: input.goal_progress_json,
     });
-    log_event(ctx, None, "episode.recorded", "cycle episode logged".to_string(), None);
+    log_event(
+        ctx,
+        None,
+        "episode.recorded",
+        "cycle episode logged".to_string(),
+        None,
+    );
 }
 
 /// Upsert a briefing. Preserves created_at; refreshes updated_at; a fresh set marks it
@@ -1825,7 +2240,11 @@ pub fn briefing_archive(ctx: &ReducerContext, name: String, archived: bool) -> R
     log_event(
         ctx,
         None,
-        if archived { "briefing.archived" } else { "briefing.restored" },
+        if archived {
+            "briefing.archived"
+        } else {
+            "briefing.restored"
+        },
         name,
         None,
     );
@@ -1896,7 +2315,11 @@ pub fn artifact_upsert(ctx: &ReducerContext, input: ArtifactInput) {
     log_event(
         ctx,
         None,
-        if is_new { "artifact.new" } else { "artifact.modified" },
+        if is_new {
+            "artifact.new"
+        } else {
+            "artifact.modified"
+        },
         row.path,
         None,
     );
@@ -1907,12 +2330,23 @@ pub fn action_queue(ctx: &ReducerContext, input: ActionInput) -> Result<(), Stri
     if let Some(agent_name) = input.agent_name.as_ref() {
         require_agent(ctx, agent_name)?;
     }
-    queue_action_internal(ctx, input.agent_name, input.action_type, input.payload_json, input.reason);
+    queue_action_internal(
+        ctx,
+        input.agent_name,
+        input.action_type,
+        input.payload_json,
+        input.reason,
+    );
     Ok(())
 }
 
 #[spacetimedb::reducer]
-pub fn action_complete(ctx: &ReducerContext, action_id: u64, status: String, result_text: Option<String>) -> Result<(), String> {
+pub fn action_complete(
+    ctx: &ReducerContext,
+    action_id: u64,
+    status: String,
+    result_text: Option<String>,
+) -> Result<(), String> {
     let mut action = ctx
         .db
         .actions()
@@ -1967,7 +2401,9 @@ pub fn agent_poll_record(ctx: &ReducerContext, input: AgentPollInput) -> Result<
         Some(input.agent_name),
         "agent.polled",
         format!("status={}", input.status),
-        input.last_capture_preview.map(|preview| format!("{{\"preview\":{}}}", serde_json_escape(&preview))),
+        input
+            .last_capture_preview
+            .map(|preview| format!("{{\"preview\":{}}}", serde_json_escape(&preview))),
     );
     Ok(())
 }
@@ -1996,7 +2432,13 @@ pub fn resolve_goal_states(ctx: &ReducerContext) {
             updated.status = new_status.clone();
             updated.updated_at = now(ctx);
             ctx.db.goals().goal_key().update(updated.clone());
-            log_event(ctx, None, "goal.resolved", updated.goal_key, Some(format!("{{\"status\":\"{new_status}\"}}")));
+            log_event(
+                ctx,
+                None,
+                "goal.resolved",
+                updated.goal_key,
+                Some(format!("{{\"status\":\"{new_status}\"}}")),
+            );
         }
     }
 }
@@ -2011,7 +2453,10 @@ pub fn resolve_sub_goal_states(ctx: &ReducerContext) {
         let parent_goal = ctx.db.goals().goal_key().find(&sub_goal.goal_key);
         let new_status = if fact_is_true(ctx, &sub_goal.success_fact_key) {
             "done".to_string()
-        } else if !matches!(parent_goal.as_ref().map(|row| row.status.as_str()), Some("active" | "pending")) {
+        } else if !matches!(
+            parent_goal.as_ref().map(|row| row.status.as_str()),
+            Some("active" | "pending")
+        ) {
             "blocked".to_string()
         } else if let Some(dep_key) = sub_goal.depends_on_sub_goal_key.as_ref() {
             let dep = ctx.db.sub_goals().sub_goal_key().find(dep_key);
@@ -2027,13 +2472,27 @@ pub fn resolve_sub_goal_states(ctx: &ReducerContext) {
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .all(|dep_key| {
-                    let goal_done = ctx.db.goals().goal_key().find(&dep_key.to_string())
-                        .map(|g| g.status == "done").unwrap_or(false);
-                    let sub_goal_done = ctx.db.sub_goals().sub_goal_key().find(&dep_key.to_string())
-                        .map(|sg| sg.status == "done").unwrap_or(false);
+                    let goal_done = ctx
+                        .db
+                        .goals()
+                        .goal_key()
+                        .find(&dep_key.to_string())
+                        .map(|g| g.status == "done")
+                        .unwrap_or(false);
+                    let sub_goal_done = ctx
+                        .db
+                        .sub_goals()
+                        .sub_goal_key()
+                        .find(&dep_key.to_string())
+                        .map(|sg| sg.status == "done")
+                        .unwrap_or(false);
                     goal_done || sub_goal_done
                 });
-            if all_done { "pending".to_string() } else { "blocked".to_string() }
+            if all_done {
+                "pending".to_string()
+            } else {
+                "blocked".to_string()
+            }
         } else {
             "pending".to_string()
         };
@@ -2044,7 +2503,13 @@ pub fn resolve_sub_goal_states(ctx: &ReducerContext) {
             let owner = updated.owner_agent.clone();
             let key = updated.sub_goal_key.clone();
             ctx.db.sub_goals().sub_goal_key().update(updated);
-            log_event(ctx, Some(owner), "sub_goal.resolved", key, Some(format!("{{\"status\":\"{new_status}\"}}")));
+            log_event(
+                ctx,
+                Some(owner),
+                "sub_goal.resolved",
+                key,
+                Some(format!("{{\"status\":\"{new_status}\"}}")),
+            );
         }
     }
 }
@@ -2070,15 +2535,16 @@ pub fn resolve_active_sub_goals(ctx: &ReducerContext) {
                     .map(|goal| (goal.priority, sg.priority, sg))
             })
             .collect();
-        candidates.sort_by(|a, b| (a.0, a.1, a.2.sub_goal_key.as_str()).cmp(&(b.0, b.1, b.2.sub_goal_key.as_str())));
+        candidates.sort_by(|a, b| {
+            (a.0, a.1, a.2.sub_goal_key.as_str()).cmp(&(b.0, b.1, b.2.sub_goal_key.as_str()))
+        });
 
         if let Some((_, _, selected)) = candidates.into_iter().next() {
-            for active in ctx
-                .db
-                .sub_goals()
-                .iter()
-                .filter(|row| row.owner_agent == agent.name && row.status == "active" && row.sub_goal_key != selected.sub_goal_key)
-            {
+            for active in ctx.db.sub_goals().iter().filter(|row| {
+                row.owner_agent == agent.name
+                    && row.status == "active"
+                    && row.sub_goal_key != selected.sub_goal_key
+            }) {
                 let mut updated = active;
                 updated.status = "pending".to_string();
                 updated.updated_at = now(ctx);
@@ -2087,7 +2553,10 @@ pub fn resolve_active_sub_goals(ctx: &ReducerContext) {
             let mut selected_row = selected.clone();
             selected_row.status = "active".to_string();
             selected_row.updated_at = now(ctx);
-            ctx.db.sub_goals().sub_goal_key().update(selected_row.clone());
+            ctx.db
+                .sub_goals()
+                .sub_goal_key()
+                .update(selected_row.clone());
 
             let mut updated_agent = agent.clone();
             updated_agent.current_goal_key = Some(selected.goal_key.clone());
@@ -2122,7 +2591,8 @@ pub fn decide_actions_for_domain(ctx: &ReducerContext, domain: String) {
         .agents()
         .iter()
         .filter(|a| {
-            a.metadata_json.contains(&format!("\"domain\":\"{}\"", domain))
+            a.metadata_json
+                .contains(&format!("\"domain\":\"{}\"", domain))
         })
         .collect();
     for agent in agents {
@@ -2166,7 +2636,11 @@ pub fn decide_actions_for_domain(ctx: &ReducerContext, domain: String) {
 }
 
 #[spacetimedb::reducer]
-pub fn agent_update_pane_id(ctx: &ReducerContext, agent_name: String, biome_pane_id: String) -> Result<(), String> {
+pub fn agent_update_pane_id(
+    ctx: &ReducerContext,
+    agent_name: String,
+    biome_pane_id: String,
+) -> Result<(), String> {
     let mut agent = require_agent(ctx, &agent_name)?;
     agent.biome_pane_id = Some(biome_pane_id.clone());
     agent.idle_since = None;
@@ -2182,7 +2656,11 @@ pub fn agent_update_pane_id(ctx: &ReducerContext, agent_name: String, biome_pane
 }
 
 #[spacetimedb::reducer]
-pub fn agent_update_description(ctx: &ReducerContext, agent_name: String, description: String) -> Result<(), String> {
+pub fn agent_update_description(
+    ctx: &ReducerContext,
+    agent_name: String,
+    description: String,
+) -> Result<(), String> {
     let mut agent = require_agent(ctx, &agent_name)?;
     agent.rolling_description = Some(description);
     ctx.db.agents().name().update(agent);
@@ -2207,14 +2685,23 @@ pub fn service_add(ctx: &ReducerContext, input: ServiceInput) {
         service_type: input.service_type,
         host: input.host.unwrap_or_else(|| "localhost".to_string()),
         check_target: input.check_target,
-        status: existing.as_ref().map(|r| r.status.clone()).unwrap_or_else(|| "unknown".to_string()),
+        status: existing
+            .as_ref()
+            .map(|r| r.status.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
         last_checked_at: existing.as_ref().and_then(|r| r.last_checked_at.clone()),
         last_healthy_at: existing.as_ref().and_then(|r| r.last_healthy_at.clone()),
-        consecutive_failures: existing.as_ref().map(|r| r.consecutive_failures).unwrap_or(0),
+        consecutive_failures: existing
+            .as_ref()
+            .map(|r| r.consecutive_failures)
+            .unwrap_or(0),
         restart_policy: input.restart_policy.unwrap_or_else(|| "manual".to_string()),
         restart_command: opt_text(input.restart_command),
         metadata_json: json_or_empty(input.metadata_json),
-        created_at: existing.as_ref().map(|r| r.created_at.clone()).unwrap_or_else(|| timestamp.clone()),
+        created_at: existing
+            .as_ref()
+            .map(|r| r.created_at.clone())
+            .unwrap_or_else(|| timestamp.clone()),
         updated_at: timestamp,
     };
     let _ = ctx.db.services().name().delete(&row.name);
@@ -2223,7 +2710,11 @@ pub fn service_add(ctx: &ReducerContext, input: ServiceInput) {
 }
 
 #[spacetimedb::reducer]
-pub fn service_update(ctx: &ReducerContext, name: String, patch: ServicePatch) -> Result<(), String> {
+pub fn service_update(
+    ctx: &ReducerContext,
+    name: String,
+    patch: ServicePatch,
+) -> Result<(), String> {
     let current = require_service(ctx, &name)?;
     let timestamp = now(ctx);
     let updated = Service {
@@ -2236,7 +2727,11 @@ pub fn service_update(ctx: &ReducerContext, name: String, patch: ServicePatch) -
         last_healthy_at: current.last_healthy_at,
         consecutive_failures: current.consecutive_failures,
         restart_policy: patch.restart_policy.unwrap_or(current.restart_policy),
-        restart_command: if patch.clear_restart_command { None } else { patch.restart_command.or(current.restart_command) },
+        restart_command: if patch.clear_restart_command {
+            None
+        } else {
+            patch.restart_command.or(current.restart_command)
+        },
         metadata_json: patch.metadata_json.unwrap_or(current.metadata_json),
         created_at: current.created_at,
         updated_at: timestamp,
@@ -2251,7 +2746,12 @@ pub fn service_update(ctx: &ReducerContext, name: String, patch: ServicePatch) -
 pub fn service_remove(ctx: &ReducerContext, name: String, delete: bool) -> Result<(), String> {
     require_service(ctx, &name)?;
     if delete {
-        for record in ctx.db.service_health_records().iter().filter(|r| r.service_name == name) {
+        for record in ctx
+            .db
+            .service_health_records()
+            .iter()
+            .filter(|r| r.service_name == name)
+        {
             let _ = ctx.db.service_health_records().id().delete(record.id);
         }
         let _ = ctx.db.services().name().delete(&name);
@@ -2267,7 +2767,10 @@ pub fn service_remove(ctx: &ReducerContext, name: String, delete: bool) -> Resul
 }
 
 #[spacetimedb::reducer]
-pub fn service_health_record(ctx: &ReducerContext, input: ServiceHealthInput) -> Result<(), String> {
+pub fn service_health_record(
+    ctx: &ReducerContext,
+    input: ServiceHealthInput,
+) -> Result<(), String> {
     let mut svc = require_service(ctx, &input.service_name)?;
     let timestamp = now(ctx);
 
@@ -2307,7 +2810,10 @@ pub fn service_health_record(ctx: &ReducerContext, input: ServiceHealthInput) ->
             None,
             "restart_service".to_string(),
             payload.to_string(),
-            Some(format!("service {} has {} consecutive failures", svc.name, svc.consecutive_failures)),
+            Some(format!(
+                "service {} has {} consecutive failures",
+                svc.name, svc.consecutive_failures
+            )),
         );
     }
 
@@ -2317,7 +2823,9 @@ pub fn service_health_record(ctx: &ReducerContext, input: ServiceHealthInput) ->
         None,
         "service.health_recorded",
         format!("{}={}", input.service_name, input.status),
-        input.response_time_ms.map(|ms| format!("{{\"response_time_ms\":{ms}}}")),
+        input
+            .response_time_ms
+            .map(|ms| format!("{{\"response_time_ms\":{ms}}}")),
     );
     Ok(())
 }
