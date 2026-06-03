@@ -585,13 +585,16 @@ async fn facts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
          <th class=\"pr-3 py-1\">when</th><th class=\"pr-3\">key</th><th>value</th></tr></thead><tbody>",
     );
     for f in &facts {
+        // app.py binds created_at/fact_value; the live harness schema exposes
+        // updated_at/value_json. Keep app.py's field first, fall back to the
+        // current column so the when/value columns show real data either way.
         body.push_str(&format!(
             "<tr><td class=\"pr-3 align-top text-xs text-zinc-500\">{}</td>\
              <td class=\"pr-3 align-top\">{}</td>\
              <td class=\"align-top text-zinc-300\">{}</td></tr>",
-            html_escape(&truncate_chars(&value_display(f.get("created_at")), 19)),
+            html_escape(&truncate_chars(&first_field(f, &["created_at", "updated_at"]), 19)),
             html_escape(&value_display(f.get("fact_key"))),
-            html_escape(&value_display(f.get("fact_value"))),
+            html_escape(&first_field(f, &["fact_value", "value_json"])),
         ));
     }
     body.push_str("</tbody></table>");
@@ -1398,6 +1401,17 @@ fn value_display_or(value: Option<&Value>, default: &str) -> String {
 /// Truncate to `n` Unicode scalar values (matches Python `s[:n]` closely enough for display).
 fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+/// First non-empty displayed value among `keys` (tolerates schema field renames).
+fn first_field(obj: &Value, keys: &[&str]) -> String {
+    for k in keys {
+        let v = value_display(obj.get(k));
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    String::new()
 }
 
 /// Format a unix mtime to local "%Y-%m-%d %H:%M" (matches Flask `datetime.fromtimestamp(...).strftime`).
