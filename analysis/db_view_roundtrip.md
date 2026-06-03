@@ -55,3 +55,26 @@ Goals/anchors:
 `analysis/paths_from_db.sh` proves the available DB read surfaces can reconstruct the rows that are actually in the DB, including the required path fields. It does not prove DB-as-source for the full portfolio yet because the central DB is missing 9 canonical paths, has one stale path status, and lacks the `harness_db_first_coherence` goal anchor.
 
 Fact `harness_db_view_roundtrip_proven` was not set.
+
+## Re-sync (dbsync c863)
+
+Date: 2026-06-03
+
+Commands run:
+
+```sh
+./analysis/paths_to_db.sh
+./analysis/paths_to_db.sh
+./analysis/paths_from_db.sh > /tmp/paths_rt.json
+/home/sdancer/orchestrator/harness path-list --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)))"
+```
+
+Result: clean for the canonical path set.
+
+- First sync exited 0: canonical source had 5 goals / 28 paths; goals added `0`; anchors updated `1`; paths added `10`; paths updated `2`; paths unchanged `16`.
+- Second sync exited 0 and was idempotent: goals added `0`; anchors updated `0`; paths added `0`; paths updated `0`; paths unchanged `28`.
+- The requested `path-list` count command printed `28`. The earlier 27-path figure is stale; `/home/sdancer/orchestrator/analysis/paths.json` now contains 28 paths.
+- `paths_from_db` read-back has 28 paths under the 5 canonical goals.
+- Goal set caveat: additive-only sync leaves the pre-existing DB-only goal `albion_gamedata_corpus` in place, with no paths.
+- Path set comparison under canonical goals is clean: no missing paths, no DB-only paths, and no mismatches on `hypothesis`, `falsification`, or `status`.
+- Remaining goal-field caveat: `albion_tutorial_bot` has DB goal status `active`; canonical `paths.json` has no top-level status for that goal, only status notes.
