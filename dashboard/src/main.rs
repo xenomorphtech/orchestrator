@@ -476,8 +476,31 @@ async fn agents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !is_authed(&headers, &state) {
         return Redirect::to("/login").into_response();
     }
-    let rows = state.data.harness_table(&["agents"]);
-    render_page("agents", &format!("<pre>{rows:#?}</pre>"), 0).into_response()
+    let agents = rows_to_values(state.data.harness_table(&["agents"]));
+    let mut body = String::from("<h1 class=\"text-2xl mb-4\">Agents</h1>");
+    if agents.is_empty() {
+        body.push_str("<div class=\"text-zinc-500\">(no agents registered)</div>");
+    } else {
+        body.push_str(
+            "<table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+             <th class=\"pr-3 py-1\">name</th><th class=\"pr-3\">kind</th><th class=\"pr-3\">workdir</th>\
+             <th>description</th></tr></thead><tbody>",
+        );
+        for ag in &agents {
+            body.push_str(&format!(
+                "<tr><td class=\"pr-3 align-top\">{}</td>\
+                 <td class=\"pr-3 align-top text-xs text-zinc-500\">{}</td>\
+                 <td class=\"pr-3 align-top text-xs\">{}</td>\
+                 <td class=\"align-top\">{}</td></tr>",
+                html_escape(&value_display(ag.get("agent_name"))),
+                html_escape(&value_display(ag.get("kind"))),
+                html_escape(&value_display(ag.get("workdir"))),
+                html_escape(&value_display(ag.get("description"))),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+    render_page("agents", &body, 0).into_response()
 }
 
 async fn facts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
