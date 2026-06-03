@@ -1382,12 +1382,12 @@ fn read_md_file(dir: &FsPath, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
-fn goal_tree_data(state: &AppState, goal_key: &str) -> Result<Value> {
-    let output = std::process::Command::new(&state.cfg.harness_path)
+fn goal_tree_data(_state: &AppState, goal_key: &str) -> Result<Value> {
+    let output = std::process::Command::new("/home/sdanced/orchestrator/harness")
         .arg("--server")
-        .arg(&state.cfg.harness_server)
+        .arg("http://127.0.0.1:3001")
         .arg("--database")
-        .arg(&state.cfg.harness_database)
+        .arg("orchestrator-box")
         .arg("goal-tree")
         .arg(goal_key)
         .arg("--json")
