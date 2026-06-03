@@ -133,7 +133,43 @@ async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
 }
 
 async fn cycles(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "cycles", "/cycles")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let episodes = latest_episodes(&state, 200);
+    let mut body = format!(
+        "<h1 class=\"text-2xl mb-4\">Cycles <span class=\"text-sm text-zinc-500\">(latest {})</span></h1>",
+        episodes.len()
+    );
+    if episodes.is_empty() {
+        body.push_str("<p class=\"text-zinc-500\">No cycles recorded yet.</p>");
+    } else {
+        body.push_str(
+            "<div class=\"overflow-x-auto rounded border border-zinc-800\"><table class=\"min-w-full text-left text-xs\">\
+             <thead class=\"bg-zinc-900 text-zinc-400\"><tr>\
+             <th class=\"px-3 py-2\">id</th><th class=\"px-3 py-2\">when</th><th class=\"px-3 py-2\">summary</th>\
+             <th class=\"px-3 py-2\">frontier</th><th class=\"px-3 py-2\">stall</th></tr></thead><tbody>",
+        );
+        for episode in &episodes {
+            let progress = episode.get("goal_progress_json");
+            let frontier = progress.and_then(|v| v.get("frontier"));
+            body.push_str(&format!(
+                "<tr class=\"border-t border-zinc-800 align-top\">\
+                 <td class=\"px-3 py-2 text-zinc-500\">{}</td>\
+                 <td class=\"px-3 py-2 text-zinc-400 whitespace-nowrap\">{}</td>\
+                 <td class=\"px-3 py-2 text-zinc-100\">{}</td>\
+                 <td class=\"px-3 py-2 text-zinc-300\">{}</td>\
+                 <td class=\"px-3 py-2 text-zinc-300\">{}</td></tr>",
+                html_escape(&value_display(episode.get("id"))),
+                html_escape(&value_display(episode.get("created_at"))),
+                html_escape(&value_display(episode.get("summary"))),
+                html_escape(&value_display(frontier.and_then(|v| v.get("id")))),
+                html_escape(&value_display(frontier.and_then(|v| v.get("stall")))),
+            ));
+        }
+        body.push_str("</tbody></table></div>");
+    }
+    render_page("cycles", &body, 30).into_response()
 }
 
 async fn cycle_detail(
@@ -613,6 +649,16 @@ fn value_i64(value: Option<&Value>) -> Option<i64> {
             .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     })
+}
+
+fn value_display(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
 }
 
 fn parse_json_field(row: &mut std::collections::HashMap<String, Value>, key: &str) {
