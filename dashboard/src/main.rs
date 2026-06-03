@@ -11,7 +11,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::{Form, Router};
+use axum::{Form, Json, Router};
 use chrono::Local;
 use config::DashboardConfig;
 use data::DataClient;
@@ -89,6 +89,9 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/briefings", get(api_briefings))
         .route("/api/adherence", get(api_adherence))
         .route("/api/progress", get(api_progress))
+        .route("/api/goaltree/{goal_key}", get(api_goaltree))
+        .route("/api/goaltree/{goal_key}/ws/{ws_id}", post(api_goaltree_ws))
+        .route("/api/goaltree/{goal_key}/tick", post(api_goaltree_tick))
         .with_state(state)
 }
 
@@ -428,30 +431,18 @@ async fn goaltree(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     if !is_authed(&headers, &state) {
         return Redirect::to("/login").into_response();
     }
-    let path = goal_tree_path();
     let mut body = String::from("<h1 class=\"text-2xl mb-4\">Goal Tree</h1>");
-    let tree = match fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
-            Ok(value) => value,
-            Err(err) => {
-                body.push_str(&format!(
-                    "<div class=\"rounded border border-red-900/60 bg-red-950/60 p-3 text-red-200\">Could not parse {}: {}</div>",
-                    html_escape(&path.display().to_string()),
-                    html_escape(&err.to_string())
-                ));
-                return render_page("goaltree", &body, 0).into_response();
-            }
-        },
+    let tree = match goal_tree_data(&state, "albion_bot") {
+        Ok(tree) => tree,
         Err(err) => {
             body.push_str(&format!(
-                "<div class=\"rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400\">Goal tree file is absent or unreadable: <span class=\"text-zinc-200\">{}</span><br><span class=\"text-xs\">{}</span></div>",
-                html_escape(&path.display().to_string()),
+                "<div class=\"rounded border border-zinc-800 bg-zinc-900 p-3 text-zinc-400\">Goal tree is absent or unreadable from the DB.<br><span class=\"text-xs\">{}</span></div>",
                 html_escape(&err.to_string())
             ));
             return render_page("goaltree", &body, 0).into_response();
         }
     };
-    body.push_str(&render_goal_tree(&tree, &path.display().to_string()));
+    body.push_str(&render_goal_tree(&tree, "harness DB"));
     render_page("goaltree", &body, 0).into_response()
 }
 
@@ -931,6 +922,19 @@ struct SinceQuery {
     n: Option<i64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct WorkstreamPatch {
+    status: Option<String>,
+    stall: Option<u32>,
+    blocker: Option<String>,
+    next_substep: Option<String>,
+    title: Option<String>,
+    metric: Option<String>,
+    done_when: Option<String>,
+    worker: Option<String>,
+    falsification: Option<String>,
+}
+
 async fn talk_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1167,6 +1171,75 @@ async fn api_progress(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     api_authed_json(&headers, &state, || progress_data(&state))
 }
 
+async fn api_goaltree(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(goal_key): Path<String>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return api_unauthorized();
+    }
+    match goal_tree_data(&state, &goal_key) {
+        Ok(tree) => axum::Json(tree).into_response(),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_goaltree_ws(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((goal_key, ws_id)): Path<(String, String)>,
+    Json(patch): Json<WorkstreamPatch>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return api_unauthorized();
+    }
+    match upsert_workstream(&state, &goal_key, &ws_id, patch) {
+        Ok(()) => match goal_tree_data(&state, &goal_key) {
+            Ok(tree) => axum::Json(tree).into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": err.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_goaltree_tick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(goal_key): Path<String>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return api_unauthorized();
+    }
+    match increment_goal_tick(&state, &goal_key) {
+        Ok(()) => match goal_tree_data(&state, &goal_key) {
+            Ok(tree) => axum::Json(tree).into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": err.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 fn api_authed_json<F>(headers: &HeaderMap, state: &AppState, build: F) -> Response
 where
     F: FnOnce() -> Value,
@@ -1309,12 +1382,215 @@ fn read_md_file(dir: &FsPath, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
-fn goal_tree_path() -> std::path::PathBuf {
-    std::env::var_os("GOAL_TREE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from("/home/sdanced/clientless/analysis/goal_tree.json")
+fn goal_tree_data(state: &AppState, goal_key: &str) -> Result<Value> {
+    let goal = fetch_goal_row(state, goal_key)
+        .ok_or_else(|| anyhow::anyhow!("goal `{goal_key}` not found in harness DB"))?;
+    let subgoals = fetch_subgoal_rows(state, goal_key);
+    let paths = fetch_path_rows(state, goal_key);
+    let facts = fetch_goal_facts(state, goal_key);
+    let goal_meta = parse_embedded_json(goal.get("metadata_json"));
+    let goal_obj = json!({
+        "key": value_display_or(goal.get("goal_key"), goal_key),
+        "title": value_display(goal.get("title")),
+        "metric": first_nonempty(&[
+            value_display(goal.get("metric")),
+            value_display(goal_meta.get("metric")),
+        ]),
+        "scope_note": first_nonempty(&[
+            value_display(goal.get("scope_note")),
+            value_display(goal_meta.get("scope_note")),
+            value_display(goal.get("detail")),
+        ]),
+        "tick": first_value(&[
+            goal.get("tick"),
+            goal_meta.get("tick"),
+        ]),
+        "status": value_display(goal.get("status")),
+        "priority": goal.get("priority").cloned().unwrap_or(Value::Null),
+        "updated_at": value_display(goal.get("updated_at")),
+    });
+    let mut workstreams = assemble_workstreams(&subgoals, &paths);
+    workstreams.sort_by(|a, b| {
+        value_i64(a.get("order"))
+            .unwrap_or(9999)
+            .cmp(&value_i64(b.get("order")).unwrap_or(9999))
+            .then_with(|| value_display(a.get("id")).cmp(&value_display(b.get("id"))))
+    });
+    Ok(json!({"goal": goal_obj, "workstreams": workstreams, "facts": facts}))
+}
+
+fn fetch_goal_row(state: &AppState, goal_key: &str) -> Option<Value> {
+    let query = format!(
+        "SELECT goal_key, title, detail, status, priority, success_fact_key, metadata_json, completion_report, created_at, updated_at FROM goals WHERE goal_key = '{}'",
+        sql_escape(goal_key)
+    );
+    state
+        .data
+        .sql_query(&query)
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|row| Value::Object(row.into_iter().collect()))
+        .or_else(|| {
+            goals_data(state)
+                .into_iter()
+                .find(|goal| value_display(goal.get("goal_key")) == goal_key)
         })
+}
+
+fn fetch_subgoal_rows(state: &AppState, goal_key: &str) -> Vec<Value> {
+    let query = format!(
+        "SELECT sub_goal_key, goal_key, owner_agent, title, detail, status, priority, instruction_text, stuck_guidance_text, metadata_json, completion_report, created_at, updated_at FROM sub_goals WHERE goal_key = '{}'",
+        sql_escape(goal_key)
+    );
+    state
+        .data
+        .sql_query(&query)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| Value::Object(row.into_iter().collect()))
+                .collect()
+        })
+        .unwrap_or_else(|_| {
+            rows_to_values(state.data.harness_table(&["sub-goals"]))
+                .into_iter()
+                .filter(|row| value_display(row.get("goal_key")) == goal_key)
+                .collect()
+        })
+}
+
+fn fetch_path_rows(state: &AppState, goal_key: &str) -> Vec<Value> {
+    let query = format!(
+        "SELECT path_name, goal_key, sub_goal_key, worker, worktree, hypothesis, falsification, status, stall_counter, notes, metadata_json, created_at, updated_at FROM paths WHERE goal_key = '{}'",
+        sql_escape(goal_key)
+    );
+    state
+        .data
+        .sql_query(&query)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| Value::Object(row.into_iter().collect()))
+                .collect()
+        })
+        .unwrap_or_else(|_| {
+            let text = state
+                .data
+                .harness_stdout(&["path-list", "--goal", goal_key, "--json"]);
+            serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+        })
+}
+
+fn fetch_goal_facts(state: &AppState, goal_key: &str) -> Vec<Value> {
+    let rows = state
+        .data
+        .sql_query(
+            "SELECT fact_key, value_json, confidence, source_type, source_ref, metadata_json FROM facts",
+        )
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| Value::Object(row.into_iter().collect()))
+                .collect()
+        })
+        .unwrap_or_else(|_| facts_data(state, 500));
+    rows.into_iter()
+        .filter(|fact| {
+            value_display(fact.get("fact_key")).contains(goal_key)
+                || value_display(fact.get("source_ref")).contains(goal_key)
+                || value_display(fact.get("metadata_json")).contains(goal_key)
+                || parse_embedded_json(fact.get("metadata_json"))
+                    .get("goal_key")
+                    .is_some_and(|v| value_display(Some(v)) == goal_key)
+        })
+        .collect()
+}
+
+fn assemble_workstreams(subgoals: &[Value], paths: &[Value]) -> Vec<Value> {
+    let mut by_subgoal: std::collections::BTreeMap<String, &Value> =
+        std::collections::BTreeMap::new();
+    for path in paths {
+        let key = value_display(path.get("sub_goal_key"));
+        if !key.is_empty() {
+            by_subgoal.entry(key).or_insert(path);
+        }
+    }
+    let mut out = Vec::new();
+    for sub in subgoals {
+        let id = value_display(sub.get("sub_goal_key"));
+        let path = by_subgoal.get(&id).copied();
+        out.push(workstream_from_rows(&id, sub, path));
+    }
+    let known: std::collections::BTreeSet<String> = subgoals
+        .iter()
+        .map(|sub| value_display(sub.get("sub_goal_key")))
+        .collect();
+    for path in paths {
+        let id = value_display(path.get("sub_goal_key"));
+        if id.is_empty() || !known.contains(&id) {
+            let fallback_id = if id.is_empty() {
+                value_display(path.get("path_name"))
+            } else {
+                id
+            };
+            out.push(workstream_from_rows(&fallback_id, &Value::Null, Some(path)));
+        }
+    }
+    out
+}
+
+fn workstream_from_rows(id: &str, sub: &Value, path: Option<&Value>) -> Value {
+    let sub_meta = parse_embedded_json(sub.get("metadata_json"));
+    let path_meta = parse_embedded_json(path.and_then(|p| p.get("metadata_json")));
+    json!({
+        "id": id,
+        "title": first_nonempty(&[
+            value_display(sub.get("title")),
+            path.map(|p| value_display(p.get("path_name"))).unwrap_or_default(),
+            id.to_string(),
+        ]),
+        "status": first_nonempty(&[
+            value_display(sub.get("status")),
+            path.map(|p| value_display(p.get("status"))).unwrap_or_default(),
+            "pending".to_string(),
+        ]),
+        "stall": first_value(&[
+            sub_meta.get("stall"),
+            path.and_then(|p| p.get("stall_counter")),
+            path_meta.get("stall"),
+        ]),
+        "blocker": first_nonempty(&[
+            value_display(sub.get("stuck_guidance_text")),
+            path.map(|p| value_display(p.get("notes"))).unwrap_or_default(),
+        ]),
+        "next_substep": first_nonempty(&[
+            value_display(sub.get("instruction_text")),
+            path.map(|p| value_display(p.get("hypothesis"))).unwrap_or_default(),
+        ]),
+        "metric": first_nonempty(&[
+            value_display(sub_meta.get("metric")),
+            value_display(path_meta.get("metric")),
+        ]),
+        "done_when": first_nonempty(&[
+            path.map(|p| value_display(parse_embedded_json(p.get("metadata_json")).get("done_when"))).unwrap_or_default(),
+            value_display(sub.get("detail")),
+        ]),
+        "falsification": path.map(|p| value_display(p.get("falsification"))).unwrap_or_default(),
+        "worker": first_nonempty(&[
+            value_display(sub.get("owner_agent")),
+            path.map(|p| value_display(p.get("worker"))).unwrap_or_default(),
+        ]),
+        "path_name": path.map(|p| value_display(p.get("path_name"))).unwrap_or_default(),
+        "order": first_value(&[
+            sub_meta.get("order"),
+            path_meta.get("order"),
+            sub.get("priority"),
+        ]),
+        "updated_at": first_nonempty(&[
+            value_display(sub.get("updated_at")),
+            path.map(|p| value_display(p.get("updated_at"))).unwrap_or_default(),
+        ]),
+    })
 }
 
 fn render_goal_tree(tree: &Value, source_path: &str) -> String {
@@ -1379,7 +1655,7 @@ fn render_goal_tree(tree: &Value, source_path: &str) -> String {
     body.push_str("</section>");
 
     if items.is_empty() {
-        body.push_str("<div class=\"text-zinc-500\">(no workstreams in goal_tree.json)</div>");
+        body.push_str("<div class=\"text-zinc-500\">(no workstreams in the harness DB)</div>");
         return body;
     }
 
@@ -1447,6 +1723,230 @@ fn goal_tree_dot_class(status: &str) -> &'static str {
         "cancelled" => "bg-zinc-600",
         _ => "bg-sky-500",
     }
+}
+
+fn upsert_workstream(
+    state: &AppState,
+    goal_key: &str,
+    ws_id: &str,
+    patch: WorkstreamPatch,
+) -> Result<()> {
+    let current_tree = goal_tree_data(state, goal_key)
+        .unwrap_or_else(|_| json!({"goal": {"key": goal_key}, "workstreams": [], "facts": []}));
+    let current = current_tree
+        .get("workstreams")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| value_display(item.get("id")) == ws_id)
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+
+    let title = patch
+        .title
+        .or_else(|| nonempty_string(current.get("title")))
+        .unwrap_or_else(|| ws_id.to_string());
+    let status = patch
+        .status
+        .or_else(|| nonempty_string(current.get("status")))
+        .unwrap_or_else(|| "pending".to_string());
+    let stall = patch
+        .stall
+        .or_else(|| value_i64(current.get("stall")).and_then(|n| u32::try_from(n).ok()))
+        .unwrap_or(0);
+    let blocker = patch
+        .blocker
+        .or_else(|| nonempty_string(current.get("blocker")))
+        .unwrap_or_default();
+    let next_substep = patch
+        .next_substep
+        .or_else(|| nonempty_string(current.get("next_substep")))
+        .unwrap_or_default();
+    let metric = patch
+        .metric
+        .or_else(|| nonempty_string(current.get("metric")))
+        .unwrap_or_default();
+    let done_when = patch
+        .done_when
+        .or_else(|| nonempty_string(current.get("done_when")))
+        .unwrap_or_default();
+    let worker = patch
+        .worker
+        .or_else(|| nonempty_string(current.get("worker")))
+        .unwrap_or_else(|| "lean-loop".to_string());
+    let falsification = patch
+        .falsification
+        .or_else(|| nonempty_string(current.get("falsification")))
+        .unwrap_or_default();
+    let order = value_i64(current.get("order")).unwrap_or(9999);
+    let metadata = serde_json::to_string(&json!({
+        "source": "dashboard-http",
+        "metric": metric,
+        "stall": stall,
+        "order": order,
+    }))?;
+    let sub_status = run_harness_mutation(
+        state,
+        &[
+            "sub-goal-add",
+            ws_id,
+            goal_key,
+            &worker,
+            &title,
+            "--detail",
+            &done_when,
+            "--status",
+            &status,
+            "--priority",
+            &priority_from_order(order),
+            "--instruction-text",
+            &next_substep,
+            "--stuck-guidance-text",
+            &blocker,
+            "--metadata",
+            &metadata,
+        ],
+    );
+    sub_status?;
+    let path_metadata = serde_json::to_string(&json!({
+        "source": "dashboard-http",
+        "metric": metric,
+        "done_when": done_when,
+    }))?;
+    let path_name = first_nonempty(&[
+        nonempty_string(current.get("path_name")).unwrap_or_default(),
+        format!("{ws_id} {title}"),
+    ]);
+    run_harness_mutation(
+        state,
+        &[
+            "path-add",
+            &path_name,
+            "--goal",
+            goal_key,
+            "--sub-goal",
+            ws_id,
+            "--worker",
+            &worker,
+            "--hypothesis",
+            &next_substep,
+            "--falsification",
+            &falsification,
+            "--status",
+            &status,
+            "--stall-counter",
+            &stall.to_string(),
+            "--notes",
+            &blocker,
+            "--metadata",
+            &path_metadata,
+        ],
+    )
+}
+
+fn increment_goal_tick(state: &AppState, goal_key: &str) -> Result<()> {
+    let current = goal_tree_data(state, goal_key)?;
+    let goal = current.get("goal").unwrap_or(&Value::Null);
+    let next_tick = value_i64(goal.get("tick")).unwrap_or(0) + 1;
+    let title = value_display_or(goal.get("title"), goal_key);
+    let status = value_display_or(goal.get("status"), "active");
+    let priority = value_i64(goal.get("priority")).unwrap_or(100).max(1) as u32;
+    let scope_note = value_display(goal.get("scope_note"));
+    let metric = value_display(goal.get("metric"));
+    let metadata = serde_json::to_string(&json!({
+        "source": "dashboard-http",
+        "tick": next_tick,
+        "metric": metric,
+        "scope_note": scope_note,
+    }))?;
+    run_harness_mutation(
+        state,
+        &[
+            "goal-add",
+            goal_key,
+            &title,
+            "--detail",
+            &scope_note,
+            "--status",
+            &status,
+            "--priority",
+            &priority.to_string(),
+            "--metadata",
+            &metadata,
+        ],
+    )
+}
+
+fn run_harness_mutation(state: &AppState, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new(&state.cfg.harness_path)
+        .arg("--server")
+        .arg(&state.cfg.harness_server)
+        .arg("--database")
+        .arg(&state.cfg.harness_database)
+        .args(args)
+        .output()
+        .with_context(|| format!("run harness {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(anyhow::anyhow!(
+        "harness {} failed: {}{}",
+        args.join(" "),
+        stdout,
+        stderr
+    ))
+}
+
+fn priority_from_order(order: i64) -> String {
+    let priority = if order >= 0 && order < 100 {
+        100 - order
+    } else {
+        1
+    };
+    priority.to_string()
+}
+
+fn parse_embedded_json(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::Object(_)) | Some(Value::Array(_)) => value.cloned().unwrap_or(Value::Null),
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+fn first_nonempty(values: &[String]) -> String {
+    values
+        .iter()
+        .find(|value| !value.is_empty() && value.as_str() != "(none)")
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn first_value(values: &[Option<&Value>]) -> Value {
+    values
+        .iter()
+        .flatten()
+        .find(|value| !json_is_empty(value) && value_display(Some(value)).as_str() != "(none)")
+        .cloned()
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn nonempty_string(value: Option<&Value>) -> Option<String> {
+    let rendered = value_display(value);
+    if rendered.is_empty() || rendered == "(none)" {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+fn sql_escape(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn adherence_data(state: &AppState) -> Value {
