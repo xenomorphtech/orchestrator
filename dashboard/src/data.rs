@@ -5,8 +5,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::blocking::Client;
 use serde_json::Value;
+use ureq::Agent;
 
 use crate::config::DashboardConfig;
 
@@ -15,15 +15,16 @@ pub type Row = HashMap<String, String>;
 #[derive(Clone)]
 pub struct DataClient {
     cfg: DashboardConfig,
-    http: Client,
+    http: Agent,
 }
 
 impl DataClient {
     pub fn new(cfg: DashboardConfig) -> Result<Self> {
-        let http = Client::builder()
+        // ureq = pure-sync HTTP (no internal tokio runtime) -> safe to build + call from inside
+        // the axum async runtime (reqwest::blocking panics there: "Cannot drop a runtime...").
+        let http = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(10))
-            .build()
-            .context("build HTTP client")?;
+            .build();
         Ok(Self { cfg, http })
     }
 
@@ -39,16 +40,14 @@ impl DataClient {
     }
 
     pub fn sql_query(&self, query: &str) -> Result<Vec<HashMap<String, Value>>> {
+        // ureq returns Err on non-2xx already (no error_for_status needed).
         let payload: Value = self
             .http
             .post(&self.cfg.sql_url)
-            .header("content-type", "text/plain")
-            .body(query.to_string())
-            .send()
+            .set("content-type", "text/plain")
+            .send_string(query)
             .context("send SQL request")?
-            .error_for_status()
-            .context("SQL HTTP status")?
-            .json()
+            .into_json()
             .context("decode SQL JSON")?;
         Ok(parse_sql_payload(payload))
     }
