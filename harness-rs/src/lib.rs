@@ -1,4 +1,4 @@
-use spacetimedb::{ReducerContext, SpacetimeType, Table};
+use spacetimedb::{ReducerContext, SpacetimeType, Table, Timestamp};
 
 #[cfg(feature = "cli")]
 pub mod codex_app_server;
@@ -341,6 +341,17 @@ pub struct Workstream {
     pub created_at: String,
     pub updated_at: String,
     pub metadata_json: String,
+}
+
+#[derive(Clone)]
+#[spacetimedb::table(accessor = generation, public)]
+pub struct Generation {
+    pub generation_number: u32,
+    pub rung: u8,
+    pub seconds_to_rung: u64,
+    pub dollars: f64,
+    pub notes: String,
+    pub created_at: Timestamp,
 }
 
 #[derive(Clone)]
