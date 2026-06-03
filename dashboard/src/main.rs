@@ -181,7 +181,43 @@ async fn cycle_detail(
 }
 
 async fn goals(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "goals", "/goals")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let goals = goals_data(&state);
+    let mut body = String::from("<h1 class=\"text-2xl mb-4\">Goals</h1>");
+    body.push_str(
+        "<table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+         <th class=\"pr-3 py-1\">status</th><th class=\"pr-3\">prio</th>\
+         <th class=\"pr-3\">key</th><th>title</th></tr></thead><tbody>",
+    );
+    for goal in &goals {
+        let status = value_display(goal.get("status"));
+        let cls = match status.as_str() {
+            "active" => "b-active",
+            "pending" => "b-pending",
+            "done" => "b-done",
+            "cancelled" => "b-cancelled",
+            _ => "b-pending",
+        };
+        let priority = value_display(goal.get("priority"));
+        let goal_key = value_display(goal.get("goal_key"));
+        let title = value_display(goal.get("title"));
+        body.push_str(&format!(
+            "<tr><td class=\"pr-3 align-top\"><span class=\"badge {}\">{}</span></td>\
+             <td class=\"pr-3 align-top text-zinc-500\">{}</td>\
+             <td class=\"pr-3 align-top\"><a class=\"text-sky-400 hover:underline\" href=\"/goal/{}\">{}</a></td>\
+             <td class=\"align-top\">{}</td></tr>",
+            cls,
+            html_escape(&status),
+            html_escape(&priority),
+            html_escape(&goal_key),
+            html_escape(&goal_key),
+            html_escape(&title),
+        ));
+    }
+    body.push_str("</tbody></table>");
+    render_page("goals", &body, 0).into_response()
 }
 
 async fn goal_detail(
@@ -721,7 +757,16 @@ fn render_page(title: &str, body: &str, refresh: u64) -> Html<String> {
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{} - orchestrator</title><script src=\"https://cdn.tailwindcss.com\"></script>{}\
-         <style>.mono{{font-family:ui-monospace,Menlo,Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word}}</style>\
+         <style>.mono{{font-family:ui-monospace,Menlo,Consolas,monospace}}\
+         .ellip{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}}\
+         pre{{white-space:pre-wrap;word-break:break-word}}\
+         table tr:hover{{background:rgba(255,255,255,.04)}}\
+         .badge{{display:inline-block;padding:.1rem .4rem;border-radius:.2rem;font-size:.7rem;line-height:1rem}}\
+         .b-active{{background:#16a34a;color:#fff}}\
+         .b-pending{{background:#eab308;color:#000}}\
+         .b-cancelled,.b-done{{background:#525252;color:#fff}}\
+         .b-progressing{{background:#0ea5e9;color:#fff}}\
+         .b-stalled{{background:#dc2626;color:#fff}}</style>\
          </head><body class=\"bg-zinc-950 text-zinc-200 mono text-sm\">\
          <nav class=\"bg-zinc-900 border-b border-zinc-800 px-4 py-2 flex gap-4 items-center\">\
          <a href=\"/\" class=\"font-bold text-zinc-100\">orchestrator</a>\
