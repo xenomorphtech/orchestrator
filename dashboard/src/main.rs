@@ -481,7 +481,29 @@ async fn agents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 }
 
 async fn facts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "facts", "/facts")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let facts = facts_data(&state, 80);
+    let mut body = String::from(
+        "<h1 class=\"text-2xl mb-4\">Facts <span class=\"text-sm text-zinc-500\">(latest)</span></h1>",
+    );
+    body.push_str(
+        "<table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+         <th class=\"pr-3 py-1\">when</th><th class=\"pr-3\">key</th><th>value</th></tr></thead><tbody>",
+    );
+    for f in &facts {
+        body.push_str(&format!(
+            "<tr><td class=\"pr-3 align-top text-xs text-zinc-500\">{}</td>\
+             <td class=\"pr-3 align-top\">{}</td>\
+             <td class=\"align-top text-zinc-300\">{}</td></tr>",
+            html_escape(&truncate_chars(&value_display(f.get("created_at")), 19)),
+            html_escape(&value_display(f.get("fact_key"))),
+            html_escape(&value_display(f.get("fact_value"))),
+        ));
+    }
+    body.push_str("</tbody></table>");
+    render_page("facts", &body, 0).into_response()
 }
 
 async fn services(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
