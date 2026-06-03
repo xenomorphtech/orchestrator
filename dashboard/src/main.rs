@@ -129,7 +129,141 @@ async fn logout() -> Response {
 }
 
 async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "dashboard", "/")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let episodes = latest_episodes(&state, 8);
+    let goals = goals_data(&state);
+    let active: Vec<&Value> = goals
+        .iter()
+        .filter(|g| value_display(g.get("status")) == "active")
+        .collect();
+    let paths = read_json_file(&state.cfg.analysis_dir.join("paths.json"));
+    let services = rows_to_values(state.data.harness_table(&["services"]));
+
+    let mut body = String::from("<h1 class=\"text-2xl mb-4 text-zinc-100\">Dashboard</h1>");
+
+    // active campaigns
+    body.push_str("<section class=\"mb-6\">");
+    body.push_str(&format!(
+        "<h2 class=\"text-lg text-zinc-100 mb-2\">Active campaigns ({} of {})</h2>",
+        active.len(),
+        goals.len()
+    ));
+    if active.is_empty() {
+        body.push_str("<div class=\"text-zinc-500\">(no active goals)</div>");
+    } else {
+        body.push_str(
+            "<table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+             <th class=\"py-1 pr-3\">goal</th><th>prio</th><th>title</th></tr></thead><tbody>",
+        );
+        for g in &active {
+            let key = value_display(g.get("goal_key"));
+            body.push_str(&format!(
+                "<tr><td class=\"pr-3 align-top\"><a class=\"text-sky-400 hover:underline\" href=\"/goal/{}\">{}</a></td>\
+                 <td class=\"pr-3 align-top\">{}</td>\
+                 <td class=\"align-top\">{}</td></tr>",
+                html_escape(&key),
+                html_escape(&key),
+                html_escape(&value_display(g.get("priority"))),
+                html_escape(&value_display(g.get("title"))),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+    body.push_str("</section>");
+
+    // path portfolio summary
+    if let Some(path_goals) = paths.get("goals").and_then(Value::as_object) {
+        if !path_goals.is_empty() {
+            body.push_str(
+                "<section class=\"mb-6\"><h2 class=\"text-lg text-zinc-100 mb-2\">Path portfolio</h2>\
+                 <table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+                 <th class=\"pr-3 py-1\">goal</th><th class=\"pr-3\">metric</th>\
+                 <th class=\"pr-3\">progress</th><th>paths</th></tr></thead><tbody>",
+            );
+            for (gk, g) in path_goals {
+                let cur = value_display_or(g.get("current"), "?");
+                let tgt = value_display_or(g.get("target"), "?");
+                let paths_arr = g.get("paths").and_then(Value::as_array);
+                let n = paths_arr.map(|a| a.len()).unwrap_or(0);
+                let statuses = paths_arr
+                    .map(|a| {
+                        a.iter()
+                            .map(|p| value_display_or(p.get("status"), "?"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                body.push_str(&format!(
+                    "<tr><td class=\"pr-3 align-top\">{}</td>\
+                     <td class=\"pr-3 align-top\">{}</td>\
+                     <td class=\"pr-3 align-top\">{}/{}</td>\
+                     <td class=\"align-top\">{} ({})</td></tr>",
+                    html_escape(gk),
+                    html_escape(&value_display(g.get("metric_name"))),
+                    html_escape(&cur),
+                    html_escape(&tgt),
+                    n,
+                    html_escape(&statuses),
+                ));
+            }
+            body.push_str("</tbody></table></section>");
+        }
+    }
+
+    // recent cycles
+    body.push_str(
+        "<section class=\"mb-6\"><h2 class=\"text-lg text-zinc-100 mb-2\">Recent cycles \
+         <a href=\"/cycles\" class=\"text-xs text-sky-400\">(all →)</a></h2>\
+         <table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+         <th class=\"pr-3 py-1\">id</th><th class=\"pr-3\">when</th><th>summary</th></tr></thead><tbody>",
+    );
+    for e in &episodes {
+        let id = value_display(e.get("id"));
+        body.push_str(&format!(
+            "<tr><td class=\"pr-3 align-top text-zinc-500\">{}</td>\
+             <td class=\"pr-3 align-top text-xs text-zinc-400\">{}</td>\
+             <td class=\"align-top\"><a class=\"hover:text-white\" href=\"/cycle/{}\">{}</a></td></tr>",
+            html_escape(&id),
+            html_escape(&truncate_chars(&value_display(e.get("created_at")), 19)),
+            html_escape(&id),
+            html_escape(&truncate_chars(&value_display(e.get("summary")), 180)),
+        ));
+    }
+    body.push_str("</tbody></table></section>");
+
+    // services
+    if !services.is_empty() {
+        body.push_str(
+            "<section class=\"mb-6\"><h2 class=\"text-lg text-zinc-100 mb-2\">Services</h2>\
+             <table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+             <th class=\"pr-3 py-1\">service</th><th class=\"pr-3\">type</th>\
+             <th class=\"pr-3\">status</th><th>target</th></tr></thead><tbody>",
+        );
+        for s in &services {
+            let status = value_display(s.get("last_status"));
+            let cls = if status == "healthy" {
+                "text-emerald-400"
+            } else {
+                "text-amber-400"
+            };
+            body.push_str(&format!(
+                "<tr><td class=\"pr-3 align-top\">{}</td>\
+                 <td class=\"pr-3 align-top\">{}</td>\
+                 <td class=\"pr-3 align-top {}\">{}</td>\
+                 <td class=\"align-top text-xs text-zinc-500\">{}</td></tr>",
+                html_escape(&value_display(s.get("service_name"))),
+                html_escape(&value_display(s.get("service_type"))),
+                cls,
+                html_escape(&status),
+                html_escape(&value_display(s.get("check_target"))),
+            ));
+        }
+        body.push_str("</tbody></table></section>");
+    }
+
+    render_page("dashboard", &body, 30).into_response()
 }
 
 async fn cycles(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -695,6 +829,20 @@ fn value_display(value: Option<&Value>) -> String {
         Some(Value::Null) | None => String::new(),
         Some(other) => other.to_string(),
     }
+}
+
+/// Like Python `dict.get(key, default)`: returns `default` only when the value is
+/// absent or JSON null, otherwise the displayed value.
+fn value_display_or(value: Option<&Value>, default: &str) -> String {
+    match value {
+        None | Some(Value::Null) => default.to_string(),
+        Some(v) => value_display(Some(v)),
+    }
+}
+
+/// Truncate to `n` Unicode scalar values (matches Python `s[:n]` closely enough for display).
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 fn parse_json_field(row: &mut std::collections::HashMap<String, Value>, key: &str) {
