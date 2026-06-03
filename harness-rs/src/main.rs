@@ -1398,7 +1398,7 @@ fn cmd_goal_tree(cli: &CliContext, args: GoalTreeArgs) -> Result<()> {
     }
 
     let ws_query = format!(
-        "SELECT ws_uid, goal_key, ws_id, title, metric, done_when, falsification, status, stall, blocker, next_substep, ord, worker, created_at, updated_at, metadata_json FROM workstreams WHERE goal_key = '{}' ORDER BY ord",
+        "SELECT ws_uid, goal_key, ws_id, title, metric, done_when, falsification, status, stall, blocker, next_substep, ord, worker, created_at, updated_at, metadata_json FROM workstreams WHERE goal_key = '{}'",
         sql_escape(&args.goal_key)
     );
     let ws_results = sql_query(cli, &ws_query)?;
@@ -1411,6 +1411,12 @@ fn cmd_goal_tree(cli: &CliContext, args: GoalTreeArgs) -> Result<()> {
         }
         workstreams.push(Value::Object(obj));
     }
+    workstreams.sort_by_key(|value| {
+        value
+            .get("ord")
+            .and_then(|ord| ord.as_u64())
+            .unwrap_or(u64::MAX)
+    });
 
     let fact_results = sql_query(
         cli,
