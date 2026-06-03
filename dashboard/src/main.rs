@@ -507,7 +507,39 @@ async fn facts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
 }
 
 async fn services(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    authed_or_placeholder(&headers, &state, "services", "/services")
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let services = rows_to_values(state.data.harness_table(&["services"]));
+    let mut body = String::from("<h1 class=\"text-2xl mb-4\">Services</h1>");
+    body.push_str(
+        "<table class=\"w-full\"><thead><tr class=\"text-zinc-500 text-left\">\
+         <th class=\"pr-3 py-1\">name</th><th class=\"pr-3\">type</th>\
+         <th class=\"pr-3\">status</th><th class=\"pr-3\">last poll</th><th>target</th></tr></thead><tbody>",
+    );
+    for sv in &services {
+        let status = value_display(sv.get("last_status"));
+        let cls = if status == "healthy" {
+            "text-emerald-400"
+        } else {
+            "text-amber-400"
+        };
+        body.push_str(&format!(
+            "<tr><td class=\"pr-3 align-top\">{}</td>\
+             <td class=\"pr-3 align-top text-xs text-zinc-500\">{}</td>\
+             <td class=\"pr-3 align-top {}\">{}</td>\
+             <td class=\"pr-3 align-top text-xs text-zinc-500\">{}</td>\
+             <td class=\"align-top text-xs\">{}</td></tr>",
+            html_escape(&value_display(sv.get("service_name"))),
+            html_escape(&value_display(sv.get("service_type"))),
+            cls,
+            html_escape(&status),
+            html_escape(&truncate_chars(&value_display(sv.get("last_polled_at")), 19)),
+            html_escape(&value_display(sv.get("check_target"))),
+        ));
+    }
+    body.push_str("</tbody></table>");
+    render_page("services", &body, 0).into_response()
 }
 
 async fn memory_index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
