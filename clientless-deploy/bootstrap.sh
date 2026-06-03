@@ -93,9 +93,19 @@ rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
   --exclude '.git' --exclude 'target' --exclude '*.so' --exclude '*.png' --exclude '*.jpg' \
   "$ALBION/clientless-bot" "$ALBION/crates" "$ALBION/gamestate" "$ALBION/bin" \
   "$ALBION/Cargo.toml" "$ALBION/Cargo.lock" $R:$H/clientless/ 2>&1 | tail -1
-rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" "$DEPLOY/analysis/" $R:$H/clientless/analysis/
+rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" "$DEPLOY/analysis/" $R:$H/clientless/analysis.seed/
 rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" "$DEPLOY/onbox/" $R:$H/clientless/onbox/
-$SSH $R "chown -R $NRU:$NRU $H/clientless; chmod +x $H/clientless/onbox/*.sh"
+$SSH $R "set -e
+  chown -R $NRU:$NRU $H/clientless
+  chmod +x $H/clientless/onbox/*.sh
+  for f in goal_tree.json STATE.md; do
+    if [ -f $H/clientless/analysis/\$f ]; then
+      echo \"preserve live analysis/\$f\"
+    else
+      install -o $NRU -g $NRU -m 0644 $H/clientless/analysis.seed/\$f $H/clientless/analysis/\$f
+      echo \"seeded analysis/\$f\"
+    fi
+  done"
 
 log "4.5/6 mirror knowledge base + proven Albion tools -> $NRU home"
 $SSH $R "mkdir -p $H/albion-wiki $H/albion/tools; chown -R $NRU:$NRU $H/albion-wiki $H/albion"
