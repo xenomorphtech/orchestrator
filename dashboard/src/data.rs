@@ -33,7 +33,14 @@ impl DataClient {
     }
 
     pub fn harness_stdout(&self, args: &[&str]) -> String {
-        match Command::new(&self.cfg.harness_path).args(args).output() {
+        match Command::new(&self.cfg.harness_path)
+            .arg("--server")
+            .arg(&self.cfg.harness_server)
+            .arg("--database")
+            .arg(&self.cfg.harness_database)
+            .args(args)
+            .output()
+        {
             Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
             Err(err) => format!("(error: {err})"),
         }
@@ -127,6 +134,28 @@ fn parse_sql_payload(payload: Value) -> Vec<HashMap<String, Value>> {
     };
     rows.iter()
         .filter_map(Value::as_array)
-        .map(|row| cols.iter().cloned().zip(row.iter().cloned()).collect())
+        .map(|row| {
+            cols.iter()
+                .cloned()
+                .zip(row.iter().cloned().map(unwrap_sql_cell))
+                .collect()
+        })
         .collect()
+}
+
+fn unwrap_sql_cell(value: Value) -> Value {
+    // SpacetimeDB encodes Option<T> cells as [0, value] / [1, []].
+    match value {
+        Value::Array(items) if items.len() == 2 => {
+            let mut items = items.into_iter();
+            let tag = items.next().unwrap_or(Value::Null);
+            let payload = items.next().unwrap_or(Value::Null);
+            match tag.as_i64() {
+                Some(0) => unwrap_sql_cell(payload),
+                Some(1) => Value::Null,
+                _ => Value::Array(vec![tag, payload]),
+            }
+        }
+        other => other,
+    }
 }

@@ -143,7 +143,7 @@ async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
         .iter()
         .filter(|g| value_display(g.get("status")) == "active")
         .collect();
-    let paths = read_json_file(&state.cfg.analysis_dir.join("paths.json"));
+    let paths = paths_portfolio_data(&state);
     let services = rows_to_values(state.data.harness_table(&["services"]));
 
     let mut body = String::from("<h1 class=\"text-2xl mb-4 text-zinc-100\">Dashboard</h1>");
@@ -292,16 +292,20 @@ async fn cycles(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         for episode in &episodes {
             let progress = episode.get("goal_progress_json");
             let frontier = progress.and_then(|v| v.get("frontier"));
+            let id = value_display(episode.get("id"));
+            let summary = value_display(episode.get("summary"));
             body.push_str(&format!(
-                "<tr class=\"border-t border-zinc-800 align-top\">\
-                 <td class=\"px-3 py-2 text-zinc-500\">{}</td>\
+                "<tr class=\"border-t border-zinc-800 align-top hover:bg-zinc-900/40\">\
+                 <td class=\"px-3 py-2 text-zinc-500\"><a class=\"hover:text-sky-400\" href=\"/cycle/{}\">{}</a></td>\
                  <td class=\"px-3 py-2 text-zinc-400 whitespace-nowrap\">{}</td>\
-                 <td class=\"px-3 py-2 text-zinc-100\">{}</td>\
+                 <td class=\"px-3 py-2 text-zinc-100\"><a class=\"text-sky-300 hover:underline\" href=\"/cycle/{}\">{}</a></td>\
                  <td class=\"px-3 py-2 text-zinc-300\">{}</td>\
                  <td class=\"px-3 py-2 text-zinc-300\">{}</td></tr>",
-                html_escape(&value_display(episode.get("id"))),
+                html_escape(&id),
+                html_escape(&id),
                 html_escape(&value_display(episode.get("created_at"))),
-                html_escape(&value_display(episode.get("summary"))),
+                html_escape(&id),
+                html_escape(&summary),
                 html_escape(&value_display(frontier.and_then(|v| v.get("id")))),
                 html_escape(&value_display(frontier.and_then(|v| v.get("stall")))),
             ));
@@ -331,10 +335,13 @@ async fn cycle_detail(
         html_escape(&value_display(e.get("created_at")))
     ));
     body.push_str(&format!(
-        "<div class=\"bg-zinc-900 border border-zinc-800 rounded p-3 mb-3\"><pre>{}</pre></div>",
+        "<section class=\"mb-4\">\
+         <h2 class=\"text-lg text-zinc-100 mb-2\">Full cycle description</h2>\
+         <div class=\"bg-zinc-900 border border-zinc-800 rounded p-3\">\
+         <pre class=\"whitespace-pre-wrap text-sm leading-6\">{}</pre></div></section>",
         html_escape(&value_display(e.get("summary")))
     ));
-    body.push_str("<div class=\"grid grid-cols-3 gap-3\">");
+    body.push_str("<div class=\"grid grid-cols-1 lg:grid-cols-3 gap-3\">");
     for (k, label) in [
         ("agent_statuses_json", "Agents"),
         ("actions_taken_json", "Actions"),
@@ -507,12 +514,12 @@ async fn paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     if !is_authed(&headers, &state) {
         return Redirect::to("/login").into_response();
     }
-    let p = read_json_file(&state.cfg.analysis_dir.join("paths.json"));
+    let p = paths_portfolio_data(&state);
     let mut body = String::from("<h1 class=\"text-2xl mb-4\">Path portfolio</h1>");
     let empty = p.is_null() || p.as_object().is_some_and(|o| o.is_empty());
     if empty {
         body.push_str(
-            "<div class=\"text-zinc-500\">(empty / unreadable analysis/paths.json)</div>",
+            "<div class=\"text-zinc-500\">(empty / unreadable harness DB paths table)</div>",
         );
     } else if let Some(goals) = p.get("goals").and_then(Value::as_object) {
         for (gk, g) in goals {
@@ -539,11 +546,7 @@ async fn paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
                     );
                     for pt in arr {
                         let status = value_display(pt.get("status"));
-                        let cls = if status == "progressing" {
-                            "b-progressing"
-                        } else {
-                            "b-stalled"
-                        };
+                        let cls = path_status_badge_class(&status);
                         body.push_str(&format!(
                             "<tr><td class=\"pr-2 align-top\">{}</td>\
                              <td class=\"pr-2 align-top\"><span class=\"badge {}\">{}</span></td>\
@@ -554,7 +557,7 @@ async fn paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
                             html_escape(&value_display(pt.get("name"))),
                             cls,
                             html_escape(&status),
-                            html_escape(&value_display_or(pt.get("stall_counter"), "0")),
+                            html_escape(&stall_counter_display(pt.get("stall_counter"))),
                             html_escape(&value_display(pt.get("worker"))),
                             html_escape(&value_display(pt.get("hypothesis"))),
                             html_escape(&value_display(pt.get("falsification"))),
@@ -614,9 +617,9 @@ async fn facts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
          <th class=\"pr-3 py-1\">when</th><th class=\"pr-3\">key</th><th>value</th></tr></thead><tbody>",
     );
     for f in &facts {
-        // app.py binds created_at/fact_value; the live harness schema exposes
-        // updated_at/value_json. Keep app.py's field first, fall back to the
-        // current column so the when/value columns show real data either way.
+        // Older dashboard schemas exposed created_at/fact_value; the live
+        // harness schema exposes updated_at/value_json. Keep both so the
+        // when/value columns show real data either way.
         body.push_str(&format!(
             "<tr><td class=\"pr-3 align-top text-xs text-zinc-500\">{}</td>\
              <td class=\"pr-3 align-top\">{}</td>\
@@ -1112,7 +1115,7 @@ async fn api_paths(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     api_authed_json(
         &headers,
         &state,
-        || json!({"paths": read_json_file(&state.cfg.analysis_dir.join("paths.json"))}),
+        || json!({"paths": paths_portfolio_data(&state)}),
     )
 }
 
@@ -1300,15 +1303,192 @@ fn latest_episodes(state: &AppState, limit: usize) -> Vec<Value> {
 }
 
 fn goals_data(state: &AppState) -> Vec<Value> {
-    let mut rows = state.data.harness_table(&["goals"]);
-    rows.sort_by(|a, b| {
-        let a_active = a.get("status").is_some_and(|s| s == "active");
-        let b_active = b.get("status").is_some_and(|s| s == "active");
+    let rows = state
+        .data
+        .sql_query(
+            "SELECT goal_key, title, detail, status, priority, depends_on_goal_key, success_fact_key, metadata_json, completion_report, created_at, updated_at, tick, scope_note FROM goals",
+        )
+        .map(|rows| {
+            rows.into_iter()
+                .map(|mut row| {
+                    parse_json_field(&mut row, "metadata_json");
+                    Value::Object(row.into_iter().collect())
+                })
+                .collect::<Vec<_>>()
+        });
+    let mut goals = rows.unwrap_or_else(|_| rows_to_values(state.data.harness_table(&["goals"])));
+    goals.sort_by(|a, b| {
+        let a_active = value_display(a.get("status")) == "active";
+        let b_active = value_display(b.get("status")) == "active";
         b_active
             .cmp(&a_active)
-            .then_with(|| parse_i64(b.get("priority")).cmp(&parse_i64(a.get("priority"))))
+            .then_with(|| value_i64(b.get("priority")).cmp(&value_i64(a.get("priority"))))
     });
-    rows_to_values(rows)
+    goals
+}
+
+fn paths_portfolio_data(state: &AppState) -> Value {
+    let goal_rows = state
+        .data
+        .sql_query(
+            "SELECT goal_key, title, detail, status, priority, success_fact_key, metadata_json, updated_at FROM goals",
+        )
+        .unwrap_or_default();
+    let anchor_rows = state
+        .data
+        .sql_query(
+            "SELECT goal_key, metric_name, metric_current, metric_target, updated_at FROM goal_anchor",
+        )
+        .unwrap_or_default();
+    let path_rows = state
+        .data
+        .sql_query(
+            "SELECT path_name, goal_key, sub_goal_key, worker, worktree, hypothesis, falsification, status, stall_counter, last_metric_move_at, predicted_delta, substrate, notes, metadata_json, created_at, updated_at FROM paths",
+        )
+        .unwrap_or_default();
+
+    let anchors: std::collections::BTreeMap<String, Value> = anchor_rows
+        .into_iter()
+        .filter_map(|row| {
+            let key = value_display(row.get("goal_key"));
+            if key.is_empty() {
+                None
+            } else {
+                Some((key, Value::Object(row.into_iter().collect())))
+            }
+        })
+        .collect();
+
+    let mut goals = serde_json::Map::new();
+    for mut row in goal_rows {
+        parse_json_field(&mut row, "metadata_json");
+        let goal_key = value_display(row.get("goal_key"));
+        if goal_key.is_empty() {
+            continue;
+        }
+        let anchor = anchors.get(&goal_key);
+        let metadata = row
+            .get("metadata_json")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let metric_name = first_nonempty(&[
+            value_display(anchor.and_then(|a| a.get("metric_name"))),
+            value_display(metadata.get("metric")),
+        ]);
+        let last_move_at = first_nonempty(&[
+            value_display(metadata.get("last_move_at")),
+            value_display(anchor.and_then(|a| a.get("updated_at"))),
+            value_display(row.get("updated_at")),
+        ]);
+
+        let mut goal = serde_json::Map::new();
+        insert_string_field(
+            &mut goal,
+            "title",
+            value_display_or(row.get("title"), &goal_key),
+        );
+        insert_value_field(&mut goal, "metric_name", Value::String(metric_name));
+        insert_optional_value(
+            &mut goal,
+            "current",
+            anchor.and_then(|a| a.get("metric_current")),
+        );
+        insert_optional_value(
+            &mut goal,
+            "target",
+            anchor.and_then(|a| a.get("metric_target")),
+        );
+        insert_optional_value(&mut goal, "status", row.get("status"));
+        insert_optional_value(&mut goal, "priority", row.get("priority"));
+        insert_optional_value(&mut goal, "success_fact_key", row.get("success_fact_key"));
+        insert_optional_value(&mut goal, "completion", row.get("detail"));
+        insert_value_field(&mut goal, "last_move_at", Value::String(last_move_at));
+        goal.insert("paths".to_string(), Value::Array(Vec::new()));
+        goals.insert(goal_key, Value::Object(goal));
+    }
+
+    for mut row in path_rows {
+        parse_json_field(&mut row, "metadata_json");
+        let goal_key = value_display(row.get("goal_key"));
+        if goal_key.is_empty() {
+            continue;
+        }
+        let goal_entry = goals.entry(goal_key.clone()).or_insert_with(|| {
+            json!({
+                "title": goal_key,
+                "paths": []
+            })
+        });
+        let metadata = row
+            .get("metadata_json")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut path = serde_json::Map::new();
+        insert_string_field(&mut path, "name", value_display(row.get("path_name")));
+        for (out_key, row_key) in [
+            ("worker", "worker"),
+            ("worktree", "worktree"),
+            ("substrate", "substrate"),
+            ("hypothesis", "hypothesis"),
+            ("falsification", "falsification"),
+            ("status", "status"),
+            ("stall_counter", "stall_counter"),
+            ("last_metric_move_at", "last_metric_move_at"),
+            ("predicted_delta", "predicted_delta"),
+            ("notes", "notes"),
+            ("sub_goal_key", "sub_goal_key"),
+        ] {
+            insert_optional_value(&mut path, out_key, row.get(row_key));
+        }
+        for (key, value) in metadata {
+            if key != "source" && !path.contains_key(&key) {
+                insert_value_field(&mut path, &key, value);
+            }
+        }
+
+        if let Some(paths) = goal_entry.get_mut("paths").and_then(Value::as_array_mut) {
+            paths.push(Value::Object(path));
+        }
+        let moved = value_display(row.get("last_metric_move_at"));
+        if !moved.is_empty() {
+            if let Some(goal) = goal_entry.as_object_mut() {
+                let current = value_display(goal.get("last_move_at"));
+                if moved > current {
+                    goal.insert("last_move_at".to_string(), Value::String(moved));
+                }
+            }
+        }
+    }
+
+    json!({
+        "schema_version": 1,
+        "source": "harness-db",
+        "goals": goals,
+    })
+}
+
+fn insert_optional_value(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<&Value>,
+) {
+    if let Some(value) = value {
+        insert_value_field(map, key, value.clone());
+    }
+}
+
+fn insert_string_field(map: &mut serde_json::Map<String, Value>, key: &str, value: String) {
+    insert_value_field(map, key, Value::String(value));
+}
+
+fn insert_value_field(map: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
+    if json_is_empty(&value) || value_display(Some(&value)) == "(none)" {
+        return;
+    }
+    map.insert(key.to_string(), value);
 }
 
 fn facts_data(state: &AppState, limit: usize) -> Vec<Value> {
@@ -1324,13 +1504,6 @@ fn briefings_data(state: &AppState, show: &str) -> Vec<Value> {
         _ => &["briefing-list"],
     };
     rows_to_values(state.data.harness_table(args))
-}
-
-fn read_json_file(path: &FsPath) -> Value {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or(Value::Null)
 }
 
 fn list_md_json(dir: &FsPath) -> Vec<Value> {
@@ -1476,10 +1649,23 @@ fn render_goal_tree(tree: &Value, source_path: &str) -> String {
 
     body.push_str("<section class=\"relative ml-2 border-l border-zinc-700 pl-6\">");
     for (idx, item) in items.iter().enumerate() {
-        let id = value_display_or(item.get("id"), &format!("WS{}", idx + 1));
+        let id = first_nonempty(&[
+            value_display(item.get("id")),
+            value_display(item.get("ws_id")),
+            format!("WS{}", idx + 1),
+        ]);
         let title = value_display_or(item.get("title"), &id);
         let status = value_display_or(item.get("status"), "pending");
-        let stall = value_display_or(item.get("stall"), "0");
+        let stall = stall_counter_display(item.get("stall"));
+        let stall_label = if stall.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<span class=\"text-xs text-zinc-500\">stall {}</span>",
+                html_escape(&stall)
+            )
+        };
+        let worker = value_display_or(item.get("worker"), "lean-loop");
         let blocker = value_display(item.get("blocker"));
         let next_substep = value_display(item.get("next_substep"));
         let metric = value_display(item.get("metric"));
@@ -1491,14 +1677,16 @@ fn render_goal_tree(tree: &Value, source_path: &str) -> String {
              <span class=\"text-zinc-500\">{}</span>\
              <h3 class=\"text-base text-zinc-100\">{}</h3>\
              <span class=\"badge {}\">{}</span>\
-             <span class=\"text-xs text-zinc-500\">stall {}</span>\
+             {}\
+             <span class=\"text-xs text-zinc-500\">worker {}</span>\
              </div>",
             goal_tree_dot_class(&status),
             html_escape(&id),
             html_escape(&title),
             goal_tree_badge_class(&status),
             html_escape(&status),
-            html_escape(&stall)
+            stall_label,
+            html_escape(&worker)
         ));
         body.push_str("<dl class=\"grid gap-3 text-xs md:grid-cols-2\">");
         body.push_str(&goal_tree_field("blocker", &blocker));
@@ -1521,22 +1709,47 @@ fn goal_tree_field(label: &str, value: &str) -> String {
 }
 
 fn goal_tree_badge_class(status: &str) -> &'static str {
-    match status {
+    match canonical_status(status).as_str() {
         "active" | "progressing" => "b-active",
         "pending" => "b-pending",
         "done" | "complete" | "verified" => "b-done",
+        "gated-hold" | "gated" | "hold" => "b-cancelled",
         "cancelled" => "b-cancelled",
         _ => "b-pending",
     }
 }
 
 fn goal_tree_dot_class(status: &str) -> &'static str {
-    match status {
+    match canonical_status(status).as_str() {
         "active" | "progressing" => "bg-emerald-500",
         "pending" => "bg-yellow-500",
         "done" | "complete" | "verified" => "bg-zinc-500",
-        "cancelled" => "bg-zinc-600",
+        "gated-hold" | "gated" | "hold" | "cancelled" => "bg-zinc-600",
         _ => "bg-sky-500",
+    }
+}
+
+fn path_status_badge_class(status: &str) -> &'static str {
+    match canonical_status(status).as_str() {
+        "active" | "progressing" => "b-progressing",
+        "done" | "complete" | "verified" => "b-done",
+        "pending" => "b-pending",
+        "gated-hold" | "gated" | "hold" | "cancelled" => "b-cancelled",
+        "stalled" | "blocked" => "b-stalled",
+        _ => "b-pending",
+    }
+}
+
+fn canonical_status(status: &str) -> String {
+    status.trim().to_ascii_lowercase()
+}
+
+fn stall_counter_display(value: Option<&Value>) -> String {
+    let rendered = value_display_or(value, "0");
+    if rendered.trim() == "0" {
+        String::new()
+    } else {
+        rendered
     }
 }
 
@@ -1747,8 +1960,8 @@ fn adherence_data(state: &AppState) -> Value {
     let subgoals = rows_to_values(state.data.harness_table(&["sub-goals"]));
     let briefings_db = briefings_data(state, "all");
     let briefing_files = list_md_json(&state.cfg.briefings_dir);
-    let paths = read_json_file(&state.cfg.analysis_dir.join("paths.json"));
-    let file_goal_count = paths
+    let paths = paths_portfolio_data(state);
+    let path_goal_count = paths
         .get("goals")
         .and_then(Value::as_object)
         .map(|goals| goals.len())
@@ -1780,7 +1993,7 @@ fn adherence_data(state: &AppState) -> Value {
                 .is_some_and(|s| !s.is_empty() && s != "(none)")
         })
         .count();
-    let total_checks = goals.len().max(1) + file_goal_count.max(1) + briefing_files.len().max(1);
+    let total_checks = goals.len().max(1) + path_goal_count.max(1) + briefing_files.len().max(1);
     let missing = unlinked_path_goals.len()
         + goals.len().saturating_sub(fresh_goal_anchors)
         + briefing_files.len().saturating_sub(briefings_db.len());
@@ -1791,7 +2004,7 @@ fn adherence_data(state: &AppState) -> Value {
         "counts": {
             "db_goals": goals.len(),
             "db_subgoals": subgoals.len(),
-            "path_file_goals": file_goal_count,
+            "db_path_goals": path_goal_count,
             "db_briefings": briefings_db.len(),
             "briefing_files": briefing_files.len(),
             "fresh_goal_anchors": fresh_goal_anchors,
@@ -1844,10 +2057,6 @@ fn progress_data(state: &AppState) -> Value {
     })
 }
 
-fn parse_i64(value: Option<&String>) -> i64 {
-    value.and_then(|v| v.parse().ok()).unwrap_or(0)
-}
-
 fn value_i64(value: Option<&Value>) -> Option<i64> {
     value.and_then(|v| {
         v.as_i64()
@@ -1891,7 +2100,7 @@ fn first_field(obj: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
-/// Format a unix mtime to local "%Y-%m-%d %H:%M" (matches Flask `datetime.fromtimestamp(...).strftime`).
+/// Format a unix mtime to local "%Y-%m-%d %H:%M".
 fn format_mtime(secs: u64) -> String {
     use chrono::TimeZone;
     chrono::Local
@@ -1901,7 +2110,7 @@ fn format_mtime(secs: u64) -> String {
         .unwrap_or_default()
 }
 
-/// Normalize a CLI-table cell: treat (none)/empty as "" (Flask `_briefing_norm`).
+/// Normalize a CLI-table cell: treat (none)/empty as "".
 fn briefing_norm(v: &str) -> String {
     if v.is_empty() || v == "(none)" {
         String::new()
@@ -1910,7 +2119,7 @@ fn briefing_norm(v: &str) -> String {
     }
 }
 
-/// Render comma-separated tags as chips (Flask `_tag_chips`).
+/// Render comma-separated tags as chips.
 fn tag_chips(tags_str: &str) -> String {
     tags_str
         .split(',')
@@ -1925,7 +2134,7 @@ fn tag_chips(tags_str: &str) -> String {
         .collect()
 }
 
-/// Render a goal chip, or an em-dash when absent (Flask `_goal_chip`).
+/// Render a goal chip, or an em-dash when absent.
 fn goal_chip(goal: &str) -> String {
     if goal.is_empty() {
         "<span class=\"text-zinc-600 text-xs\">—</span>".to_string()
@@ -2466,7 +2675,7 @@ mod tests {
     use crate::data::parse_table;
 
     #[test]
-    fn parses_pipe_table_like_flask() {
+    fn parses_pipe_table() {
         let rows = parse_table("a | b\n--+--\n 1 | two \n(1 row)\n");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("a").unwrap(), "1");
@@ -2474,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_channels_like_flask() {
+    fn sanitizes_channels() {
         assert_eq!(sanitize_channel_slug(Some(" A b!!c ")).unwrap(), "a-b-c");
         assert!(sanitize_channel_slug(Some("!!!")).is_none());
     }

@@ -17,7 +17,7 @@ curl -s -H "X-API-Key: $HARNESS_BIOME_API_KEY" "http://localhost:3021/panes/<uui
 Read ledgers:
 
 ```bash
-cat /home/sdancer/orchestrator/analysis/paths.json
+/home/sdancer/orchestrator/harness path-list --json
 cat /home/sdancer/orchestrator/analysis/hypotheses.md
 cat /home/sdancer/orchestrator/analysis/falsified.md
 ```
@@ -139,7 +139,8 @@ git -C <repo> worktree remove <worktree-path>
 /home/sdancer/orchestrator/harness agent-describe <name> \
   "Working on: <current task>. Done: <key results>. Next: <planned steps>."
 
-$EDITOR /home/sdancer/orchestrator/analysis/paths.json
+/home/sdancer/orchestrator/harness path-list --json
+/home/sdancer/orchestrator/harness path-set <path-name> --status <status> --stall-counter <n> --last-metric-move-at <timestamp>
 ```
 
 ## Planner spawn (every K=6 cycles, or on empty-backlog divergence)
@@ -148,7 +149,7 @@ $EDITOR /home/sdancer/orchestrator/analysis/paths.json
 Agent({
   description: "Path portfolio audit",
   subagent_type: "Plan",
-  prompt: "Read /home/sdancer/orchestrator/analysis/paths.json, hypotheses.md, falsified.md, /home/sdancer/nmss-emu/WIKI.md, and `harness facts | tail -40`. For each goal: (1) name the metric value vs target, (2) classify each active path as progressing/stalled/at-risk with one-line justification grounded in observable facts, (3) propose 1-3 fresh hypotheses for the backlog (must not duplicate anything in falsified.md — explain why distinct), (4) flag any active path that should be retired now. Return a diff against hypotheses.md — additions, status changes, removals. Do not write code; just plan."
+  prompt: "Read `harness path-list --json`, analysis/hypotheses.md, analysis/falsified.md, /home/sdancer/nmss-emu/WIKI.md, and `harness facts | tail -40`. For each goal: (1) name the metric value vs target, (2) classify each active path as progressing/stalled/at-risk with one-line justification grounded in observable facts, (3) propose 1-3 fresh hypotheses for the backlog (must not duplicate anything in falsified.md — explain why distinct), (4) flag any active path that should be retired now. Return a diff against hypotheses.md plus any required `harness path-set/path-add/path-remove` operations. Do not write code; just plan."
 })
 ```
 

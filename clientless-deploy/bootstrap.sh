@@ -17,7 +17,7 @@ R="root@$HOST"
 NRU="${NONROOT_USER:-sdanced}"          # the non-root user the loop runs as (box canonical = sdanced)
 H="/home/$NRU"
 SU="sudo -u $NRU"                        # run-as-non-root helper
-SSH="ssh -p $PORT -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+SSH_BASE=(ssh -p "$PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 DEPLOY=/home/sdancer/orchestrator/clientless-deploy
 ALBION=/home/sdancer/albion
 ALBION_WIKI=/home/sdancer/albion-wiki
@@ -41,6 +41,7 @@ if [ -f "$ENV_FILE" ]; then
   . "$ENV_FILE"
   set +a
 fi
+HARNESS_CODEX_MODEL_DEFAULT=${HARNESS_CODEX_MODEL:-gpt-5.5}
 
 cloudflared_token=""
 cloudflared_token_source=""
@@ -73,22 +74,25 @@ fi
 log "dashboard source: $DASHBOARD_SRC"
 
 log "1/6 wait for ssh ($R:$PORT)"
-up=0; for i in $(seq 1 45); do $SSH $R true 2>/dev/null && { up=1; break; }; sleep 10; done
+up=0; for _attempt in $(seq 1 45); do "${SSH_BASE[@]}" "$R" true 2>/dev/null && { up=1; break; }; sleep 10; done
 [ $up = 1 ] || { log "SSH never came up"; exit 1; }
 log "ssh up"
 
-log "2/6 base deps (apt + rust + claude cli) [root, provisioning only]"
-$SSH $R 'set -e; export DEBIAN_FRONTEND=noninteractive
+log "2/6 base deps (apt + rust + claude/codex cli) [root, provisioning only]"
+# shellcheck disable=SC2016
+"${SSH_BASE[@]}" "$R" 'set -e; export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq >/dev/null 2>&1 || true
   apt-get install -y -qq git curl python3 python3-pip python3-venv build-essential pkg-config libssl-dev rsync ca-certificates sudo cron jq lsof >/dev/null 2>&1 || true
+  command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; apt-get install -y -qq nodejs >/dev/null 2>&1; }
   command -v cargo >/dev/null 2>&1 || { curl -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1; }
   command -v claude >/dev/null 2>&1 || { curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || true; }
   command -v claude >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; apt-get install -y -qq nodejs >/dev/null 2>&1; npm i -g @anthropic-ai/claude-code >/dev/null 2>&1; }
+  command -v codex >/dev/null 2>&1 || npm i -g @openai/codex >/dev/null 2>&1
   command -v cloudflared >/dev/null 2>&1 || { curl -fsSL -o /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb && dpkg -i /tmp/cloudflared.deb >/dev/null 2>&1; rm -f /tmp/cloudflared.deb; }
-  echo "claude=$(command -v claude || echo MISSING) cargo=$(command -v cargo || echo MISSING) cloudflared=$(command -v cloudflared || echo MISSING)"'
+  echo "claude=$(command -v claude || echo MISSING) codex=$(command -v codex || echo MISSING) cargo=$(command -v cargo || echo MISSING) cloudflared=$(command -v cloudflared || echo MISSING)"'
 
 log "2.5/6 access self-heal + provision the NON-ROOT user ($NRU): trusted pubkey + passwordless sudo"
-$SSH $R "set -e
+"${SSH_BASE[@]}" "$R" "set -e
   mkdir -p /root/.ssh; chmod 700 /root/.ssh
   grep -qF '$PUBKEY' /root/.ssh/authorized_keys 2>/dev/null || echo '$PUBKEY' >> /root/.ssh/authorized_keys
   chmod 600 /root/.ssh/authorized_keys
@@ -99,33 +103,39 @@ $SSH $R "set -e
   echo '$NRU ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-$NRU; chmod 440 /etc/sudoers.d/90-$NRU
   chown -R $NRU:$NRU $H/.ssh $H/.claude $H/clientless
   echo \"self-heal OK: root+$NRU trust the operator key; $NRU has sudo\""
-$SSH $R "$SU bash -lc 'command -v cargo >/dev/null 2>&1 || curl -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1; source $H/.cargo/env 2>/dev/null || true; command -v cargo'"
+"${SSH_BASE[@]}" "$R" "$SU bash -lc 'command -v cargo >/dev/null 2>&1 || curl -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1; source $H/.cargo/env 2>/dev/null || true; command -v cargo'"
 
-log "3/6 copy claude login + lean skill -> $NRU home"
-scp -P $PORT -o StrictHostKeyChecking=accept-new /home/sdancer/.claude/.credentials.json $R:$H/.claude/.credentials.json
-scp -P $PORT -o StrictHostKeyChecking=accept-new /home/sdancer/.claude/commands/orchestrate-lean.md $R:$H/.claude/commands/orchestrate-lean.md
-$SSH $R "chown -R $NRU:$NRU $H/.claude; chmod 600 $H/.claude/.credentials.json"
+log "3/6 copy AI logins + lean skill -> $NRU home"
+scp -P "$PORT" -o StrictHostKeyChecking=accept-new /home/sdancer/.claude/.credentials.json "$R":"$H"/.claude/.credentials.json
+scp -P "$PORT" -o StrictHostKeyChecking=accept-new /home/sdancer/.claude/commands/orchestrate-lean.md "$R":"$H"/.claude/commands/orchestrate-lean.md
+"${SSH_BASE[@]}" "$R" "mkdir -p $H/.codex; chown -R $NRU:$NRU $H/.claude $H/.codex; chmod 700 $H/.codex; chmod 600 $H/.claude/.credentials.json"
+for codex_file in auth.json config.toml mcp.json models_cache.json version.json; do
+  if [ -f "/home/sdancer/.codex/$codex_file" ]; then
+    scp -P "$PORT" -o StrictHostKeyChecking=accept-new "/home/sdancer/.codex/$codex_file" "$R":"$H"/.codex/"$codex_file"
+  fi
+done
+"${SSH_BASE[@]}" "$R" "chown -R $NRU:$NRU $H/.codex; chmod 700 $H/.codex; chmod 600 $H/.codex/auth.json $H/.codex/config.toml 2>/dev/null || true; chmod 644 $H/.codex/mcp.json $H/.codex/models_cache.json $H/.codex/version.json 2>/dev/null || true"
 
 log "3.1/6 seed pool ssh key + live pool inventory"
 if [ -f /home/sdancer/.ssh/id_ed25519 ]; then
-  scp -P $PORT -o StrictHostKeyChecking=accept-new /home/sdancer/.ssh/id_ed25519 $R:$H/.ssh/id_ed25519
+  scp -P "$PORT" -o StrictHostKeyChecking=accept-new /home/sdancer/.ssh/id_ed25519 "$R":"$H"/.ssh/id_ed25519
 fi
 if [ -f /home/sdancer/.ssh/id_ed25519.pub ]; then
-  scp -P $PORT -o StrictHostKeyChecking=accept-new /home/sdancer/.ssh/id_ed25519.pub $R:$H/.ssh/id_ed25519.pub
+  scp -P "$PORT" -o StrictHostKeyChecking=accept-new /home/sdancer/.ssh/id_ed25519.pub "$R":"$H"/.ssh/id_ed25519.pub
 fi
 if [ -f "$POOL_INVENTORY" ]; then
-  scp -P $PORT -o StrictHostKeyChecking=accept-new "$POOL_INVENTORY" $R:$H/clientless/pool.json
+  scp -P "$PORT" -o StrictHostKeyChecking=accept-new "$POOL_INVENTORY" "$R":"$H"/clientless/pool.json
 fi
-$SSH $R "chown $NRU:$NRU $H/.ssh/id_ed25519 $H/.ssh/id_ed25519.pub $H/clientless/pool.json 2>/dev/null || true; chmod 600 $H/.ssh/id_ed25519 2>/dev/null || true; chmod 644 $H/.ssh/id_ed25519.pub $H/clientless/pool.json 2>/dev/null || true"
+"${SSH_BASE[@]}" "$R" "chown $NRU:$NRU $H/.ssh/id_ed25519 $H/.ssh/id_ed25519.pub $H/clientless/pool.json 2>/dev/null || true; chmod 600 $H/.ssh/id_ed25519 2>/dev/null || true; chmod 644 $H/.ssh/id_ed25519.pub $H/clientless/pool.json 2>/dev/null || true"
 
 log "4/6 transfer clientless code + deploy files -> $H/clientless (owned by $NRU)"
 rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
   --exclude '.git' --exclude 'target' --exclude '*.so' --exclude '*.png' --exclude '*.jpg' \
   "$ALBION/clientless-bot" "$ALBION/crates" "$ALBION/gamestate" "$ALBION/bin" \
-  "$ALBION/Cargo.toml" "$ALBION/Cargo.lock" $R:$H/clientless/ 2>&1 | tail -1
-rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" "$DEPLOY/analysis/" $R:$H/clientless/analysis.seed/
-rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" "$DEPLOY/onbox/" $R:$H/clientless/onbox/
-$SSH $R "set -e
+  "$ALBION/Cargo.toml" "$ALBION/Cargo.lock" "$R":"$H"/clientless/ 2>&1 | tail -1
+rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" "$DEPLOY/analysis/" "$R":"$H"/clientless/analysis.seed/
+rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" "$DEPLOY/onbox/" "$R":"$H"/clientless/onbox/
+"${SSH_BASE[@]}" "$R" "set -e
   chown -R $NRU:$NRU $H/clientless
   chmod +x $H/clientless/onbox/*.sh
   for f in goal_tree.json STATE.md; do
@@ -138,27 +148,27 @@ $SSH $R "set -e
   done"
 
 log "4.5/6 mirror knowledge base + proven Albion tools -> $NRU home"
-$SSH $R "mkdir -p $H/albion-wiki $H/albion/tools; chown -R $NRU:$NRU $H/albion-wiki $H/albion"
+"${SSH_BASE[@]}" "$R" "mkdir -p $H/albion-wiki $H/albion/tools; chown -R $NRU:$NRU $H/albion-wiki $H/albion"
 rsync -az --delete -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
-  --exclude '.git' "$ALBION_WIKI/" $R:$H/albion-wiki/ 2>&1 | tail -1
+  --exclude '.git' "$ALBION_WIKI/" "$R":"$H"/albion-wiki/ 2>&1 | tail -1
 rsync -az --delete -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
   --exclude '.git' --exclude 'target' --exclude '__pycache__' --exclude '*.pyc' \
-  "$ALBION_TOOLS/" $R:$H/albion/tools/ 2>&1 | tail -1
-$SSH $R "chown -R $NRU:$NRU $H/albion-wiki $H/albion; test -f $H/albion-wiki/WIKI.md; test -f $H/albion/tools/input/navi-e2e/albion_e2e.py; test -d $H/albion/tools/accounts"
+  "$ALBION_TOOLS/" "$R":"$H"/albion/tools/ 2>&1 | tail -1
+"${SSH_BASE[@]}" "$R" "chown -R $NRU:$NRU $H/albion-wiki $H/albion; test -f $H/albion-wiki/WIKI.md; test -f $H/albion/tools/input/navi-e2e/albion_e2e.py; test -d $H/albion/tools/accounts"
 
 log "4.6/6 install SpacetimeDB $SPACETIME_VERSION, harness module, and Rust dashboard"
-$SSH $R "set -e
+"${SSH_BASE[@]}" "$R" "set -e
   mkdir -p $H/.local/bin $H/.local/share/spacetime/data $H/.config/spacetime $H/orchestrator /home/sdancer/orchestrator $H/orch-rust-dash
   chown -R $NRU:$NRU $H/.local $H/.config $H/orchestrator $H/orch-rust-dash /home/sdancer/orchestrator"
-$SSH $R "$SU bash -lc 'if ! $H/.local/bin/spacetime --version 2>/dev/null | grep -q \"spacetimedb tool version $SPACETIME_VERSION\"; then curl -fsSL https://install.spacetimedb.com | SPACETIME_DOWNLOAD_ROOT=$SPACETIME_RELEASE_ROOT sh -s -- -y; fi; $H/.local/bin/spacetime --version | sed -n \"1,3p\"'"
+"${SSH_BASE[@]}" "$R" "$SU bash -lc 'if ! $H/.local/bin/spacetime --version 2>/dev/null | grep -q \"spacetimedb tool version $SPACETIME_VERSION\"; then curl -fsSL https://install.spacetimedb.com | SPACETIME_DOWNLOAD_ROOT=$SPACETIME_RELEASE_ROOT sh -s -- -y; fi; $H/.local/bin/spacetime --version | sed -n \"1,3p\"'"
 rsync -az --delete -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
-  --exclude 'target' --exclude '.git' "$HARNESS_SRC/" $R:$H/orchestrator/harness-rs/ 2>&1 | tail -1
+  --exclude 'target' --exclude '.git' "$HARNESS_SRC/" "$R":"$H"/orchestrator/harness-rs/ 2>&1 | tail -1
 rsync -az --delete -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
-  --exclude 'target' --exclude '.git' "$DASHBOARD_SRC/" $R:$H/orch-rust-dash/dashboard/ 2>&1 | tail -1
-$SSH $R "chown -R $NRU:$NRU $H/orchestrator $H/orch-rust-dash"
-$SSH $R "$SU bash -lc 'source $H/.cargo/env 2>/dev/null || true; env -C $H/orchestrator/harness-rs cargo build --release --features cli; install -m 0755 $H/orchestrator/harness-rs/target/release/harness $H/orchestrator/harness'"
-$SSH $R "$SU bash -lc 'source $H/.cargo/env 2>/dev/null || true; env -C $H/orch-rust-dash/dashboard cargo build --release'"
-$SSH $R "set -e
+  --exclude 'target' --exclude '.git' "$DASHBOARD_SRC/" "$R":"$H"/orch-rust-dash/dashboard/ 2>&1 | tail -1
+"${SSH_BASE[@]}" "$R" "chown -R $NRU:$NRU $H/orchestrator $H/orch-rust-dash"
+"${SSH_BASE[@]}" "$R" "$SU bash -lc 'source $H/.cargo/env 2>/dev/null || true; env -C $H/orchestrator/harness-rs cargo build --release --features cli; install -m 0755 $H/orchestrator/harness-rs/target/release/harness $H/orchestrator/harness'"
+"${SSH_BASE[@]}" "$R" "$SU bash -lc 'source $H/.cargo/env 2>/dev/null || true; env -C $H/orch-rust-dash/dashboard cargo build --release'"
+"${SSH_BASE[@]}" "$R" "set -e
   cat > $H/orchestrator/harness.toml <<'EOF'
 # Harness configuration
 database = \"$HARNESS_DATABASE_LOCAL\"
@@ -181,11 +191,11 @@ EOF
 log "4.7/6 install systemd units for SpacetimeDB, dashboard, cloudflared, and lean loop"
 if [ -n "$cloudflared_token" ]; then
   log "installing cloudflared tunnel token from $cloudflared_token_source"
-  printf 'TUNNEL_TOKEN=%s\n' "$cloudflared_token" | $SSH $R "umask 077; mkdir -p /etc/clientless-orchestrator; cat > /etc/clientless-orchestrator/cloudflared.env"
+  printf 'TUNNEL_TOKEN=%s\n' "$cloudflared_token" | "${SSH_BASE[@]}" "$R" "umask 077; mkdir -p /etc/clientless-orchestrator; cat > /etc/clientless-orchestrator/cloudflared.env"
 else
   log "no tunnel-shaped cloudflared token in local env; preserving any existing /etc/clientless-orchestrator/cloudflared.env"
 fi
-$SSH $R "cat > /etc/systemd/system/spacetimedb-box.service <<'EOF'
+"${SSH_BASE[@]}" "$R" "cat > /etc/systemd/system/spacetimedb-box.service <<'EOF'
 [Unit]
 Description=SpacetimeDB local orchestrator node
 After=network-online.target
@@ -254,6 +264,8 @@ Group=$NRU
 WorkingDirectory=$H/clientless
 Environment=HOME=$H
 Environment=IS_SANDBOX=1
+Environment=HARNESS_CODEX_MODEL=$HARNESS_CODEX_MODEL_DEFAULT
+Environment=CODEX_MODEL=$HARNESS_CODEX_MODEL_DEFAULT
 Environment=PATH=$H/.local/bin:$H/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/bash $H/clientless/onbox/loop.sh
 Restart=always
@@ -285,18 +297,17 @@ if ! systemctl is-active --quiet clientless-lean-loop.service; then
 fi"
 
 log "4.8/6 publish harness module if orchestrator-box is absent"
-$SSH $R "$SU bash -lc 'for i in \$(seq 1 30); do $H/orchestrator/harness --server $HARNESS_SERVER_LOCAL --database $HARNESS_DATABASE_LOCAL facts >/dev/null 2>&1 && exit 0; sleep 1; done; env -C $H/orchestrator/harness-rs $H/.local/bin/spacetime publish --server $HARNESS_SERVER_LOCAL -y --delete-data=never $HARNESS_DATABASE_LOCAL; $H/orchestrator/harness --server $HARNESS_SERVER_LOCAL --database $HARNESS_DATABASE_LOCAL facts >/dev/null'"
+"${SSH_BASE[@]}" "$R" "$SU bash -lc 'for i in \$(seq 1 30); do $H/orchestrator/harness --server $HARNESS_SERVER_LOCAL --database $HARNESS_DATABASE_LOCAL facts >/dev/null 2>&1 && exit 0; sleep 1; done; env -C $H/orchestrator/harness-rs $H/.local/bin/spacetime publish --server $HARNESS_SERVER_LOCAL -y --delete-data=never $HARNESS_DATABASE_LOCAL; $H/orchestrator/harness --server $HARNESS_SERVER_LOCAL --database $HARNESS_DATABASE_LOCAL facts >/dev/null'"
 
-log "4.9/6 keep legacy paths and cron-compatible projections consistent"
-$SSH $R "set -e
-  (crontab -u $NRU -l 2>/dev/null | grep -v 'clientless/onbox/gt2paths.py' || true; echo '*/2 * * * * python3 $H/clientless/onbox/gt2paths.py >/dev/null 2>&1') | crontab -u $NRU -
-  $SU python3 $H/clientless/onbox/gt2paths.py >/dev/null 2>&1 || true"
+log "4.9/6 remove legacy path-projection cron"
+"${SSH_BASE[@]}" "$R" "set -e
+  (crontab -u $NRU -l 2>/dev/null | grep -v 'clientless/onbox/gt2paths.py' || true) | crontab -u $NRU - || true"
 
-log "5/6 smoke: claude auth on box (as $NRU)"
-$SSH $R "$SU bash -lc 'env -C ~/clientless timeout 120 claude --dangerously-skip-permissions -p \"Reply with exactly: AUTH_OK\" 2>&1 | tail -5'"
+log "5/6 smoke: codex auth/model on box (as $NRU, model=$HARNESS_CODEX_MODEL_DEFAULT)"
+"${SSH_BASE[@]}" "$R" "$SU bash -lc 'env -C ~/clientless timeout 180 codex exec --model \"$HARNESS_CODEX_MODEL_DEFAULT\" --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"Reply with exactly: AUTH_OK\" 2>&1 | tail -12'"
 
 log "6/6 health check: DB, dashboard, tunnel, loop"
-$SSH $R "set -e
+"${SSH_BASE[@]}" "$R" "set -e
   $SU $H/orchestrator/harness --server $HARNESS_SERVER_LOCAL --database $HARNESS_DATABASE_LOCAL facts >/dev/null
   curl -fsSI http://127.0.0.1:3030/ | sed -n '1,3p'
   systemctl is-enabled spacetimedb-box.service orchestrator-dashboard.service cloudflared-sg2.service clientless-lean-loop.service

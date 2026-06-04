@@ -30,6 +30,6 @@ the root of this repo, that's the signal: it belongs somewhere else.
 ## What lives here
 
 - `harness-rs/` — Rust harness (scheduler, services, agent reducer)
-- `web/` — dashboard (auth gate, talk channels, screenshots)
+- `dashboard/` — Rust Axum dashboard (auth gate, talk channels, operator views)
 - `orchestrate.md`, `orchestrate-scheduler.sh`, `send.sh` — orchestration tooling
 - `.claude/` skills and settings shared across workers

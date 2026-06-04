@@ -6,7 +6,6 @@ cd "$HOME/clientless" || exit 1
 mkdir -p analysis
 echo "loop start $(date -u +%FT%TZ) pid=$$" >> analysis/loop.log
 while true; do
-  timeout 280 bash "$HOME/clientless/onbox/tick.sh" || echo "tick timeout/err $(date -u +%FT%TZ)" >> analysis/loop.log
-  python3 "$HOME/clientless/onbox/gt2paths.py" 2>/dev/null
+  timeout 600 bash "$HOME/clientless/onbox/tick.sh" || echo "tick timeout/err $(date -u +%FT%TZ)" >> analysis/loop.log
   sleep 300
 done

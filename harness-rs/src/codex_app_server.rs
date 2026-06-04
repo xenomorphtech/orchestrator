@@ -48,6 +48,7 @@ pub struct Session {
     pub events: Receiver<InboundEvent>,
     pub stderr_log_path: PathBuf,
     pub session_dir: PathBuf,
+    pub model: String,
     child: Mutex<Option<Child>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -86,14 +87,17 @@ impl Session {
             .open(&stderr_log_path)
             .with_context(|| format!("open stderr log {}", stderr_log_path.display()))?;
 
+        let model = codex_model();
         let mut child = Command::new("codex")
             .arg("app-server")
+            .arg("-c")
+            .arg(format!("model={}", toml_string_literal(&model)))
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("spawn `codex app-server`")?;
+            .with_context(|| format!("spawn `codex app-server` with model {model}"))?;
 
         let stdin = child
             .stdin
@@ -234,6 +238,7 @@ impl Session {
             events: events_rx,
             stderr_log_path,
             session_dir: session_dir.to_path_buf(),
+            model,
             child: Mutex::new(Some(child)),
             workers: Mutex::new(workers),
         })
@@ -484,6 +489,19 @@ impl Drop for Session {
             }
         }
     }
+}
+
+fn codex_model() -> String {
+    std::env::var("HARNESS_CODEX_MODEL")
+        .or_else(|_| std::env::var("CODEX_MODEL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "gpt-5.5".to_string())
+}
+
+fn toml_string_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// Helper used by the example/tests: write each inbound event as one JSONL row.

@@ -63,6 +63,7 @@ Don't tune cold-start unless this becomes a hot path. If you ever migrate hot-lo
 
 Production setting (in `cmd_codex_send` -> `thread/resume` and `Session::turn_start`):
 
+- Codex process config: `model = "gpt-5.5"` by default. Override with `HARNESS_CODEX_MODEL` or `CODEX_MODEL`.
 - `approvalPolicy: "never"`
 - `sandboxPolicy: { "type": "dangerFullAccess" }` for `turn/start`.
 - `sandbox: "danger-full-access"` for `thread/start` (kebab-case enum, NOT the tagged-union object — they share a name but are different types).

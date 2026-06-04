@@ -51,7 +51,7 @@ An ephemeral executor on a path: Codex or Claude. Workers can die, restart, lose
 The physical/virtual resource a path's work runs *on* — a display (`:5`), a device, a running game client, a container, an account, a GPU. A substrate is **exclusive** if one running worker mutating it corrupts another (two workers driving the same `:5` client = both wedge). Exclusive substrate is the usual reason a parallelizable goal is stuck on one thread: the work is independent but the substrate is shared. **Parallelism = N independent substrate instances, one worker each** (see *Parallelism planning*). A substrate is **shardable** when N independent instances can be provisioned cheaply (displays `:6`/`:7`…, fresh accounts via a codified provisioner, extra containers/devices); **singleton** when only one exists (one physical phone). Singleton substrate caps a goal's parallelism at 1 — say so explicitly rather than driving serially by accident.
 
 ### Path portfolio
-The set of active and backlog paths per goal, maintained as the single source of truth at `/home/sdancer/orchestrator/analysis/paths.json`. Read and write every cycle.
+The set of active and backlog paths per goal, maintained in the harness DB `paths` table. The harness DB is the single source of truth. Read it with `harness path-list --json`; update it with `harness path-add`, `harness path-set`, and `harness path-remove`.
 
 ```json
 {
@@ -95,7 +95,7 @@ adb connect localhost:5558   # standing rule — idempotent
 /home/sdancer/orchestrator/senses_check.sh   # services-alive + vast non-outbid; reports problems, auto-cleans outbid (act on its output)
 ```
 
-Capture each pane's screen, classify it (rules below), compute each active goal's current metric value, and read `analysis/paths.json`, `analysis/hypotheses.md`, `analysis/falsified.md`.
+Capture each pane's screen, classify it (rules below), compute each active goal's current metric value, and read `harness path-list --json`, `analysis/hypotheses.md`, `analysis/falsified.md`.
 
 ### EVALUATE (≤60s) — compute deltas
 
@@ -173,7 +173,7 @@ To avoid shell-quoting breakage on a long multi-line report, write it to a temp 
 /home/sdancer/orchestrator/harness agent-describe <name> "<2-3 sentence rolling description>"
 ```
 
-Rewrite `analysis/paths.json` with new metric values, stall counters, status changes.
+Persist path status, stall counters, and movement timestamps with `harness path-set` / `harness path-add`; path state is DB-backed, not file-backed.
 
 ---
 
@@ -184,7 +184,7 @@ These MUST hold after every ACTUATE. A SENSE pass that observes a violation make
 1. **One worker per path.** Two workers on the same path is wasted parallelism — retire one immediately.
 2. **Each path owns its worktree.** Two paths NEVER edit the same source tree. Use `git worktree add`.
 3. **Every active worker is harness-registered.** Unmanaged panes get registered (if doing useful work) or killed (if vestigial).
-4. **Every active path has a written falsification criterion** in `paths.json`. A path without one is a perpetual-motion machine — write one or retire the path.
+4. **Every active path has a written falsification criterion** in the DB `paths` row. A path without one is a perpetual-motion machine — write one with `harness path-set` or retire the path.
 5. **Stall counter ≥ 3 triggers divergence.** No exceptions.
 6. **Every goal has a metric.** A goal without a metric is a wish — surface it for refinement.
 7. **Every spawn/restart points at a briefing file**, never at an inlined prompt. The briefing-pointer prompt is the same string used as `--default-task` on `agent-add`, so the harness can re-seed context automatically on restart.
@@ -217,7 +217,7 @@ The alternative comes from, in order of preference:
 
 1. The **backlog** in `analysis/hypotheses.md` — pick the highest predicted Δmetric per unit cost, marked `backlog`.
 2. If no backlog candidate exists, spawn a fresh `Plan` subagent specifically to enumerate hypotheses (see *Periodic planner*), then pick from its output.
-3. If even the planner cannot generate fresh hypotheses, apply the **5-paths-ranked rule** (see *Autonomous decision rule* below) — enumerate 5 distinct forward paths with pros/cons, autonomously pick path 1, and execute. Mark the **path** (not the goal) `stalled-meta` in `paths.json`; do NOT pause for user input.
+3. If even the planner cannot generate fresh hypotheses, apply the **5-paths-ranked rule** (see *Autonomous decision rule* below) — enumerate 5 distinct forward paths with pros/cons, autonomously pick path 1, and execute. Mark the **path** (not the goal) `stalled-meta` with `harness path-set`; do NOT pause for user input.
 
 A stalled path is **retired**, not paused — its worktree is removed, its worker is deregistered, and its hypothesis is appended to `falsified.md` with reason "stalled, no movement for N cycles." If a similar hypothesis returns to the backlog later, it must be distinguishable from the dropped one (different mechanism, different falsification criterion, different worker).
 
@@ -243,14 +243,14 @@ See `[[falsify-mechanism-not-path]]` and `[[unity-password-clipboard-paste]]` fo
 
 ### Framing critic on POSITIVE approach-choices (BLOCKING before sinking >1 tick into a mechanism)
 
-The negative-result critic below interrogates *failures*. But the orchestrator's most frequent real-world miss is the **opposite**: committing ticks of effort to an **unchallenged framing** — wrong surface, wrong tool, an unconfirmed assumption, stale self-reported state, or ignoring doctrine already in memory. These are not "negatives," so they bypass the negative critic entirely, and the **user ends up supplying the reframe** the loop should have generated. (Same-session evidence: pixel-poking a Unity form for ~6 ticks when an in-process call existed; testing account-creation on the *web form* when the pipeline uses the *Linux client*; "work around" an unconfirmed email failure instead of empirically confirming it; goals-table/paths.json drift reported as truth; an existing `one-fresh-account-per-instance` / `pivot-to-programmatic-runner` memory that the user had to re-surface.)
+The negative-result critic below interrogates *failures*. But the orchestrator's most frequent real-world miss is the **opposite**: committing ticks of effort to an **unchallenged framing** — wrong surface, wrong tool, an unconfirmed assumption, stale self-reported state, or ignoring doctrine already in memory. These are not "negatives," so they bypass the negative critic entirely, and the **user ends up supplying the reframe** the loop should have generated. (Same-session evidence: pixel-poking a Unity form for ~6 ticks when an in-process call existed; testing account-creation on the *web form* when the pipeline uses the *Linux client*; "work around" an unconfirmed email failure instead of empirically confirming it; goals-table/DB-path drift reported as truth; an existing `one-fresh-account-per-instance` / `pivot-to-programmatic-runner` memory that the user had to re-surface.)
 
 **HARD RULE: before a worker sinks >1 tick into an approach — and before the orchestrator reports a state-derived claim — run the framing critic.** It asks, of the chosen *approach* (not the failure):
 1. **Right surface?** Web vs native client, UI vs in-process/API/memory, pixel-poke vs programmatic call. The visible/easy surface is usually NOT the right one. Name the surface explicitly and justify it over the alternatives.
 2. **Assumption empirically confirmed, or just assumed?** If the approach rests on an unverified premise ("the email isn't arriving", "the field needs a click"), run the *cheapest empirical test FIRST* — do not build on or "work around" an unconfirmed premise.
 3. **More-direct mechanism available?** Is there a programmatic/in-process path that skips the brittle outer layer entirely (inject-the-call vs drive-the-GUI; own-DH vs read-the-key)?
 4. **Does memory/doctrine already prescribe this?** Grep the memory index + facts for the decision area BEFORE defaulting to the easy tool — applicable doctrine recalled reactively (after a user nudge) is a process miss.
-5. **Is the state I'm reporting reconciled to ground truth THIS tick?** Ledgers (paths.json, goals table, metrics) drift. Before reporting a metric/status as fact, cross-check it against the latest fact/worktree/screenshot evidence — never relay stale metadata as current truth.
+5. **Is the state I'm reporting reconciled to ground truth THIS tick?** Ledgers (DB paths, goals table, metrics) drift. Before reporting a metric/status as fact, cross-check it against the latest fact/worktree/screenshot evidence — never relay stale metadata as current truth.
 
 Record the framing verdict in the episode when a worker is about to commit >1 tick to a non-obvious surface/tool, or when a path has churned ≥2 ticks on the same mechanism without a metric move (churn is the signal the framing — not just the mechanism — may be wrong). A worker defaulting to xdotool/web-form/requests/manual-clicks without the orchestrator having surfaced the more-direct surface is a framing-critic miss. See `[[feedback_user_corrections_root_cause_framing_critic]]`.
 
@@ -258,7 +258,7 @@ Record the framing verdict in the episode when a worker is about to commit >1 ti
 
 A **negative result** is any worker output that asserts something did not / cannot work: `blocked`, `falsified`, `impossible`, `no path forward`, `unreachable`, `exhausted`, but ALSO the quieter forms — "no effect", "0 samples / 0 fires", "test failed", "didn't advance", "not detected", "inconclusive", "no movement", "doesn't apply", a capability/access claim ("can't read X / no permission / cap missing"), or a relayed-from-a-worker "X is not possible". **Negative results are the single most expensive thing to get wrong** — a false negative written to a ledger or cross-pollinated as a fact prunes the search space for every future session and silently kills live paths. They are also the orchestrator's most common error (multiple same-session corrections: packet-injection-impossible, memory-read-blocked — both false).
 
-**HARD RULE: no negative result may be accepted, recorded, propagated, or relayed until it passes a critic.** This gate runs BEFORE the adversarial-enumeration and prior-breakthrough-audit steps below — those decide *what else to try* and *whether it was already done*; the critic decides *whether the negative result is even true*. The orchestrator MUST NOT pass a worker's negative claim through to the user, to `falsified.md`/`hypotheses.md`/`paths.json`, to a `*_blocked.md`/`*_falsified.md` artifact, or to a `fact-set` until the critic has run.
+**HARD RULE: no negative result may be accepted, recorded, propagated, or relayed until it passes a critic.** This gate runs BEFORE the adversarial-enumeration and prior-breakthrough-audit steps below — those decide *what else to try* and *whether it was already done*; the critic decides *whether the negative result is even true*. The orchestrator MUST NOT pass a worker's negative claim through to the user, to `falsified.md`/`hypotheses.md`/DB path rows, to a `*_blocked.md`/`*_falsified.md` artifact, or to a `fact-set` until the critic has run.
 
 **The critic challenges the VALIDITY of the negative result** (distinct from enumerating alternatives). It must answer all of:
 1. **Precondition met?** Was the thing-under-test actually exercised — right substrate, right state, target process alive, traffic flowing, the code path reached? (`[[verify-precondition-before-probe]]`, `[[substrate-state-invalidation]]`: 0 fires when the app is at a title screen means nothing.)
@@ -360,7 +360,7 @@ Serial path management (one worker per path, divergence on stall) is the skill's
 - Provision substrate instance `i` (e.g. `Xtigervnc :N+i` + its own client/account/container) — script this; it is the reproducible generator's job.
 - One **worktree per shard** and one **worker per shard** (the one-worker-per-path invariant applies per shard). Name shards `<goal>-shard-<i>`.
 - Each shard's briefing points at *its* substrate instance explicitly (display number, account, device serial) — shards must never address each other's substrate.
-- Record each shard as its own path row in `paths.json` under the goal; the goal's metric becomes `Σ shard progress` (e.g. accounts_through_tutorial / K).
+- Record each shard as its own DB `paths` row under the goal; the goal's metric becomes `Σ shard progress` (e.g. accounts_through_tutorial / K).
 
 **Substrate-sharding invariants (additions to the standing invariant list):**
 - **One exclusive substrate instance per worker.** Two workers on one display/device/client is corruption, not parallelism — the higher-numbered shard re-provisions its own instance or is retired.
@@ -436,7 +436,7 @@ Every K=6 cycles (≈30 min), OR any time the divergence rule fires with an empt
 Agent({
   description: "Path portfolio audit",
   subagent_type: "Plan",
-  prompt: "Read /home/sdancer/orchestrator/analysis/paths.json, hypotheses.md, falsified.md, /home/sdancer/nmss-emu/WIKI.md, and `harness facts | tail -40`. For each goal: (1) name the metric value vs target, (2) classify each active path as progressing/stalled/at-risk with one-line justification grounded in observable facts, (3) propose 1-3 fresh hypotheses for the backlog (must not duplicate anything in falsified.md — explain why distinct), (4) flag any active path that should be retired now. Return a diff against hypotheses.md — additions, status changes, removals. Do not write code; just plan."
+  prompt: "Read `harness path-list --json`, analysis/hypotheses.md, analysis/falsified.md, /home/sdancer/nmss-emu/WIKI.md, and `harness facts | tail -40`. For each goal: (1) name the metric value vs target, (2) classify each active path as progressing/stalled/at-risk with one-line justification grounded in observable facts, (3) propose 1-3 fresh hypotheses for the backlog (must not duplicate anything in falsified.md — explain why distinct), (4) flag any active path that should be retired now. Return a diff against hypotheses.md plus any required `harness path-set/path-add/path-remove` operations. Do not write code; just plan."
 })
 ```
 
@@ -585,7 +585,7 @@ The lifecycle for every worktree path:
 1. **Scope it to a single concrete deliverable** (one verb, one capture, one ported file, one verified milestone) — not "work on X indefinitely."
 2. **On delivery** (deliverable committed + verified): **FOLD to `main` immediately** — merge the branch into `main` in the canonical repo (e.g. `~/albion`), resolve the (small, fresh) conflict surface, confirm `main` builds.
 3. **DELETE the worktree** (`git worktree remove <path>` + `git branch -d <branch>`) — do not leave it lingering to drift.
-4. **SPAWN A NEW WORKER + fresh worktree off the now-current `main`** for the next step. The path persists in `paths.json`; the worktree/branch/worker are disposable and recreated from current `main`.
+4. **SPAWN A NEW WORKER + fresh worktree off the now-current `main`** for the next step. The path persists in the DB `paths` row; the worktree/branch/worker are disposable and recreated from current `main`.
 
 Why this is mandatory: frequent folds keep each merge tiny and near-conflict-free (hours of divergence, not days); `main` stays the always-current source of truth (so the knowledge base + the next worker start from reality, not a stale base); and it kills the recurring "multiple worktrees with different versions, which is newest?" failure at the root. A worktree that has delivered but not folded is **carrying undelivered value off-`main`** — treat an un-folded delivered worktree like an un-recorded result: a process violation to fix this tick.
 

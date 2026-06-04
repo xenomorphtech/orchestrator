@@ -1,28 +1,29 @@
-# Flask Route Inventory
+# Rust Dashboard Route Inventory
 
-Source read in full: `web/app.py` (1188 lines).
+Source read in full: `dashboard/src/main.rs`; shared data access lives in `dashboard/src/data.rs`.
 
 ## Global Auth And Shared Data
 
-- Auth gate: `before_request` redirects every path except `/login*` and `/static*` to `/login` unless `dash_auth` cookie validates with `URLSafeTimedSerializer(secret_key, salt="dashboard-auth-cookie-v1")` and equals `sha256("dashboard-salt-v1:" + DASHBOARD_PASSWORD)`.
+- Auth gate: every protected Axum handler redirects to `/login` unless `dash_auth` validates against the local dashboard secret key and equals `sha256("dashboard-salt-v1:" + DASHBOARD_PASSWORD)`.
 - Password: `DASHBOARD_PASSWORD` env or default `welcome to my w0rld`; cookie max age 30 days, httponly, `SameSite=Lax`, not secure.
 - Secret key: `/home/sdancer/orchestrator/.dash_secret_key`, created `0600` if missing.
 - Harness CLI: `/home/sdancer/orchestrator/harness`; table parser splits pipe-delimited headers/rows, skips separator lines and `(N rows)`.
 - SQL: POST text SQL to `{HARNESS_SERVER}/v1/database/{HARNESS_DATABASE}/sql`; env overrides, then `/home/sdancer/orchestrator/harness.toml`, then defaults.
-- Files: `/home/sdancer/orchestrator/analysis/paths.json`, `/home/sdancer/orchestrator/briefings/*.md`, `/home/sdancer/.claude/projects/-home-sdancer-orchestrator/memory/*.md`, talk logs under `/home/sdancer/orchestrator/analysis/talk_channels/*.jsonl`.
-- Base template: inline `BASE` via `render_template_string`; Tailwind CDN, nav links, optional meta refresh, `{{ body|safe }}`.
+- Files: `/home/sdancer/orchestrator/briefings/*.md`, `/home/sdancer/.claude/projects/-home-sdancer-orchestrator/memory/*.md`, talk logs under `/home/sdancer/orchestrator/analysis/talk_channels/*.jsonl`. Path portfolio data comes from the harness DB `paths` table.
+- Base template: Rust `render_page`; Tailwind CDN, nav links, optional meta refresh, body HTML assembled by handlers.
 
 ## Routes
 
-- `GET /login`: if authed redirects `302` to `/talk?c=general`; otherwise renders login form template. Data calls: cookie validation only.
-- `POST /login`: form `password`; on match sets `dash_auth` cookie and redirects `303` to `/talk?c=general`; on mismatch renders login form with error. Data calls: password hash + secret signer.
-- `GET /logout`: deletes `dash_auth` cookie and redirects `302` to `/login`. Data calls: none.
-- `GET /`: dashboard page with refresh 30. Data calls: `episodes(8)` via SQL newest-id search with CLI fallback, `goals()` via `harness goals`, `paths_portfolio()` from `analysis/paths.json`, `services()` via `harness services`. Template sections: active campaigns, path portfolio summary, recent cycles, services.
-- `GET /cycles`: latest 200 cycles. Data calls: `episodes(200)` via SQL with CLI fallback. Template: table id/when/agent count/action count/summary.
-- `GET /cycle/<cid>`: cycle detail, `cid` integer path. Data calls: SQL by id with fallback to `episodes(500)`. Template: summary card plus JSON pre blocks for agents/actions/goal progress. Returns 404 if missing.
+- `GET /login`: if authed redirects to `/talk?c=general`; otherwise renders login form. Data calls: cookie validation only.
+- `POST /login`: form `password`; on match sets `dash_auth` cookie and redirects to `/talk?c=general`; on mismatch renders login form with error. Data calls: password hash + secret signer.
+- `GET /logout`: deletes `dash_auth` cookie and redirects to `/login`. Data calls: none.
+- `GET /`: dashboard page with refresh 30. Data calls: `episodes(8)` via SQL newest-id search with CLI fallback, `goals()` via `harness goals`, `paths_portfolio()` from the harness DB `paths` table, `services()` via `harness services`. Template sections: active campaigns, path portfolio summary, recent cycles, services.
+- `GET /cycles`: latest 200 cycles. Data calls: `episodes(200)` via SQL with CLI fallback. Template: table id/when/summary/frontier/stall; id and summary link to `/cycle/<id>`.
+- `GET /cycle/<cid>`: cycle detail, `cid` integer path. Data calls: SQL by id with fallback to `episodes(500)`. Template: full cycle description plus JSON pre blocks for agents/actions/goal progress. Returns 404 if missing.
 - `GET /goals`: goals list. Data calls: `harness goals`, sorted active first then priority descending. Template: status badge, priority, key link, title.
+- `GET /goaltree`: goal tree dashboard shell.
 - `GET /goal/<key>`: goal detail. Data calls: `harness goals`, exact `goal_key` match. Template: badge, priority, title, optional detail, success/completion/created/updated grid. Returns 404 if missing.
-- `GET /paths`: path portfolio. Data calls: `analysis/paths.json`. Template: one section per goal with metric/current/target/last move and per-path table.
+- `GET /paths`: path portfolio. Data calls: harness DB `paths` table plus goal/anchor metadata. Template: one section per goal with metric/current/target/last move and per-path table.
 - `GET /agents`: agents list. Data calls: `harness agents`. Template: table name/kind/workdir/description or empty notice.
 - `GET /facts`: latest 80 facts. Data calls: `harness facts`, reversed and truncated. Template: table created/key/value.
 - `GET /services`: services list. Data calls: `harness services`. Template: table name/type/status/last poll/target.
@@ -36,3 +37,17 @@ Source read in full: `web/app.py` (1188 lines).
 - `POST /talk/new`: query `c` current channel, form `name`. Data calls: sanitize slug, ensure/touch channel JSONL. Redirects `303` to new or current channel.
 - `POST /talk/clear`: form or query `c`. Data calls: truncates channel JSONL and fire-and-forget `harness send orchestrator` admin notification. Redirects `303` to channel.
 - `POST /talk/delete`: form or query `c`. Rejects `general` with 400. Data calls: unlink channel JSONL if present and fire-and-forget admin notification. Redirects `303` to general.
+- `GET /api/cycles`: JSON latest cycles.
+- `GET /api/goals`: JSON goals.
+- `GET /api/goal/<key>`: JSON goal detail.
+- `GET /api/paths`: JSON path portfolio from the DB `paths` table.
+- `GET /api/agents`: JSON agents.
+- `GET /api/facts`: JSON latest facts.
+- `GET /api/services`: JSON services.
+- `GET /api/memory`: JSON memory index.
+- `GET /api/briefings`: JSON briefing index.
+- `GET /api/adherence`: JSON path adherence signals.
+- `GET /api/progress`: JSON aggregate progress.
+- `GET /api/goaltree/<goal_key>`: JSON goal-tree state.
+- `POST /api/goaltree/<goal_key>/ws/<ws_id>`: mutate a workspace node.
+- `POST /api/goaltree/<goal_key>/tick`: append a goal-tree tick.

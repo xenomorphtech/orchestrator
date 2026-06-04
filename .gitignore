@@ -1,6 +1,8 @@
 harness-rs/target/
+dashboard/target/
 minimap-sniffer/target/
 .env
+harness.toml
 .dash_secret_key
 .claude/scheduled_tasks.lock
 .claude/

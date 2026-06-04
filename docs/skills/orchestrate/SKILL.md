@@ -17,17 +17,17 @@ You are not a procedure executor, not a task tracker, not a meeting facilitator.
 - **Metric** — pure `state → number`, monotonic toward goal, computable in ≤30s, deterministic.
 - **Path** — hypothesis + falsification criterion + worktree + worker + stall counter.
 - **Worker** — ephemeral executor. Replaceable; the path persists.
-- **Portfolio** — `/home/sdancer/orchestrator/analysis/paths.json`, the single source of truth, read and written every cycle.
+- **Portfolio** — the harness DB `paths` table, the single source of truth. Read with `harness path-list --json`; update with `harness path-add`, `harness path-set`, and `harness path-remove`.
 
 ## The cycle: SENSE → EVALUATE → DECIDE → ACTUATE → RECORD
 
 Budget 4 minutes of compute, 1 minute slack within the 5-minute interval.
 
-1. **SENSE** (≤60s) — observe without writing. `harness episodes --limit 5`, `harness agents`, `harness panes`, `harness poll-services`, capture each pane screen, compute each goal's metric, read paths.json + hypotheses.md + falsified.md.
+1. **SENSE** (≤60s) — observe without writing. `harness episodes --limit 5`, `harness agents`, `harness panes`, `harness poll-services`, capture each pane screen, compute each goal's metric, read `harness path-list --json` + hypotheses.md + falsified.md.
 2. **EVALUATE** (≤60s) — compute metric deltas per goal; classify each path as **progressing** / **stalled** / **falsified** / **at-risk**; classify each worker as **working** / **idle** / **stuck** / **dead**.
 3. **DECIDE** (≤30s) — apply the control law (next section).
 4. **ACTUATE** (≤90s) — execute decisions idempotently. Order: briefings → worktree ops → agent ops → cross-pollination.
-5. **RECORD** (≤30s) — `episode-add`, `agent-describe` for changed workers, rewrite `paths.json`.
+5. **RECORD** (≤30s) — `episode-add`, `agent-describe` for changed workers, update DB path rows.
 
 ## Control law
 
@@ -44,7 +44,7 @@ Budget 4 minutes of compute, 1 minute slack within the 5-minute interval.
 1. One worker per path.
 2. Each path owns its worktree (`git worktree add`).
 3. Every active worker is harness-registered.
-4. Every active path has a written falsification criterion in `paths.json`.
+4. Every active path has a written falsification criterion in its DB `paths` row.
 5. `stall_counter ≥ 3` triggers divergence — no exceptions.
 6. Every goal has a metric.
 7. Every spawn/restart points at a briefing file via the canonical pointer prompt.
@@ -107,7 +107,7 @@ Per cycle, emit a short operator report:
 - Invariant violations fixed.
 - Escalations.
 
-Then `episode-add`, `agent-describe` for changed workers, and refresh `paths.json`.
+Then `episode-add`, `agent-describe` for changed workers, and update DB path rows.
 
 ## References
 
@@ -116,4 +116,4 @@ Then `episode-add`, `agent-describe` for changed workers, and refresh `paths.jso
 - Codex `codex_app_server` mode: `/home/sdancer/orchestrator/codex-app-server-mode.md`.
 - Hypothesis ledger: `/home/sdancer/orchestrator/analysis/hypotheses.md`.
 - Falsification ledger: `/home/sdancer/orchestrator/analysis/falsified.md`.
-- Portfolio: `/home/sdancer/orchestrator/analysis/paths.json`.
+- Portfolio: harness DB `paths` table (`harness path-list --json`).

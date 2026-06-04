@@ -2487,15 +2487,15 @@ fn cmd_codex_send(cli: &CliContext, args: &SendArgs, agent: &AgentForSend) -> Re
         .with_context(|| format!("create session dir {}", session_dir.display()))?;
     let events_path = session_dir.join("events.jsonl");
 
+    let session = Session::spawn(&workdir_path, &session_dir).context("spawn codex app-server")?;
     let _ = writeln!(
         &mut io::stderr().lock(),
-        "[codex-send] agent={} workdir={} session_dir={}",
+        "[codex-send] agent={} model={} workdir={} session_dir={}",
         agent.name,
+        session.model,
         workdir_path.display(),
         session_dir.display()
     );
-
-    let session = Session::spawn(&workdir_path, &session_dir).context("spawn codex app-server")?;
     let _init = session
         .initialize("orchestrator-harness", "Orchestrator Harness", "0.1.0")
         .context("initialize codex app-server")?;
