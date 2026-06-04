@@ -24,7 +24,7 @@ ALBION_WIKI=/home/sdancer/albion-wiki
 ALBION_TOOLS=/home/sdancer/albion/tools
 ORCH=/home/sdancer/orchestrator
 HARNESS_SRC=$ORCH/harness-rs
-DASHBOARD_SRC=/home/sdancer/orch-rust-dash/dashboard
+DASHBOARD_SRC=${DASHBOARD_SRC:-$ORCH/dashboard}
 POOL_INVENTORY=$ORCH/analysis/pool_inventory.json
 ENV_FILE=$ORCH/.env
 SPACETIME_VERSION=2.1.0
@@ -41,6 +41,36 @@ if [ -f "$ENV_FILE" ]; then
   . "$ENV_FILE"
   set +a
 fi
+
+cloudflared_token=""
+cloudflared_token_source=""
+if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+  case "$CLOUDFLARE_TUNNEL_TOKEN" in
+    eyJh*) cloudflared_token="$CLOUDFLARE_TUNNEL_TOKEN"; cloudflared_token_source=CLOUDFLARE_TUNNEL_TOKEN ;;
+    *) log "CLOUDFLARE_TUNNEL_TOKEN is set but does not look like a cloudflared tunnel token; ignoring it" ;;
+  esac
+fi
+if [ -z "$cloudflared_token" ] && [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
+  case "$CLOUDFLARE_API_TOKEN" in
+    eyJh*) cloudflared_token="$CLOUDFLARE_API_TOKEN"; cloudflared_token_source=CLOUDFLARE_API_TOKEN ;;
+    *) log "CLOUDFLARE_API_TOKEN is not a tunnel token; not using it for cloudflared --token" ;;
+  esac
+fi
+if [ ! -f "$DASHBOARD_SRC/Cargo.toml" ]; then
+  for dashboard_candidate in \
+    /home/sdancer/orch-db-finish/dashboard \
+    /home/sdancer/orch-db-first/dashboard \
+    /home/sdancer/orch-box-dbflip/dashboard \
+    /home/sdancer/orch-rust-dash/dashboard
+  do
+    if [ -f "$dashboard_candidate/Cargo.toml" ]; then
+      DASHBOARD_SRC=$dashboard_candidate
+      break
+    fi
+  done
+fi
+[ -f "$DASHBOARD_SRC/Cargo.toml" ] || { log "dashboard source not found; set DASHBOARD_SRC or restore $ORCH/dashboard"; exit 1; }
+log "dashboard source: $DASHBOARD_SRC"
 
 log "1/6 wait for ssh ($R:$PORT)"
 up=0; for i in $(seq 1 45); do $SSH $R true 2>/dev/null && { up=1; break; }; sleep 10; done
@@ -114,7 +144,7 @@ rsync -az --delete -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
 rsync -az --delete -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new" \
   --exclude '.git' --exclude 'target' --exclude '__pycache__' --exclude '*.pyc' \
   "$ALBION_TOOLS/" $R:$H/albion/tools/ 2>&1 | tail -1
-$SSH $R "chown -R $NRU:$NRU $H/albion-wiki $H/albion; test -f $H/albion-wiki/WIKI.md; test -f $H/albion/tools/input/navi-e2e/albion_e2e.py; test -f $H/albion/tools/input/albion_ingame_register_login.py"
+$SSH $R "chown -R $NRU:$NRU $H/albion-wiki $H/albion; test -f $H/albion-wiki/WIKI.md; test -f $H/albion/tools/input/navi-e2e/albion_e2e.py; test -d $H/albion/tools/accounts"
 
 log "4.6/6 install SpacetimeDB $SPACETIME_VERSION, harness module, and Rust dashboard"
 $SSH $R "set -e
@@ -149,10 +179,11 @@ EOF
   chown -R $NRU:$NRU $H/orchestrator /home/sdancer/orchestrator $H/orch-rust-dash/dashboard/harness.toml"
 
 log "4.7/6 install systemd units for SpacetimeDB, dashboard, cloudflared, and lean loop"
-if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
-  printf 'TUNNEL_TOKEN=%s\n' "$CLOUDFLARE_API_TOKEN" | $SSH $R "umask 077; mkdir -p /etc/clientless-orchestrator; cat > /etc/clientless-orchestrator/cloudflared.env"
+if [ -n "$cloudflared_token" ]; then
+  log "installing cloudflared tunnel token from $cloudflared_token_source"
+  printf 'TUNNEL_TOKEN=%s\n' "$cloudflared_token" | $SSH $R "umask 077; mkdir -p /etc/clientless-orchestrator; cat > /etc/clientless-orchestrator/cloudflared.env"
 else
-  log "CLOUDFLARE_API_TOKEN not set locally; preserving any existing /etc/clientless-orchestrator/cloudflared.env"
+  log "no tunnel-shaped cloudflared token in local env; preserving any existing /etc/clientless-orchestrator/cloudflared.env"
 fi
 $SSH $R "cat > /etc/systemd/system/spacetimedb-box.service <<'EOF'
 [Unit]
@@ -241,7 +272,13 @@ if ! systemctl is-active --quiet orchestrator-dashboard.service; then
   if ss -ltn '( sport = :3030 )' | grep -q ':3030'; then echo 'dashboard already listening on :3030; enabled unit for reboot'; else systemctl start orchestrator-dashboard.service; fi
 fi
 if ! systemctl is-active --quiet cloudflared-sg2.service; then
-  if pgrep -f 'cloudflared tunnel run' >/dev/null; then echo 'cloudflared unmanaged process already running; enabled unit for reboot'; elif [ -s /etc/clientless-orchestrator/cloudflared.env ]; then systemctl start cloudflared-sg2.service; else echo 'cloudflared token env missing; unit enabled but not started'; fi
+  if pgrep -f 'cloudflared tunnel run' >/dev/null; then
+    echo 'cloudflared unmanaged process already running; enabled unit for reboot'
+  elif [ -s /etc/clientless-orchestrator/cloudflared.env ] && sh -c '. /etc/clientless-orchestrator/cloudflared.env; case \"\${TUNNEL_TOKEN:-}\" in eyJh*) exit 0;; *) exit 1;; esac'; then
+    systemctl start cloudflared-sg2.service
+  else
+    echo 'cloudflared tunnel token missing or invalid; unit enabled but not started'
+  fi
 fi
 if ! systemctl is-active --quiet clientless-lean-loop.service; then
   if pgrep -u $NRU -f '$H/clientless/onbox/loop.sh' >/dev/null; then echo 'lean loop unmanaged process already running; enabled unit for reboot'; else systemctl start clientless-lean-loop.service; fi
