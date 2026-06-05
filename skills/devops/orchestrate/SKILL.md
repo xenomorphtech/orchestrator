@@ -8,7 +8,7 @@ platforms: [linux]
 metadata:
   hermes:
     tags: [orchestrator, control-loop, multi-agent, harness, divergence, falsification, devops]
-    related_skills: [plan, requesting-code-review, systematic-debugging, test-driven-development]
+    related_skills: [critic, plan, requesting-code-review, systematic-debugging, test-driven-development]
 ---
 
 # Orchestrate
@@ -155,7 +155,7 @@ A SENSE pass that observes a violation makes fixing it the **highest-priority ac
 The control loop's job is to **monotonically reduce the distance to every non-done goal, every tick.** The most common real failure is not a wrong move — it is *no move*, disguised as a decision: "parked", "banked", "held at ceiling", "needs a sustained session", "requires human/legit play", "multi-hour integration — bank it", "saturated", "proportionality call". Every one of these silently moved a live path **out of the active lifecycle**, so the `stall_counter ≥ 3 → divergence` rule — the one mechanism designed to break stalls — never fired. **Parking is stall-counter laundering.**
 
 1. **`parked` / `banked` / `saturated-hold` / `legit-play backlog` are ABOLISHED as end-states.** A path is exactly one of: `active`, `backlog` (still accrues stall + brainstorm), `done`, or `path-dropped` (full audit done). If you catch yourself writing any other terminal-sounding status, you are stalling.
-2. **"Requires human/legit play", "needs a sustained session", "multi-hour integration", "proportionality" are NEGATIVE RESULTS** — the quietest forms — and MUST pass the *Mandatory critic on every negative result* + *Adversarial enumeration* before they touch any ledger or report.
+2. **"Requires human/legit play", "needs a sustained session", "multi-hour integration", "proportionality" are NEGATIVE RESULTS** — the quietest forms — and MUST pass the **`critic` skill's negative-result procedure** + *Adversarial enumeration* before they touch any ledger or report.
 3. **Hours-long ⇒ chunk, don't bank.** A task too big for one tick is a *chunking* instruction, never a stop condition. Each tick advances it by ONE concrete committed sub-step and commits. Monotonic progress beats finish-or-don't-start.
 4. **A headline metric being met does NOT demote its sub-goals.** Drive every declared sub-goal to `done` or `path-dropped`.
 5. **Prefer a continuous/ordinal distance metric** (step N/total, pieces-integrated/total, mobs-killed/required) over a binary milestone, so a zero-movement tick is *visible* as an alarm rather than tolerated.
@@ -192,43 +192,15 @@ A worker proving that ONE injection/access mechanism fails against a target does
 
 Briefings for input-injection / scraping / instrumentation paths MUST list 3+ candidate mechanisms up front. Workers default to the easiest tool; the orchestrator counters by surfacing alternatives as first-class options in the briefing.
 
-### Framing critic on POSITIVE approach-choices (BLOCKING before sinking >1 tick into a mechanism)
+### Critic — framing + negative-result validity gate
 
-The orchestrator's most frequent real-world miss is the **opposite** of failure: committing ticks of effort to an **unchallenged framing** — wrong surface, wrong tool, an unconfirmed assumption, stale self-reported state, or ignoring doctrine already in memory. These are not "negatives," so they bypass the negative critic entirely.
+The orchestrator runs two distinct critics as a **validity gate** before sinking ticks into a chosen approach or before recording a worker's negative claim. The full procedure (5-point framing checklist, 6-point negative-result checklist, critic-worker spawn template, inline vs spawned scaling) lives in the `critic` skill — **load it before adjudicating any framing or negative-result claim**.
 
-**HARD RULE: before a worker sinks >1 tick into an approach — and before the orchestrator reports a state-derived claim — run the framing critic:**
-1. **Right surface?** Web vs native client, UI vs in-process/API/memory, pixel-poke vs programmatic call. Name the surface explicitly and justify it over the alternatives.
-2. **Assumption empirically confirmed, or just assumed?** If the approach rests on an unverified premise, run the *cheapest empirical test FIRST* — do not build on or "work around" an unconfirmed premise.
-3. **More-direct mechanism available?** Is there a programmatic/in-process path that skips the brittle outer layer entirely (inject-the-call vs drive-the-GUI; own-DH vs read-the-key)?
-4. **Does memory/doctrine already prescribe this?** Grep the memory index + facts for the decision area BEFORE defaulting to the easy tool.
-5. **Is the state I'm reporting reconciled to ground truth THIS tick?** Ledgers drift. Before reporting a metric/status as fact, cross-check it against the latest fact/worktree/screenshot evidence.
+Triggers in this loop:
+- **Framing critic** — before a worker sinks >1 tick into a non-obvious surface/tool, or when a path has churned ≥2 ticks on the same mechanism without a metric move, or before the orchestrator relays any state-derived claim.
+- **Negative-result critic** — before any worker negative (`blocked`/`falsified`/`impossible`/`exhausted`/`no path forward`/`test failed`/`no effect`/capability claim) is accepted, recorded, propagated, or relayed. The critic runs **first** — before adversarial enumeration and prior-breakthrough audit; those decide *what else to try* and *whether it was already done*; the critic decides *whether the negative is even true*.
 
-Record the framing verdict in the episode when a worker is about to commit >1 tick to a non-obvious surface/tool, or when a path has churned ≥2 ticks on the same mechanism without a metric move (churn is the signal the framing — not just the mechanism — may be wrong).
-
-### Mandatory critic on EVERY negative result (BLOCKING — runs first)
-
-A **negative result** is any worker output that asserts something did not / cannot work: `blocked`, `falsified`, `impossible`, `no path forward`, `unreachable`, `exhausted`, but ALSO the quieter forms — "no effect", "0 samples / 0 fires", "test failed", "didn't advance", "not detected", "inconclusive", "no movement", "doesn't apply", a capability/access claim ("can't read X / no permission / cap missing"), or a relayed-from-a-worker "X is not possible". **Negative results are the single most expensive thing to get wrong** — a false negative written to a ledger or cross-pollinated as a fact prunes the search space for every future session and silently kills live paths.
-
-**HARD RULE: no negative result may be accepted, recorded, propagated, or relayed until it passes a critic.** The orchestrator MUST NOT pass a worker's negative claim through to the user, to `falsified.md`/`hypotheses.md`/DB path rows, to a `*_blocked.md`/`*_falsified.md` artifact, or to a `fact-set` until the critic has run.
-
-**The critic challenges the VALIDITY of the negative result** (distinct from enumerating alternatives). It must answer all of:
-1. **Precondition met?** Was the thing-under-test actually exercised — right substrate, right state, target process alive, traffic flowing, the code path reached?
-2. **Mechanism implemented correctly?** Was the failure the *hypothesis* failing, or the *harness* (wrong offset, wrong tool invocation, a dispatcher fighting itself)?
-3. **Capability/access actually blocked, or privilege-context?** Verify caps/perms on **the host that runs the target**, not the orchestrator's shell; remember sudo→root, LKM, and `ptrace_scope` toggles defeat most apparent blocks.
-4. **Is it on the critical path at all?** Often a sibling formulation sidesteps the "blocker" entirely.
-5. **Measurement valid?** Thin-sample noise vs real signal; right detector; reproduced ≥2×?
-6. **First-principles check:** is the asserted impossibility actually a law, or one mechanism's failure being over-generalized?
-
-**How to run it (scale to the claim):**
-- **Routine / mechanism-level negative** (a single probe came back empty): run the 6-point checklist inline this tick and record the verdict in the episode. If any point is unresolved, the result is **not yet a negative** — re-run with the gap fixed before believing it.
-- **Path- or goal-level negative**, or any negative about to hit a ledger/fact/user report: spawn an **independent critic worker** (own worktree, no shared state with the original worker, 20-min cap):
-  > "Worker `<wname>` reports negative result `<claim>` for path `<name>`. Your job is to FALSIFY THE NEGATIVE — find the most likely reason this 'failure' is actually a false negative. Work the 6-point validity checklist (precondition, harness-correctness, capability-vs-privilege verified on the target host, critical-path relevance, measurement validity, first-principles). Return `analysis/<path>_critic.md` with a verdict: CONFIRMED or REFUTED. Do not enumerate new mechanisms — that's a separate worker; only adjudicate this claim."
-
-**Verdicts:**
-- **REFUTED** → the negative is rejected. Re-task the original worker with the critic's re-test; do NOT record any closure. Log it (a refuted negative is a near-revival).
-- **CONFIRMED** → the negative is real *for this mechanism*. Now proceed to Falsification-scoping + Adversarial-enumeration + Prior-breakthrough-audit as usual.
-
-**Never relay a worker's negative result to the user as fact without having run this gate.**
+Inline verdict for routine cases; spawn an independent critic worker (own worktree, 20-min cap) for path-/goal-level claims or anything about to hit a ledger/fact/user report. Verdicts (`PROCEED`/`REFINE`/`REFUSE` for framing; `CONFIRMED`/`REFUTED` for negative) are recorded in the episode with per-point rationale, not just a one-liner.
 
 ### Adversarial enumeration on every "blocked" claim
 
@@ -376,7 +348,7 @@ The report (written to the episode summary) contains:
 1. **Calling `AskUserQuestion` from inside a tick.** The 5-paths-ranked rule is the replacement. Asking permission breaks the control loop.
 2. **Creating/editing cron jobs from inside a tick.** The cadence is owned externally. Touching `CronCreate`/`CronDelete` is a structural violation.
 3. **Relabelling a path to `parked` / `banked` / `saturated-hold` / `legit-play backlog` to escape the divergence rule.** Those are abolished end-states. Refusing the relabel is the cure.
-4. **Accepting a worker's "blocked" claim without the framing critic + adversarial enumeration + prior-breakthrough audit.** A worker's `*_blocked.md` is a request for an audit, not a verdict.
+4. **Accepting a worker's "blocked" claim without the full closure gate.** A worker's `*_blocked.md` is a request for the full audit chain — **critic skill** (framing + negative-result) → adversarial enumeration → prior-breakthrough audit — not a verdict. Skipping any of the three is a process miss.
 5. **Writing a falsified.md row that says "input injection" or "field is uninjectable"** instead of naming the specific mechanism (e.g. `xdotool XTestFakeKeyEvent filtered by TMP_InputField ContentType.Password`) and ≥3 untried siblings. Mechanism ≠ path.
 6. **Letting a worktree persist after deliverable commit.** Fold to main, delete the worktree, spawn fresh off main. Carrying undelivered value off-`main` is a process violation.
 7. **Reporting a metric that is one cycle stale as "this tick's value".** Always cross-check the latest fact / screenshot / worktree evidence before publishing the report.
@@ -395,7 +367,7 @@ At the end of every tick, confirm:
 - [ ] EVALUATE updated `stall_counter` for every path that didn't move.
 - [ ] DECIDE applied the control law; for every `stall_counter ≥ 3` path, divergence is in the actions.
 - [ ] For every `blocked`/`falsified`/`path-dropped` candidate, the prior-breakthrough audit ran and returned clean (or the closure was downgraded/refused).
-- [ ] For every worker's negative result, the framing critic + 6-point critic + adversarial enumeration ran.
+- [ ] For every worker's negative result, the `critic` skill's framing + 6-point critic + adversarial enumeration ran.
 - [ ] ACTUATE was idempotent — no `harness send` overlapped.
 - [ ] All spawned/restarted workers point at `briefings/<name>.md`, not at inlined prompts.
 - [ ] The episode summary IS the full operator report (not a 1-2 sentence blurb).
@@ -470,6 +442,7 @@ EOF
 
 ## See also
 
+- **`critic` skill** — the framing + negative-result validity gate (extracted from this skill; load it before adjudicating any framing or negative claim).
 - `references/worker-classification.md` — dead/working/stuck/idle/stuck-stale rules; routing decisions.
 - `references/worker-handling.md` — context refresh, restart, retire mechanics.
 - `references/worker-briefings.md` — required briefing sections + SQL-backed SoT pattern.
