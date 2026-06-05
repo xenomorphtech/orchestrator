@@ -46,6 +46,19 @@ impl DataClient {
         }
     }
 
+    pub fn call_reducer(&self, reducer: &str, args: Vec<Value>) -> Result<()> {
+        let url = format!(
+            "{}/v1/database/{}/call/{}",
+            self.cfg.harness_server, self.cfg.harness_database, reducer
+        );
+        self.http
+            .post(&url)
+            .set("content-type", "application/json")
+            .send_string(&Value::Array(args).to_string())
+            .with_context(|| format!("call reducer {reducer}"))?;
+        Ok(())
+    }
+
     pub fn sql_query(&self, query: &str) -> Result<Vec<HashMap<String, Value>>> {
         // ureq returns Err on non-2xx already (no error_for_status needed).
         let payload: Value = self

@@ -239,6 +239,8 @@ struct FactSetArgs {
 struct GoalAddArgs {
     goal_key: String,
     title: String,
+    #[arg(long)]
+    parent_goal_key: Option<String>,
     #[arg(long, default_value = "")]
     detail: String,
     #[arg(long, default_value = "pending")]
@@ -256,11 +258,19 @@ struct GoalAddArgs {
     tick: Option<u32>,
     #[arg(long)]
     scope_note: Option<String>,
+    #[arg(long)]
+    instruction_text: Option<String>,
+    #[arg(long)]
+    stuck_guidance_text: Option<String>,
+    #[arg(long)]
+    blocked_by: Option<String>,
 }
 
 #[derive(Args)]
 struct GoalUpdateArgs {
     goal_key: String,
+    #[arg(long)]
+    parent_goal_key: Option<String>,
     #[arg(long)]
     title: Option<String>,
     #[arg(long)]
@@ -278,11 +288,25 @@ struct GoalUpdateArgs {
     #[arg(long)]
     clear_success_fact: bool,
     #[arg(long)]
+    clear_parent_goal_key: bool,
+    #[arg(long)]
     tick: Option<u32>,
     #[arg(long)]
     scope_note: Option<String>,
     #[arg(long)]
     clear_scope_note: bool,
+    #[arg(long)]
+    instruction_text: Option<String>,
+    #[arg(long)]
+    clear_instruction_text: bool,
+    #[arg(long)]
+    stuck_guidance_text: Option<String>,
+    #[arg(long)]
+    clear_stuck_guidance_text: bool,
+    #[arg(long)]
+    blocked_by: Option<String>,
+    #[arg(long)]
+    clear_blocked_by: bool,
 }
 
 #[derive(Args)]
@@ -310,7 +334,7 @@ struct GoalSetArgs {
 
 #[derive(Args)]
 struct GoalTreeArgs {
-    goal_key: String,
+    goal_key: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -416,6 +440,9 @@ struct SubGoalUpdateArgs {
     instruction_text: Option<String>,
     #[arg(long)]
     stuck_guidance_text: Option<String>,
+    /// JSON metadata
+    #[arg(long)]
+    metadata: Option<String>,
     #[arg(long)]
     clear_depends: bool,
     #[arg(long)]
@@ -1374,86 +1401,31 @@ fn decode_value_json(raw: &Value) -> Value {
 }
 
 fn cmd_goal_tree(cli: &CliContext, args: GoalTreeArgs) -> Result<()> {
-    let goal_query = format!(
-        "SELECT goal_key, title, detail, status, priority, depends_on_goal_key, success_fact_key, metadata_json, completion_report, created_at, updated_at, tick, scope_note FROM goals WHERE goal_key = '{}'",
-        sql_escape(&args.goal_key)
-    );
-    let Some(mut goal) = first_row_object(cli, &goal_query)? else {
-        let _ = writeln!(
-            &mut io::stderr().lock(),
-            "goal '{}' not found",
-            args.goal_key
-        );
-        std::process::exit(2);
+    let goals = goal_tree_rows(cli, "SELECT * FROM goals", normalize_goal_node)?;
+    let sub_goals = goal_tree_rows(cli, "SELECT * FROM sub_goals", normalize_sub_goal_node)?;
+    let facts = goal_tree_rows(cli, "SELECT * FROM facts", normalize_fact_node)?;
+
+    let roots = if let Some(goal_key) = args.goal_key.as_deref() {
+        let Some(goal) = goals
+            .iter()
+            .find(|goal| nonempty_json_string(goal.get("goal_key")).as_deref() == Some(goal_key))
+        else {
+            let _ = writeln!(&mut io::stderr().lock(), "goal '{goal_key}' not found");
+            std::process::exit(2);
+        };
+        vec![build_goal_node(
+            goal,
+            &goals,
+            &sub_goals,
+            &mut std::collections::BTreeSet::new(),
+        )]
+    } else {
+        build_root_goal_nodes(&goals, &sub_goals)
     };
 
-    if let Some(goal_key) = goal.get("goal_key").cloned() {
-        goal.insert("key".to_string(), goal_key);
-    }
-    let metadata = parse_json_object(goal.get("metadata_json"));
-    for key in ["metric", "done_when", "surfaces"] {
-        if let Some(value) = metadata.get(key) {
-            goal.insert(key.to_string(), value.clone());
-        }
-    }
-
-    let ws_query = format!(
-        "SELECT ws_uid, goal_key, ws_id, title, metric, done_when, falsification, status, stall, blocker, next_substep, ord, worker, created_at, updated_at, metadata_json FROM workstreams WHERE goal_key = '{}'",
-        sql_escape(&args.goal_key)
-    );
-    let ws_results = sql_query(cli, &ws_query)?;
-    let (ws_columns, ws_rows) = extract_columns_and_rows(&ws_results);
-    let mut workstreams = Vec::with_capacity(ws_rows.len());
-    for row in &ws_rows {
-        let mut obj = row_to_json_object(&ws_columns, row);
-        if let Some(ord) = obj.get("ord").cloned() {
-            obj.insert("order".to_string(), ord);
-        }
-        workstreams.push(Value::Object(obj));
-    }
-    workstreams.sort_by_key(|value| {
-        value
-            .get("ord")
-            .and_then(|ord| ord.as_u64())
-            .unwrap_or(u64::MAX)
-    });
-
-    let fact_results = sql_query(
-        cli,
-        "SELECT fact_key, value_json, confidence, source_type, source_ref, updated_at, metadata_json FROM facts",
-    )?;
-    let (fact_columns, fact_rows) = extract_columns_and_rows(&fact_results);
-    let mut scoped_facts: Vec<(String, Value)> = Vec::new();
-    let prefix = format!("{}.", args.goal_key);
-    for row in &fact_rows {
-        let obj = row_to_json_object(&fact_columns, row);
-        let fact_key = obj
-            .get("fact_key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let metadata = parse_json_object(obj.get("metadata_json"));
-        let metadata_goal = metadata
-            .get("goal_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s == args.goal_key)
-            .unwrap_or(false);
-        if metadata_goal || fact_key.starts_with(&prefix) {
-            scoped_facts.push((
-                fact_key,
-                decode_value_json(obj.get("value_json").unwrap_or(&Value::Null)),
-            ));
-        }
-    }
-    scoped_facts.sort_by(|a, b| a.0.cmp(&b.0));
-    let facts = scoped_facts
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect::<Vec<_>>();
-
     let tree = json!({
-        "goal": Value::Object(goal),
-        "workstreams": workstreams,
+        "schema": "goal_tree.v2",
+        "roots": roots,
         "facts": facts,
     });
     if args.json {
@@ -1462,6 +1434,203 @@ fn cmd_goal_tree(cli: &CliContext, args: GoalTreeArgs) -> Result<()> {
         out!("{}", serde_json::to_string_pretty(&tree)?);
     }
     Ok(())
+}
+
+fn goal_tree_rows<F>(cli: &CliContext, query: &str, normalize: F) -> Result<Vec<Value>>
+where
+    F: Fn(serde_json::Map<String, Value>) -> Value,
+{
+    let results = sql_query(cli, query)?;
+    let (columns, rows) = extract_columns_and_rows(&results);
+    Ok(rows
+        .iter()
+        .map(|row| normalize(row_to_json_object(&columns, row)))
+        .collect())
+}
+
+fn normalize_goal_node(mut obj: serde_json::Map<String, Value>) -> Value {
+    if let Some(goal_key) = obj.get("goal_key").cloned() {
+        obj.insert("key".to_string(), goal_key);
+    }
+    if let Some(raw_meta) = obj.remove("metadata_json") {
+        let metadata = parse_json_object(Some(&raw_meta));
+        for key in ["metric", "done_when", "surfaces"] {
+            if let Some(value) = metadata.get(key) {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+        obj.insert("metadata".to_string(), Value::Object(metadata));
+    }
+    obj.insert("type".to_string(), Value::String("goal".to_string()));
+    obj.insert("children".to_string(), Value::Array(Vec::new()));
+    Value::Object(obj)
+}
+
+fn normalize_sub_goal_node(mut obj: serde_json::Map<String, Value>) -> Value {
+    if let Some(sub_goal_key) = obj.get("sub_goal_key").cloned() {
+        obj.insert("key".to_string(), sub_goal_key);
+    }
+    if let Some(raw_meta) = obj.remove("metadata_json") {
+        let metadata = parse_json_object(Some(&raw_meta));
+        if let Some(parent) = metadata.get("parent_sub_goal_key").cloned() {
+            obj.insert("parent_sub_goal_key".to_string(), parent);
+        }
+        obj.insert("metadata".to_string(), Value::Object(metadata));
+    }
+    obj.insert("type".to_string(), Value::String("sub_goal".to_string()));
+    obj.insert("children".to_string(), Value::Array(Vec::new()));
+    Value::Object(obj)
+}
+
+fn normalize_fact_node(mut obj: serde_json::Map<String, Value>) -> Value {
+    if let Some(raw_meta) = obj.remove("metadata_json") {
+        obj.insert(
+            "metadata".to_string(),
+            Value::Object(parse_json_object(Some(&raw_meta))),
+        );
+    }
+    if let Some(raw_value) = obj.get("value_json").cloned() {
+        obj.insert("value".to_string(), decode_value_json(&raw_value));
+    }
+    obj.insert("type".to_string(), Value::String("fact".to_string()));
+    Value::Object(obj)
+}
+
+fn build_root_goal_nodes(goals: &[Value], sub_goals: &[Value]) -> Vec<Value> {
+    let goal_keys: std::collections::BTreeSet<String> = goals
+        .iter()
+        .filter_map(|goal| nonempty_json_string(goal.get("goal_key")))
+        .collect();
+    let mut roots: Vec<Value> = goals
+        .iter()
+        .filter(|goal| {
+            nonempty_json_string(goal.get("parent_goal_key"))
+                .map(|parent| !goal_keys.contains(&parent))
+                .unwrap_or(true)
+        })
+        .map(|goal| {
+            build_goal_node(
+                goal,
+                goals,
+                sub_goals,
+                &mut std::collections::BTreeSet::new(),
+            )
+        })
+        .collect();
+    sort_tree_nodes(&mut roots);
+    roots
+}
+
+fn build_goal_node(
+    goal: &Value,
+    goals: &[Value],
+    sub_goals: &[Value],
+    visiting: &mut std::collections::BTreeSet<String>,
+) -> Value {
+    let key = nonempty_json_string(goal.get("goal_key")).unwrap_or_default();
+    if !visiting.insert(key.clone()) {
+        return json!({
+            "type": "goal",
+            "key": key,
+            "cycle": true,
+            "children": [],
+        });
+    }
+
+    let mut obj = goal.as_object().cloned().unwrap_or_default();
+    let mut children: Vec<Value> = goals
+        .iter()
+        .filter(|child| nonempty_json_string(child.get("parent_goal_key")).as_deref() == Some(&key))
+        .map(|child| build_goal_node(child, goals, sub_goals, visiting))
+        .collect();
+    children.extend(build_sub_goal_roots(&key, sub_goals));
+    sort_tree_nodes(&mut children);
+
+    obj.insert("children".to_string(), Value::Array(children));
+    visiting.remove(&key);
+    Value::Object(obj)
+}
+
+fn build_sub_goal_roots(goal_key: &str, sub_goals: &[Value]) -> Vec<Value> {
+    let local_keys: std::collections::BTreeSet<String> = sub_goals
+        .iter()
+        .filter(|sg| nonempty_json_string(sg.get("goal_key")).as_deref() == Some(goal_key))
+        .filter_map(|sg| nonempty_json_string(sg.get("sub_goal_key")))
+        .collect();
+    let mut roots: Vec<Value> = sub_goals
+        .iter()
+        .filter(|sg| nonempty_json_string(sg.get("goal_key")).as_deref() == Some(goal_key))
+        .filter(|sg| {
+            nonempty_json_string(sg.get("parent_sub_goal_key"))
+                .map(|dep| !local_keys.contains(&dep))
+                .unwrap_or(true)
+        })
+        .map(|sg| build_sub_goal_node(sg, sub_goals, &mut std::collections::BTreeSet::new()))
+        .collect();
+    sort_tree_nodes(&mut roots);
+    roots
+}
+
+fn build_sub_goal_node(
+    sub_goal: &Value,
+    sub_goals: &[Value],
+    visiting: &mut std::collections::BTreeSet<String>,
+) -> Value {
+    let key = nonempty_json_string(sub_goal.get("sub_goal_key")).unwrap_or_default();
+    if !visiting.insert(key.clone()) {
+        return json!({
+            "type": "sub_goal",
+            "key": key,
+            "cycle": true,
+            "children": [],
+        });
+    }
+    let goal_key = nonempty_json_string(sub_goal.get("goal_key")).unwrap_or_default();
+    let mut children: Vec<Value> = sub_goals
+        .iter()
+        .filter(|child| nonempty_json_string(child.get("goal_key")).as_deref() == Some(&goal_key))
+        .filter(|child| {
+            nonempty_json_string(child.get("parent_sub_goal_key")).as_deref() == Some(&key)
+        })
+        .map(|child| build_sub_goal_node(child, sub_goals, visiting))
+        .collect();
+    sort_tree_nodes(&mut children);
+
+    let mut obj = sub_goal.as_object().cloned().unwrap_or_default();
+    obj.insert("children".to_string(), Value::Array(children));
+    visiting.remove(&key);
+    Value::Object(obj)
+}
+
+fn sort_tree_nodes(nodes: &mut [Value]) {
+    nodes.sort_by(|a, b| {
+        node_priority(b)
+            .cmp(&node_priority(a))
+            .then_with(|| node_key(a).cmp(&node_key(b)))
+    });
+}
+
+fn node_priority(node: &Value) -> u64 {
+    node.get("priority")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn node_key(node: &Value) -> String {
+    nonempty_json_string(node.get("key"))
+        .or_else(|| nonempty_json_string(node.get("goal_key")))
+        .or_else(|| nonempty_json_string(node.get("sub_goal_key")))
+        .or_else(|| nonempty_json_string(node.get("ws_id")))
+        .unwrap_or_default()
+}
+
+fn nonempty_json_string(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(s)) if !s.is_empty() && s != "(none)" => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 fn cmd_ws_set(cli: &CliContext, args: WsSetArgs) -> Result<()> {
@@ -1519,6 +1688,7 @@ fn cmd_goal_set(cli: &CliContext, args: GoalSetArgs) -> Result<()> {
                 "detail": none_json(),
                 "status": optional_json_string(args.status),
                 "priority": none_json(),
+                "parent_goal_key": none_json(),
                 "depends_on_goal_key": none_json(),
                 "success_fact_key": none_json(),
                 "metadata_json": optional_json_string(metadata_json),
@@ -1528,6 +1698,13 @@ fn cmd_goal_set(cli: &CliContext, args: GoalSetArgs) -> Result<()> {
                 "clear_depends": false,
                 "clear_success_fact": false,
                 "clear_scope_note": args.clear_scope_note,
+                "clear_parent_goal_key": false,
+                "instruction_text": none_json(),
+                "clear_instruction_text": false,
+                "stuck_guidance_text": none_json(),
+                "clear_stuck_guidance_text": false,
+                "blocked_by": none_json(),
+                "clear_blocked_by": false,
             }),
         ]),
     )
@@ -1555,118 +1732,192 @@ fn cmd_import_goal_tree(cli: &CliContext, args: ImportGoalTreeArgs) -> Result<()
         .with_context(|| format!("reading {}", args.path.display()))?;
     let tree: Value =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", args.path.display()))?;
-    let goal = tree
-        .get("goal")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| anyhow!("goal_tree JSON must contain a goal object"))?;
-    let goal_key = args
-        .goal_key
-        .or_else(|| value_string(goal.get("goal_key")))
-        .or_else(|| value_string(goal.get("key")))
-        .unwrap_or_else(|| "albion_bot".to_string());
+    let roots = tree
+        .get("roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("goal_tree.v2 JSON must contain a roots array"))?;
+    let mut counts = ImportGoalTreeCounts::default();
+    for (idx, root) in roots.iter().enumerate() {
+        let override_key = if idx == 0 {
+            args.goal_key.as_deref()
+        } else {
+            None
+        };
+        import_goal_tree_goal(cli, root, override_key, None, &mut counts)?;
+    }
+    import_goal_tree_facts(cli, &tree, &args, &mut counts)?;
+
+    out!(
+        "imported goal_tree.v2: {} goals, {} sub-goals, {} facts",
+        counts.goals,
+        counts.sub_goals,
+        counts.facts
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct ImportGoalTreeCounts {
+    goals: u32,
+    sub_goals: u32,
+    facts: u32,
+}
+
+fn import_goal_tree_goal(
+    cli: &CliContext,
+    node: &Value,
+    override_key: Option<&str>,
+    parent_goal_key: Option<&str>,
+    counts: &mut ImportGoalTreeCounts,
+) -> Result<String> {
+    let obj = node
+        .as_object()
+        .ok_or_else(|| anyhow!("goal tree node is not an object"))?;
+    if value_string(obj.get("type")).as_deref() != Some("goal") {
+        return Err(anyhow!("expected goal node, got {:?}", obj.get("type")));
+    }
+    let goal_key = override_key
+        .map(str::to_string)
+        .or_else(|| value_string(obj.get("goal_key")))
+        .or_else(|| value_string(obj.get("key")))
+        .ok_or_else(|| anyhow!("goal node is missing goal_key/key"))?;
     if goal_key.contains("::") {
-        return Err(anyhow!("goal_key must not contain '::'"));
+        return Err(anyhow!("goal_key must not contain '::': {goal_key}"));
     }
 
-    let mut metadata = parse_json_object(goal.get("metadata_json"));
+    let mut metadata = parse_json_object(obj.get("metadata").or_else(|| obj.get("metadata_json")));
     for key in ["metric", "surfaces", "done_when"] {
-        if let Some(value) = goal.get(key) {
+        if let Some(value) = obj.get(key) {
             metadata.insert(key.to_string(), value.clone());
         }
     }
-    let title = value_string(goal.get("title")).unwrap_or_else(|| goal_key.clone());
     call_reducer_silent(
         cli,
         "goal_add",
         Some(vec![json!({
             "goal_key": goal_key,
-            "title": title,
-            "detail": some_json_string(value_string(goal.get("done_when")).unwrap_or_default()),
-            "status": some_json_string(value_string(goal.get("status")).unwrap_or_else(|| "active".to_string())),
-            "priority": some_json_u32(value_u32(goal.get("priority")).unwrap_or(50)),
-            "depends_on_goal_key": optional_json_string(value_string(goal.get("depends_on_goal_key"))),
-            "success_fact_key": optional_json_string(value_string(goal.get("success_fact_key"))),
+            "title": value_string(obj.get("title")).unwrap_or_else(|| goal_key.clone()),
+            "parent_goal_key": optional_json_string(parent_goal_key.map(str::to_string).or_else(|| value_string(obj.get("parent_goal_key")))),
+            "detail": some_json_string(value_string(obj.get("detail")).or_else(|| value_string(obj.get("done_when"))).unwrap_or_default()),
+            "status": some_json_string(value_string(obj.get("status")).unwrap_or_else(|| "active".to_string())),
+            "priority": some_json_u32(value_u32(obj.get("priority")).unwrap_or(50)),
+            "depends_on_goal_key": optional_json_string(value_string(obj.get("depends_on_goal_key"))),
+            "success_fact_key": optional_json_string(value_string(obj.get("success_fact_key"))),
             "metadata_json": some_json_string(serde_json::to_string(&Value::Object(metadata))?),
             "completion_report": null,
-            "tick": optional_json_u32(value_u32(goal.get("tick"))),
-            "scope_note": optional_json_string(value_string(goal.get("scope_note"))),
+            "tick": optional_json_u32(value_u32(obj.get("tick"))),
+            "scope_note": optional_json_string(value_string(obj.get("scope_note"))),
             "clear_scope_note": false,
+            "instruction_text": optional_json_string(value_string(obj.get("instruction_text"))),
+            "stuck_guidance_text": optional_json_string(value_string(obj.get("stuck_guidance_text"))),
+            "blocked_by": optional_json_string(value_string(obj.get("blocked_by"))),
         })]),
     )?;
+    counts.goals += 1;
 
-    let mut workstream_count = 0u32;
-    if let Some(items) = tree
-        .get("workstreams")
-        .or_else(|| tree.get("subgoals"))
-        .and_then(|v| v.as_array())
-    {
-        for (idx, item) in items.iter().enumerate() {
-            let obj = item
-                .as_object()
-                .ok_or_else(|| anyhow!("workstream at index {idx} is not an object"))?;
-            let ws_id = value_string(obj.get("ws_id"))
-                .or_else(|| value_string(obj.get("id")))
-                .or_else(|| value_string(obj.get("key")))
-                .ok_or_else(|| anyhow!("workstream at index {idx} is missing ws_id/id/key"))?;
-            if ws_id.contains("::") {
-                return Err(anyhow!("workstream id must not contain '::': {ws_id}"));
+    if let Some(children) = obj.get("children").and_then(Value::as_array) {
+        for child in children {
+            match value_string(child.get("type")).as_deref() {
+                Some("goal") => {
+                    import_goal_tree_goal(cli, child, None, Some(&goal_key), counts)?;
+                }
+                Some("sub_goal") => {
+                    import_goal_tree_sub_goal(cli, &goal_key, child, None, counts)?;
+                }
+                _ => return Err(anyhow!("unknown child node type: {:?}", child.get("type"))),
             }
-            let mut metadata = parse_json_object(obj.get("metadata_json"));
-            if metadata.is_empty() {
-                metadata.insert(
-                    "source".to_string(),
-                    Value::String("import-goal-tree".to_string()),
-                );
-            }
-            call_reducer_silent(
-                cli,
-                "workstream_set",
-                Some(vec![json!({
-                    "goal_key": goal_key,
-                    "ws_id": ws_id,
-                    "title": optional_json_string(value_string(obj.get("title"))),
-                    "metric": optional_json_string(value_string(obj.get("metric"))),
-                    "done_when": optional_json_string(value_string(obj.get("done_when"))),
-                    "falsification": optional_json_string(value_string(obj.get("falsification"))),
-                    "status": optional_json_string(value_string(obj.get("status"))),
-                    "stall": optional_json_u32(value_u32(obj.get("stall")).or_else(|| value_u32(obj.get("stall_counter")))),
-                    "blocker": optional_json_string(value_string(obj.get("blocker"))),
-                    "next_substep": optional_json_string(value_string(obj.get("next_substep"))),
-                    "ord": optional_json_u32(value_u32(obj.get("ord")).or_else(|| value_u32(obj.get("order"))).or(Some(idx as u32))),
-                    "worker": optional_json_string(value_string(obj.get("worker"))),
-                    "metadata_json": some_json_string(serde_json::to_string(&Value::Object(metadata))?),
-                    "clear_metric": false,
-                    "clear_done_when": false,
-                    "clear_falsification": false,
-                    "clear_blocker": false,
-                    "clear_next_substep": false,
-                    "clear_worker": false,
-                })]),
-            )?;
-            workstream_count += 1;
         }
     }
+    Ok(goal_key)
+}
 
-    let mut fact_count = 0u32;
-    if let Some(facts) = tree.get("facts").and_then(|v| v.as_array()) {
+fn import_goal_tree_sub_goal(
+    cli: &CliContext,
+    goal_key: &str,
+    node: &Value,
+    parent_sub_goal_key: Option<&str>,
+    counts: &mut ImportGoalTreeCounts,
+) -> Result<String> {
+    let obj = node
+        .as_object()
+        .ok_or_else(|| anyhow!("sub-goal node is not an object"))?;
+    let sub_goal_key = value_string(obj.get("sub_goal_key"))
+        .or_else(|| value_string(obj.get("key")))
+        .ok_or_else(|| anyhow!("sub-goal node is missing sub_goal_key/key"))?;
+    let mut metadata = parse_json_object(obj.get("metadata").or_else(|| obj.get("metadata_json")));
+    if let Some(parent) = parent_sub_goal_key
+        .map(str::to_string)
+        .or_else(|| value_string(obj.get("parent_sub_goal_key")))
+    {
+        metadata.insert("parent_sub_goal_key".to_string(), Value::String(parent));
+    }
+    if metadata.is_empty() {
+        metadata.insert(
+            "source".to_string(),
+            Value::String("import-goal-tree".to_string()),
+        );
+    }
+    call_reducer_silent(
+        cli,
+        "sub_goal_add",
+        Some(vec![json!({
+            "sub_goal_key": sub_goal_key,
+            "goal_key": goal_key,
+            "owner_agent": value_string(obj.get("owner_agent")).unwrap_or_else(|| "unassigned".to_string()),
+            "title": value_string(obj.get("title")).unwrap_or_else(|| sub_goal_key.clone()),
+            "detail": some_json_string(value_string(obj.get("detail")).unwrap_or_default()),
+            "status": some_json_string(value_string(obj.get("status")).unwrap_or_else(|| "pending".to_string())),
+            "priority": some_json_u32(value_u32(obj.get("priority")).unwrap_or(50)),
+            "depends_on_sub_goal_key": optional_json_string(value_string(obj.get("depends_on_sub_goal_key"))),
+            "blocked_by": optional_json_string(value_string(obj.get("blocked_by"))),
+            "success_fact_key": optional_json_string(value_string(obj.get("success_fact_key"))),
+            "instruction_text": optional_json_string(value_string(obj.get("instruction_text"))),
+            "stuck_guidance_text": optional_json_string(value_string(obj.get("stuck_guidance_text"))),
+            "metadata_json": some_json_string(serde_json::to_string(&Value::Object(metadata))?),
+            "completion_report": null,
+        })]),
+    )?;
+    counts.sub_goals += 1;
+
+    if let Some(children) = obj.get("children").and_then(Value::as_array) {
+        for child in children {
+            import_goal_tree_sub_goal(cli, goal_key, child, Some(&sub_goal_key), counts)?;
+        }
+    }
+    Ok(sub_goal_key)
+}
+
+fn import_goal_tree_facts(
+    cli: &CliContext,
+    tree: &Value,
+    args: &ImportGoalTreeArgs,
+    counts: &mut ImportGoalTreeCounts,
+) -> Result<()> {
+    if let Some(facts) = tree.get("facts").and_then(Value::as_array) {
         for (idx, fact) in facts.iter().enumerate() {
+            let fact_key = value_string(fact.get("fact_key"))
+                .unwrap_or_else(|| format!("import-goal-tree.note{idx:02}"));
+            let value_json = fact
+                .get("value_json")
+                .cloned()
+                .or_else(|| fact.get("value").cloned())
+                .unwrap_or_else(|| fact.clone());
+            let metadata = parse_json_object(fact.get("metadata").or_else(|| fact.get("metadata_json")));
             call_reducer_silent(
                 cli,
                 "fact_set",
                 Some(vec![json!({
-                    "fact_key": format!("{goal_key}.note{idx:02}"),
-                    "value_json": serde_json::to_string(fact)?,
-                    "confidence": some_json_f64(1.0),
-                    "source_type": some_json_string("import-goal-tree".to_string()),
+                    "fact_key": fact_key,
+                    "value_json": serde_json::to_string(&value_json)?,
+                    "confidence": some_json_f64(fact.get("confidence").and_then(Value::as_f64).unwrap_or(1.0)),
+                    "source_type": some_json_string(value_string(fact.get("source_type")).unwrap_or_else(|| "import-goal-tree".to_string())),
                     "source_ref": some_json_string(args.path.display().to_string()),
-                    "metadata_json": some_json_string(json!({"goal_key": goal_key, "ord": idx}).to_string()),
+                    "metadata_json": some_json_string(serde_json::to_string(&Value::Object(metadata))?),
                 })]),
             )?;
-            fact_count += 1;
+            counts.facts += 1;
         }
     }
-
-    out!("imported goal {goal_key}: {workstream_count} workstreams, {fact_count} facts");
     Ok(())
 }
 
@@ -2870,6 +3121,7 @@ fn run() -> Result<()> {
             Some(vec![json!({
                 "goal_key": args.goal_key,
                 "title": args.title,
+                "parent_goal_key": optional_json_string(args.parent_goal_key),
                 "detail": some_json_string(args.detail),
                 "status": some_json_string(args.status),
                 "priority": some_json_u32(args.priority),
@@ -2879,7 +3131,10 @@ fn run() -> Result<()> {
                 "completion_report": null,
                 "tick": optional_json_u32(args.tick),
                 "scope_note": optional_json_string(args.scope_note),
-                "clear_scope_note": false
+                "clear_scope_note": false,
+                "instruction_text": optional_json_string(args.instruction_text),
+                "stuck_guidance_text": optional_json_string(args.stuck_guidance_text),
+                "blocked_by": optional_json_string(args.blocked_by),
             })]),
         ),
         Commands::GoalUpdate(args) => call_reducer(
@@ -2888,6 +3143,7 @@ fn run() -> Result<()> {
             Some(vec![
                 Value::String(args.goal_key),
                 json!({
+                    "parent_goal_key": optional_json_string(args.parent_goal_key),
                     "title": optional_json_string(args.title),
                     "detail": optional_json_string(args.detail),
                     "status": optional_json_string(args.status),
@@ -2900,7 +3156,14 @@ fn run() -> Result<()> {
                     "scope_note": optional_json_string(args.scope_note),
                     "clear_depends": args.clear_depends,
                     "clear_success_fact": args.clear_success_fact,
-                    "clear_scope_note": args.clear_scope_note
+                    "clear_scope_note": args.clear_scope_note,
+                    "clear_parent_goal_key": args.clear_parent_goal_key,
+                    "instruction_text": optional_json_string(args.instruction_text),
+                    "clear_instruction_text": args.clear_instruction_text,
+                    "stuck_guidance_text": optional_json_string(args.stuck_guidance_text),
+                    "clear_stuck_guidance_text": args.clear_stuck_guidance_text,
+                    "blocked_by": optional_json_string(args.blocked_by),
+                    "clear_blocked_by": args.clear_blocked_by,
                 }),
             ]),
         ),
@@ -2957,7 +3220,7 @@ fn run() -> Result<()> {
                     "success_fact_key": optional_json_string(args.success_fact_key),
                     "instruction_text": optional_json_string(args.instruction_text),
                     "stuck_guidance_text": optional_json_string(args.stuck_guidance_text),
-                    "metadata_json": none_json(),
+                    "metadata_json": optional_json_string(args.metadata),
                     "blocked_by": none_json(),
                     "completion_report": none_json(),
                     "clear_depends": args.clear_depends,
@@ -3486,21 +3749,25 @@ fn cmd_dump(cli: &CliContext) -> Result<()> {
 
     let rows = sql_rows(
         cli,
-        "SELECT goal_key, title, detail, status, priority, depends_on_goal_key, success_fact_key, metadata_json, tick, scope_note FROM goals",
+        "SELECT goal_key, parent_goal_key, title, detail, status, priority, depends_on_goal_key, blocked_by, success_fact_key, metadata_json, tick, scope_note, instruction_text, stuck_guidance_text FROM goals",
     )?;
     for row in &rows {
         let obj = json!({
             "type": "goal",
             "goal_key": bsatn_unwrap_or(&row[0], ""),
-            "title": bsatn_unwrap_or(&row[1], ""),
-            "detail": bsatn_unwrap(&row[2]).unwrap_or_default(),
-            "status": bsatn_unwrap_or(&row[3], "active"),
-            "priority": row[4].as_u64().unwrap_or(50),
-            "depends_on_goal_key": bsatn_unwrap(&row[5]),
-            "success_fact_key": bsatn_unwrap(&row[6]),
-            "metadata_json": bsatn_unwrap_or(&row[7], "{}"),
-            "tick": row[8].as_u64().unwrap_or(0),
-            "scope_note": bsatn_unwrap(&row[9]),
+            "parent_goal_key": bsatn_unwrap(&row[1]),
+            "title": bsatn_unwrap_or(&row[2], ""),
+            "detail": bsatn_unwrap(&row[3]).unwrap_or_default(),
+            "status": bsatn_unwrap_or(&row[4], "active"),
+            "priority": row[5].as_u64().unwrap_or(50),
+            "depends_on_goal_key": bsatn_unwrap(&row[6]),
+            "blocked_by": bsatn_unwrap(&row[7]),
+            "success_fact_key": bsatn_unwrap(&row[8]),
+            "metadata_json": bsatn_unwrap_or(&row[9], "{}"),
+            "tick": row[10].as_u64().unwrap_or(0),
+            "scope_note": bsatn_unwrap(&row[11]),
+            "instruction_text": bsatn_unwrap(&row[12]),
+            "stuck_guidance_text": bsatn_unwrap(&row[13]),
         });
         out!("{}", serde_json::to_string(&obj)?);
     }
@@ -3617,6 +3884,7 @@ fn cmd_restore(cli: &CliContext) -> Result<()> {
                     Some(vec![json!({
                         "goal_key": obj["goal_key"],
                         "title": obj["title"],
+                        "parent_goal_key": optional_json_string(obj["parent_goal_key"].as_str().map(str::to_string)),
                         "detail": some_json_string(obj["detail"].as_str().unwrap_or("").to_string()),
                         "status": some_json_string(obj["status"].as_str().unwrap_or("active").to_string()),
                         "priority": some_json_u32(obj["priority"].as_u64().unwrap_or(50) as u32),
@@ -3626,7 +3894,10 @@ fn cmd_restore(cli: &CliContext) -> Result<()> {
                         "completion_report": null,
                         "tick": optional_json_u32(obj["tick"].as_u64().and_then(|n| u32::try_from(n).ok())),
                         "scope_note": optional_json_string(obj["scope_note"].as_str().map(str::to_string)),
-                        "clear_scope_note": false
+                        "clear_scope_note": false,
+                        "instruction_text": optional_json_string(obj["instruction_text"].as_str().map(str::to_string)),
+                        "stuck_guidance_text": optional_json_string(obj["stuck_guidance_text"].as_str().map(str::to_string)),
+                        "blocked_by": optional_json_string(obj["blocked_by"].as_str().map(str::to_string)),
                     })]),
                 )?;
                 goal_count += 1;

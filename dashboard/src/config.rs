@@ -16,6 +16,7 @@ const DEFAULT_PASSWORD: &str = "welcome to my w0rld";
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
     pub bind_addr: String,
+    pub orchestrator_dir: PathBuf,
     pub harness_path: PathBuf,
     pub harness_server: String,
     pub harness_database: String,
@@ -29,6 +30,7 @@ pub struct DashboardConfig {
     pub memory_dir: PathBuf,
     pub talk_log: PathBuf,
     pub talk_channels_dir: PathBuf,
+    pub artifact_upload_dir: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,7 +46,7 @@ impl DashboardConfig {
         let home_dir = dirs_home();
         let orchestrator_dir = home_dir.join("orchestrator");
         let _ = dotenvy::from_path(orchestrator_dir.join(".env"));
-        let harness_toml = read_harness_toml();
+        let harness_toml = read_harness_toml(&orchestrator_dir);
         let env_map: HashMap<String, String> = env::vars().collect();
 
         let harness_server = env_map
@@ -75,6 +77,7 @@ impl DashboardConfig {
                 .get("DASHBOARD_BIND_ADDR")
                 .cloned()
                 .unwrap_or_else(|| "0.0.0.0:3030".to_string()),
+            orchestrator_dir: orchestrator_dir.clone(),
             harness_path: env_map
                 .get("HARNESS")
                 .map(PathBuf::from)
@@ -95,14 +98,15 @@ impl DashboardConfig {
             ),
             talk_log: analysis_dir.join("talk.jsonl"),
             talk_channels_dir: analysis_dir.join("talk_channels"),
+            artifact_upload_dir: analysis_dir.join("dashboard_uploads"),
             analysis_dir,
         })
     }
 }
 
-fn read_harness_toml() -> HarnessToml {
+fn read_harness_toml(orchestrator_dir: &Path) -> HarnessToml {
     let candidates = [
-        PathBuf::from("/home/sdancer/orchestrator/harness.toml"),
+        orchestrator_dir.join("harness.toml"),
         dirs_home().join(".config/harness/harness.toml"),
         PathBuf::from("harness.toml"),
     ];

@@ -42,6 +42,8 @@ pub struct AgentInput {
 #[derive(Clone, Debug, SpacetimeType)]
 pub struct GoalInput {
     pub goal_key: String,
+    /// `None` = root goal. `Some(key)` = this goal is a child of that goal. See `Goal.parent_goal_key`.
+    pub parent_goal_key: Option<String>,
     pub title: String,
     pub detail: Option<String>,
     pub status: Option<String>,
@@ -53,6 +55,9 @@ pub struct GoalInput {
     pub tick: Option<u32>,
     pub scope_note: Option<String>,
     pub clear_scope_note: bool,
+    pub instruction_text: Option<String>,
+    pub stuck_guidance_text: Option<String>,
+    pub blocked_by: Option<String>,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -70,6 +75,14 @@ pub struct GoalPatch {
     pub clear_depends: bool,
     pub clear_success_fact: bool,
     pub clear_scope_note: bool,
+    pub parent_goal_key: Option<String>,
+    pub clear_parent_goal_key: bool,
+    pub instruction_text: Option<String>,
+    pub clear_instruction_text: bool,
+    pub stuck_guidance_text: Option<String>,
+    pub clear_stuck_guidance_text: bool,
+    pub blocked_by: Option<String>,
+    pub clear_blocked_by: bool,
 }
 
 #[derive(Clone, Debug, SpacetimeType)]
@@ -300,12 +313,19 @@ pub struct Agent {
 pub struct Goal {
     #[primary_key]
     pub goal_key: String,
+    /// `None` = root goal (top of the tree). `Some(goal_key)` = this goal is nested under that
+    /// parent. The tree is the transitive closure of `parent_goal_key` from any root. Multiple
+    /// levels of nesting are allowed; the data model supports an infinitely deep tree.
+    #[index(btree)]
+    pub parent_goal_key: Option<String>,
     pub title: String,
     pub detail: Option<String>,
     #[index(btree)]
     pub status: String,
     #[index(btree)]
     pub priority: u32,
+    /// Sibling gating — separate from `parent_goal_key` (containment). This goal unblocks when
+    /// the named goal is `done`. May point at any goal at any depth, not just siblings.
     pub depends_on_goal_key: Option<String>,
     pub success_fact_key: Option<String>,
     pub metadata_json: String,
@@ -316,6 +336,20 @@ pub struct Goal {
     pub tick: u32,
     #[default(None::<String>)]
     pub scope_note: Option<String>,
+    /// Idle prompt — sent to the agent when this goal is the agent's current goal and the agent
+    /// is idle. Mirrors `SubGoal.instruction_text` for backward-compat (sub_goals table still
+    /// exists; new code writes to this field).
+    #[default(None::<String>)]
+    pub instruction_text: Option<String>,
+    /// Stuck prompt — sent to the agent when this goal has been `pending` for too long without a
+    /// metric move. Mirrors `SubGoal.stuck_guidance_text`.
+    #[default(None::<String>)]
+    pub stuck_guidance_text: Option<String>,
+    /// Comma-separated list of goal_keys that must all be `done` before this goal unblocks.
+    /// Mirrors `SubGoal.blocked_by`. Either `depends_on_goal_key` (single) or `blocked_by`
+    /// (multiple) can be used; both are checked by `resolve_goal_states`.
+    #[default(None::<String>)]
+    pub blocked_by: Option<String>,
 }
 
 #[derive(Clone)]
@@ -981,6 +1015,7 @@ fn bootstrap_goals() -> Vec<GoalInput> {
     vec![
         GoalInput {
             goal_key: "orchestrator.deliver_tested_oracle".to_string(),
+            parent_goal_key: None,
             title: "Deliver tested oracle and indexed evidence".to_string(),
             detail: Some(
                 "Drive the oracle from implementation through execution and VikingDB indexing."
@@ -995,9 +1030,13 @@ fn bootstrap_goals() -> Vec<GoalInput> {
             tick: None,
             scope_note: None,
             clear_scope_note: false,
+            instruction_text: None,
+            stuck_guidance_text: None,
+            blocked_by: None,
         },
         GoalInput {
             goal_key: "orchestrator.recover_crypto".to_string(),
+            parent_goal_key: None,
             title: "Recover the crypto algorithm".to_string(),
             detail: Some(
                 "Drive crypto from static analysis through emulation to an identified algorithm."
@@ -1012,9 +1051,13 @@ fn bootstrap_goals() -> Vec<GoalInput> {
             tick: None,
             scope_note: None,
             clear_scope_note: false,
+            instruction_text: None,
+            stuck_guidance_text: None,
+            blocked_by: None,
         },
         GoalInput {
             goal_key: "orchestrator.validate_capture_path".to_string(),
+            parent_goal_key: None,
             title: "Validate the capture path".to_string(),
             detail: Some(
                 "Build and test the capture flow; use a stub until the crypto is fully solved."
@@ -1029,6 +1072,9 @@ fn bootstrap_goals() -> Vec<GoalInput> {
             tick: None,
             scope_note: None,
             clear_scope_note: false,
+            instruction_text: None,
+            stuck_guidance_text: None,
+            blocked_by: None,
         },
     ]
 }
@@ -1193,10 +1239,15 @@ fn upsert_goal_internal(ctx: &ReducerContext, input: GoalInput) -> Result<(), St
     if let Some(dep) = input.depends_on_goal_key.as_ref() {
         require_goal(ctx, dep)?;
     }
+    if let Some(parent) = input.parent_goal_key.as_ref() {
+        require_goal(ctx, parent)?;
+    }
     let timestamp = now(ctx);
     let existing = ctx.db.goals().goal_key().find(&input.goal_key);
     let row = Goal {
         goal_key: input.goal_key.clone(),
+        parent_goal_key: opt_text(input.parent_goal_key)
+            .or_else(|| existing.as_ref().and_then(|r| r.parent_goal_key.clone())),
         title: input.title,
         detail: opt_text(input.detail),
         status: input.status.unwrap_or_else(|| "pending".to_string()),
@@ -1222,6 +1273,12 @@ fn upsert_goal_internal(ctx: &ReducerContext, input: GoalInput) -> Result<(), St
             opt_text(input.scope_note)
                 .or_else(|| existing.as_ref().and_then(|row| row.scope_note.clone()))
         },
+        instruction_text: opt_text(input.instruction_text)
+            .or_else(|| existing.as_ref().and_then(|r| r.instruction_text.clone())),
+        stuck_guidance_text: opt_text(input.stuck_guidance_text)
+            .or_else(|| existing.as_ref().and_then(|r| r.stuck_guidance_text.clone())),
+        blocked_by: opt_text(input.blocked_by)
+            .or_else(|| existing.as_ref().and_then(|r| r.blocked_by.clone())),
     };
     let _ = ctx.db.goals().goal_key().delete(&row.goal_key);
     ctx.db.goals().insert(row);
@@ -1614,6 +1671,11 @@ pub fn goal_update(ctx: &ReducerContext, goal_key: String, patch: GoalPatch) -> 
     let current = require_goal(ctx, &goal_key)?;
     let next = GoalInput {
         goal_key: goal_key.clone(),
+        parent_goal_key: if patch.clear_parent_goal_key {
+            None
+        } else {
+            patch.parent_goal_key.or(current.parent_goal_key)
+        },
         title: patch.title.unwrap_or(current.title),
         detail: patch.detail.or(current.detail),
         status: patch.status.clone().or(Some(current.status)),
@@ -1637,6 +1699,21 @@ pub fn goal_update(ctx: &ReducerContext, goal_key: String, patch: GoalPatch) -> 
             patch.scope_note.or(current.scope_note)
         },
         clear_scope_note: patch.clear_scope_note,
+        instruction_text: if patch.clear_instruction_text {
+            None
+        } else {
+            patch.instruction_text.or(current.instruction_text)
+        },
+        stuck_guidance_text: if patch.clear_stuck_guidance_text {
+            None
+        } else {
+            patch.stuck_guidance_text.or(current.stuck_guidance_text)
+        },
+        blocked_by: if patch.clear_blocked_by {
+            None
+        } else {
+            patch.blocked_by.or(current.blocked_by)
+        },
     };
     upsert_goal_internal(ctx, next)?;
     log_event(ctx, None, "goal.updated", goal_key, None);
@@ -1704,45 +1781,81 @@ pub fn goal_remove(
 ) -> Result<(), String> {
     require_goal(ctx, &goal_key)?;
     if delete {
-        let children: Vec<_> = ctx
-            .db
-            .sub_goals()
-            .iter()
-            .filter(|row| row.goal_key == goal_key)
-            .collect();
-        if !children.is_empty() && !cascade {
-            return Err(format!(
-                "goal {goal_key} still has {} sub-goal(s); use --cascade or cancel instead",
-                children.len()
-            ));
-        }
-        for child in children {
-            let _ = ctx
+        // Recursive cascade: collect all descendants (sub_goals AND child goals) so we can
+        // remove the entire tree under this goal. Without --cascade, refuse if any descendants
+        // exist.
+        let mut all_descendants: Vec<String> = Vec::new();
+        let mut frontier: Vec<String> = vec![goal_key.clone()];
+        while let Some(parent) = frontier.pop() {
+            // Legacy sub_goals
+            for sg in ctx
                 .db
                 .sub_goals()
-                .sub_goal_key()
-                .delete(&child.sub_goal_key);
+                .iter()
+                .filter(|row| row.goal_key == parent)
+            {
+                all_descendants.push(sg.sub_goal_key.clone());
+            }
+            // New child goals (parent_goal_key == this goal)
+            for child in ctx
+                .db
+                .goals()
+                .iter()
+                .filter(|row| row.parent_goal_key.as_deref() == Some(parent.as_str()))
+            {
+                all_descendants.push(child.goal_key.clone());
+                frontier.push(child.goal_key.clone());
+            }
         }
-        for workstream in ctx
-            .db
-            .workstreams()
-            .iter()
-            .filter(|row| row.goal_key == goal_key)
-        {
-            let _ = ctx.db.workstreams().ws_uid().delete(&workstream.ws_uid);
+        if !all_descendants.is_empty() && !cascade {
+            return Err(format!(
+                "goal {goal_key} still has {} descendant(s); use --cascade or cancel instead",
+                all_descendants.len()
+            ));
         }
-        for agent in ctx
-            .db
-            .agents()
-            .iter()
-            .filter(|row| row.current_goal_key.as_deref() == Some(goal_key.as_str()))
-        {
-            let mut updated = agent;
-            updated.current_goal_key = None;
-            updated.current_sub_goal_key = None;
-            ctx.db.agents().name().update(updated);
+        for sg_key in &all_descendants {
+            let _ = ctx.db.sub_goals().sub_goal_key().delete(sg_key);
         }
-        let _ = ctx.db.goals().goal_key().delete(&goal_key);
+        // BFS-remove child goals (and their sub_goals via the same loop)
+        let mut to_remove: Vec<String> = vec![goal_key.clone()];
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(g) = to_remove.pop() {
+            if !visited.insert(g.clone()) {
+                continue;
+            }
+            // Find children and queue them
+            for child in ctx
+                .db
+                .goals()
+                .iter()
+                .filter(|row| row.parent_goal_key.as_deref() == Some(g.as_str()))
+            {
+                to_remove.push(child.goal_key.clone());
+            }
+            // Remove workstreams under this goal
+            for ws in ctx
+                .db
+                .workstreams()
+                .iter()
+                .filter(|row| row.goal_key == g)
+            {
+                let _ = ctx.db.workstreams().ws_uid().delete(&ws.ws_uid);
+            }
+            // Detach agents assigned to this goal
+            for agent in ctx
+                .db
+                .agents()
+                .iter()
+                .filter(|row| row.current_goal_key.as_deref() == Some(g.as_str()))
+            {
+                let mut updated = agent;
+                updated.current_goal_key = None;
+                updated.current_sub_goal_key = None;
+                ctx.db.agents().name().update(updated);
+            }
+            // Finally delete the goal row itself
+            let _ = ctx.db.goals().goal_key().delete(&g);
+        }
         log_event(
             ctx,
             None,
@@ -1755,6 +1868,7 @@ pub fn goal_remove(
             ctx,
             goal_key.clone(),
             GoalPatch {
+                parent_goal_key: None,
                 title: None,
                 detail: None,
                 status: Some("cancelled".to_string()),
@@ -1768,6 +1882,13 @@ pub fn goal_remove(
                 clear_depends: false,
                 clear_success_fact: false,
                 clear_scope_note: false,
+                clear_parent_goal_key: false,
+                instruction_text: None,
+                clear_instruction_text: false,
+                stuck_guidance_text: None,
+                clear_stuck_guidance_text: false,
+                blocked_by: None,
+                clear_blocked_by: false,
             },
         )?;
         for sub_goal in ctx

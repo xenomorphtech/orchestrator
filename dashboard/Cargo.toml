@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", features = ["form", "macros"] }
+axum = { version = "0.8", features = ["form", "macros", "multipart"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dotenvy = "0.15"

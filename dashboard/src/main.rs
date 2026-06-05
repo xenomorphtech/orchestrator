@@ -3,15 +3,16 @@ mod data;
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::{Form, Json, Router};
+use axum::{Form, Router};
 use chrono::Local;
 use config::DashboardConfig;
 use data::DataClient;
@@ -25,6 +26,7 @@ const AUTH_COOKIE_NAME: &str = "dash_auth";
 const AUTH_COOKIE_MAX_AGE: i64 = 30 * 24 * 3600;
 const PASSWORD_SALT: &str = "dashboard-salt-v1:";
 const GENERAL_TALK_CHANNEL: &str = "general";
+const TALK_WORKER_TIMEOUT_SECONDS: &str = "3600";
 
 #[derive(Clone)]
 struct AppState {
@@ -73,6 +75,10 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/memory/{name}", get(memory_detail))
         .route("/briefings", get(briefings_index))
         .route("/briefings/{name}", get(briefing_detail))
+        .route("/artifacts", get(artifacts))
+        .route("/artifacts/upload", post(artifact_upload))
+        .route("/artifacts/context", post(artifact_context))
+        .route("/artifacts/raw/{sha256}", get(artifact_raw))
         .route("/talk", get(talk_get).post(talk_post))
         .route("/talk/{channel}/since", get(talk_since))
         .route("/talk/new", post(talk_new))
@@ -90,8 +96,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/adherence", get(api_adherence))
         .route("/api/progress", get(api_progress))
         .route("/api/goaltree/{goal_key}", get(api_goaltree))
-        .route("/api/goaltree/{goal_key}/ws/{ws_id}", post(api_goaltree_ws))
         .route("/api/goaltree/{goal_key}/tick", post(api_goaltree_tick))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -439,7 +445,7 @@ async fn goaltree(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         return Redirect::to("/login").into_response();
     }
     let mut body = String::from("<h1 class=\"text-2xl mb-4\">Goal Tree</h1>");
-    let tree = match goal_tree_data(&state, "albion_bot") {
+    let tree = match goal_tree_data(&state, None) {
         Ok(tree) => tree,
         Err(err) => {
             body.push_str(&format!(
@@ -673,6 +679,154 @@ async fn services(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     }
     body.push_str("</tbody></table>");
     render_page("services", &body, 0).into_response()
+}
+
+async fn artifacts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let mut body = String::from("<h1 class=\"text-2xl mb-4\">Artifacts</h1>");
+    body.push_str(&render_artifact_upload_form(None));
+    body.push_str(&render_artifact_table(&artifacts_data(&state, 200), None));
+    render_page("artifacts", &body, 0).into_response()
+}
+
+async fn artifact_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TalkQuery>,
+    mut multipart: Multipart,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let channel = sanitize_channel_slug(query.c.as_deref());
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut context_parts: Vec<String> = Vec::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let field_name = field.name().unwrap_or_default().to_string();
+        match field_name.as_str() {
+            "context" => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        context_parts.push(trimmed.to_string());
+                    }
+                }
+            }
+            "file" => {
+                let original_name = field.file_name().unwrap_or("upload.bin").to_string();
+                let Ok(bytes) = field.bytes().await else {
+                    continue;
+                };
+                if !bytes.is_empty() {
+                    files.push((original_name, bytes.to_vec()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let context_text = context_parts.join("\n\n");
+    let context = (!context_text.trim().is_empty()).then_some(context_text.as_str());
+    let mut saved = Vec::new();
+    for (original_name, bytes) in files {
+        if let Ok(record) =
+            save_uploaded_artifact(&state, &original_name, &bytes, channel.as_deref(), context)
+        {
+            saved.push(record);
+        }
+    }
+    if let Some(channel) = channel {
+        if !saved.is_empty() {
+            let hashes = saved
+                .iter()
+                .map(|artifact| truncate_chars(&artifact.sha256, 12))
+                .collect::<Vec<_>>()
+                .join(", ");
+            append_talk_entry(
+                &state,
+                &channel,
+                "system",
+                &format!("uploaded {} artifact(s): {hashes}", saved.len()),
+                None,
+            );
+            send_talk_worker_prompt(state.clone(), channel.clone(), None);
+        }
+        Redirect::to(&format!("/talk?c={channel}")).into_response()
+    } else {
+        Redirect::to("/artifacts").into_response()
+    }
+}
+
+async fn artifact_raw(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(sha256): Path<String>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let Some(hash) = normalize_sha256(&sha256) else {
+        return (StatusCode::BAD_REQUEST, "invalid sha256").into_response();
+    };
+    let Some(artifact) = artifact_by_sha256(&state, &hash) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let path = value_display(artifact.get("path"));
+    let requested = PathBuf::from(&path);
+    if !artifact_path_allowed(&state, &requested) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let Ok(bytes) = fs::read(&requested) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let filename = requested
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", header_escape(filename)),
+        )
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn artifact_context(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<ArtifactContextForm>,
+) -> Response {
+    if !is_authed(&headers, &state) {
+        return Redirect::to("/login").into_response();
+    }
+    let channel = sanitize_channel_slug(form.c.as_deref());
+    let Some(hash) = normalize_sha256(&form.sha256) else {
+        return (StatusCode::BAD_REQUEST, "invalid sha256").into_response();
+    };
+    let Some(artifact) = artifact_by_sha256(&state, &hash) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let context = form.context.unwrap_or_default();
+    if update_artifact_context(&state, &artifact, &context).is_ok() {
+        if let Some(channel) = channel.as_deref() {
+            append_talk_entry(
+                &state,
+                channel,
+                "system",
+                &format!("updated artifact context: {}", truncate_chars(&hash, 12)),
+                None,
+            );
+            send_talk_worker_prompt(state.clone(), channel.to_string(), None);
+        }
+    }
+    if let Some(channel) = channel {
+        Redirect::to(&format!("/talk?c={channel}")).into_response()
+    } else {
+        Redirect::to("/artifacts").into_response()
+    }
 }
 
 async fn memory_index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -913,6 +1067,8 @@ struct TalkPostForm {
 #[derive(Deserialize)]
 struct TalkNewForm {
     name: Option<String>,
+    goal: Option<String>,
+    context: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -925,17 +1081,11 @@ struct SinceQuery {
     n: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct WorkstreamPatch {
-    status: Option<String>,
-    stall: Option<u32>,
-    blocker: Option<String>,
-    next_substep: Option<String>,
-    title: Option<String>,
-    metric: Option<String>,
-    done_when: Option<String>,
-    worker: Option<String>,
-    falsification: Option<String>,
+#[derive(Deserialize)]
+struct ArtifactContextForm {
+    sha256: String,
+    context: Option<String>,
+    c: Option<String>,
 }
 
 async fn talk_get(
@@ -967,9 +1117,10 @@ async fn talk_post(
     let sender = if sender.is_empty() { "user" } else { sender };
     let text = form.text.unwrap_or_default().trim().to_string();
     if !text.is_empty() {
-        append_talk_entry(&state, &channel, sender, &text);
+        ensure_talk_conversation(&state, &channel, None, None);
+        append_talk_entry(&state, &channel, sender, &text, None);
         if sender == "user" {
-            notify_orchestrator_pane(&state, &text, &channel, None);
+            send_talk_worker_prompt(state.clone(), channel.clone(), Some(text));
         }
         return Redirect::to(&format!("/talk?c={channel}")).into_response();
     }
@@ -1012,11 +1163,18 @@ async fn talk_new(
     match sanitize_channel_slug(form.name.as_deref()) {
         None => Redirect::to(&format!("/talk?c={current}")).into_response(),
         Some(channel) => {
-            ensure_talk_channels(&state);
-            let _ = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(talk_channel_path(&state, &channel));
+            let goal = form
+                .goal
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let context = form
+                .context
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            ensure_talk_conversation(&state, &channel, goal, context);
+            send_talk_worker_prompt(state.clone(), channel.clone(), None);
             Redirect::to(&format!("/talk?c={channel}")).into_response()
         }
     }
@@ -1033,14 +1191,7 @@ async fn talk_clear(
     }
     let channel = sanitize_channel_slug(form.c.as_deref().or(query.c.as_deref()))
         .unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
-    ensure_talk_channels(&state);
-    let _ = fs::File::create(talk_channel_path(&state, &channel));
-    notify_orchestrator_pane(
-        &state,
-        &format!("truncated analysis/talk_channels/{channel}.jsonl"),
-        &channel,
-        Some(&format!("[/talk#{channel} ADMIN clear]")),
-    );
+    mark_talk_conversation_cleared(&state, &channel);
     Redirect::to(&format!("/talk?c={channel}")).into_response()
 }
 
@@ -1058,13 +1209,7 @@ async fn talk_delete(
     if channel == GENERAL_TALK_CHANNEL {
         return (StatusCode::BAD_REQUEST, "cannot delete the default channel").into_response();
     }
-    let _ = fs::remove_file(talk_channel_path(&state, &channel));
-    notify_orchestrator_pane(
-        &state,
-        &format!("removed analysis/talk_channels/{channel}.jsonl"),
-        &channel,
-        Some(&format!("[/talk#{channel} ADMIN delete]")),
-    );
+    mark_talk_conversation_archived(&state, &channel);
     Redirect::to(&format!("/talk?c={GENERAL_TALK_CHANNEL}")).into_response()
 }
 
@@ -1182,36 +1327,10 @@ async fn api_goaltree(
     if !is_authed(&headers, &state) {
         return api_unauthorized();
     }
-    match goal_tree_data(&state, &goal_key) {
+    match goal_tree_data(&state, Some(&goal_key)) {
         Ok(tree) => axum::Json(tree).into_response(),
         Err(err) => (
             StatusCode::NOT_FOUND,
-            axum::Json(json!({"error": err.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-async fn api_goaltree_ws(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((goal_key, ws_id)): Path<(String, String)>,
-    Json(patch): Json<WorkstreamPatch>,
-) -> Response {
-    if !is_authed(&headers, &state) {
-        return api_unauthorized();
-    }
-    match upsert_workstream(&state, &goal_key, &ws_id, patch) {
-        Ok(()) => match goal_tree_data(&state, &goal_key) {
-            Ok(tree) => axum::Json(tree).into_response(),
-            Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"error": err.to_string()})),
-            )
-                .into_response(),
-        },
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
             axum::Json(json!({"error": err.to_string()})),
         )
             .into_response(),
@@ -1227,7 +1346,7 @@ async fn api_goaltree_tick(
         return api_unauthorized();
     }
     match increment_goal_tick(&state, &goal_key) {
-        Ok(()) => match goal_tree_data(&state, &goal_key) {
+        Ok(()) => match goal_tree_data(&state, Some(&goal_key)) {
             Ok(tree) => axum::Json(tree).into_response(),
             Err(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1555,148 +1674,179 @@ fn read_md_file(dir: &FsPath, name: &str) -> Option<String> {
     fs::read_to_string(dir.join(name)).ok()
 }
 
-fn goal_tree_data(_state: &AppState, goal_key: &str) -> Result<Value> {
-    let output = std::process::Command::new("/home/sdanced/orchestrator/harness")
+fn goal_tree_data(state: &AppState, goal_key: Option<&str>) -> Result<Value> {
+    let mut cmd = std::process::Command::new(&state.cfg.harness_path);
+    cmd
         .arg("--server")
-        .arg("http://127.0.0.1:3001")
+        .arg(&state.cfg.harness_server)
         .arg("--database")
-        .arg("orchestrator-box")
+        .arg(&state.cfg.harness_database)
         .arg("goal-tree")
-        .arg(goal_key)
-        .arg("--json")
+        .arg("--json");
+    if let Some(goal_key) = goal_key {
+        cmd.arg(goal_key);
+    }
+    let output = cmd
         .output()
-        .with_context(|| format!("run harness goal-tree {goal_key} --json"))?;
+        .with_context(|| "run harness goal-tree --json".to_string())?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(anyhow::anyhow!(
-            "harness goal-tree {goal_key} failed: {}{}",
+            "harness goal-tree failed: {}{}",
             stdout,
             stderr
         ));
     }
 
     serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("parse harness goal-tree {goal_key} JSON"))
+        .with_context(|| "parse harness goal-tree JSON".to_string())
 }
 
 fn render_goal_tree(tree: &Value, source_path: &str) -> String {
-    let goal = tree.get("goal").unwrap_or(&Value::Null);
-    let goal_key = value_display_or(goal.get("key"), "albion_bot");
-    let goal_title = value_display_or(goal.get("title"), &goal_key);
-    let metric = value_display(goal.get("metric"));
-    let scope_note = value_display(goal.get("scope_note"));
-    let tick = value_display(goal.get("tick"));
-    let workstreams = tree
-        .get("workstreams")
+    let roots = tree
+        .get("roots")
         .and_then(Value::as_array)
-        .or_else(|| tree.get("subgoals").and_then(Value::as_array));
-    let items: &[Value] = workstreams.map(Vec::as_slice).unwrap_or(&[]);
-    let done = items
-        .iter()
-        .filter(|item| {
-            matches!(
-                value_display(item.get("status")).as_str(),
-                "done" | "complete" | "verified"
-            )
-        })
-        .count();
-
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let total_nodes = roots.iter().map(goal_tree_node_count).sum::<usize>();
+    let done_nodes = roots.iter().map(goal_tree_done_count).sum::<usize>();
     let mut body = String::new();
     body.push_str(&format!(
         "<section class=\"mb-5 rounded border border-zinc-800 bg-zinc-900 p-4\">\
          <div class=\"mb-2 flex flex-wrap items-baseline gap-3\">\
-         <h2 class=\"text-xl text-zinc-100\">{}</h2>\
+         <h2 class=\"text-xl text-zinc-100\">Goal Forest</h2>\
          <span class=\"text-sm text-zinc-500\">{}</span>\
          <span class=\"rounded bg-sky-950 px-2 py-0.5 text-xs text-sky-200\">{}/{}</span>\
          </div>",
-        html_escape(&goal_key),
-        html_escape(&goal_title),
-        done,
-        items.len()
+        html_escape(source_path),
+        done_nodes,
+        total_nodes
     ));
     body.push_str("<div class=\"grid gap-2 text-xs text-zinc-400 md:grid-cols-3\">");
     body.push_str(&format!(
-        "<div><span class=\"text-zinc-600\">metric</span><br>{}</div>",
-        html_escape(if metric.is_empty() {
-            "unknown"
-        } else {
-            &metric
-        })
+        "<div><span class=\"text-zinc-600\">schema</span><br>{}</div>",
+        html_escape(&value_display_or(tree.get("schema"), "goal_tree.v2"))
     ));
     body.push_str(&format!(
-        "<div><span class=\"text-zinc-600\">tick</span><br>{}</div>",
-        html_escape(if tick.is_empty() { "unknown" } else { &tick })
+        "<div><span class=\"text-zinc-600\">roots</span><br>{}</div>",
+        roots.len()
     ));
     body.push_str(&format!(
         "<div><span class=\"text-zinc-600\">source</span><br>{}</div>",
         html_escape(source_path)
     ));
-    body.push_str("</div>");
-    if !scope_note.is_empty() {
-        body.push_str(&format!(
-            "<div class=\"mt-3 rounded border border-zinc-800 bg-zinc-950/70 p-3 text-sm text-zinc-300\">{}</div>",
-            html_escape(&scope_note)
-        ));
-    }
-    body.push_str("</section>");
+    body.push_str("</div></section>");
 
-    if items.is_empty() {
-        body.push_str("<div class=\"text-zinc-500\">(no workstreams in the harness DB)</div>");
+    if roots.is_empty() {
+        body.push_str("<div class=\"text-zinc-500\">(no root goals in the harness DB)</div>");
         return body;
     }
 
     body.push_str("<section class=\"relative ml-2 border-l border-zinc-700 pl-6\">");
-    for (idx, item) in items.iter().enumerate() {
-        let id = first_nonempty(&[
-            value_display(item.get("id")),
-            value_display(item.get("ws_id")),
-            format!("WS{}", idx + 1),
-        ]);
-        let title = value_display_or(item.get("title"), &id);
-        let status = value_display_or(item.get("status"), "pending");
-        let stall = stall_counter_display(item.get("stall"));
-        let stall_label = if stall.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "<span class=\"text-xs text-zinc-500\">stall {}</span>",
-                html_escape(&stall)
-            )
-        };
-        let worker = value_display_or(item.get("worker"), "lean-loop");
-        let blocker = value_display(item.get("blocker"));
-        let next_substep = value_display(item.get("next_substep"));
-        let metric = value_display(item.get("metric"));
-        let done_when = value_display(item.get("done_when"));
-        body.push_str(&format!(
-            "<article class=\"relative mb-4 rounded border border-zinc-800 bg-zinc-900 p-4\">\
-             <span class=\"absolute -left-[31px] top-5 h-3 w-3 rounded-full border border-zinc-950 {}\"></span>\
-             <div class=\"mb-2 flex flex-wrap items-center gap-2\">\
-             <span class=\"text-zinc-500\">{}</span>\
-             <h3 class=\"text-base text-zinc-100\">{}</h3>\
-             <span class=\"badge {}\">{}</span>\
-             {}\
-             <span class=\"text-xs text-zinc-500\">worker {}</span>\
-             </div>",
-            goal_tree_dot_class(&status),
-            html_escape(&id),
-            html_escape(&title),
-            goal_tree_badge_class(&status),
-            html_escape(&status),
-            stall_label,
-            html_escape(&worker)
-        ));
-        body.push_str("<dl class=\"grid gap-3 text-xs md:grid-cols-2\">");
-        body.push_str(&goal_tree_field("blocker", &blocker));
-        body.push_str(&goal_tree_field("next_substep", &next_substep));
-        body.push_str(&goal_tree_field("metric", &metric));
-        body.push_str(&goal_tree_field("done_when", &done_when));
-        body.push_str("</dl></article>");
+    for root in roots {
+        body.push_str(&render_goal_tree_node(root, 0));
     }
     body.push_str("</section>");
     body
+}
+
+fn render_goal_tree_node(node: &Value, depth: usize) -> String {
+    let node_type = value_display_or(node.get("type"), "node");
+    let key = value_display_or(node.get("key"), &node_type);
+    let title = value_display_or(node.get("title"), &key);
+    let status = value_display_or(node.get("status"), "pending");
+    let worker = first_nonempty(&[
+        value_display(node.get("owner_agent")),
+        value_display(node.get("worker")),
+    ]);
+    let detail = value_display(node.get("detail"));
+    let instruction = value_display(node.get("instruction_text"));
+    let guidance = value_display(node.get("stuck_guidance_text"));
+    let metric = value_display(node.get("metric"));
+    let done_when = value_display(node.get("done_when"));
+    let blocker = value_display(node.get("blocker").or_else(|| node.get("blocked_by")));
+    let next_substep = value_display(node.get("next_substep"));
+    let children = node
+        .get("children")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let indent = depth.saturating_mul(14).min(84);
+    let kind_label = if node_type == "sub_goal" {
+        "sub-goal"
+    } else {
+        "goal"
+    };
+
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<article class=\"relative mb-4 rounded border border-zinc-800 bg-zinc-900 p-4\" style=\"margin-left:{}px\">\
+         <span class=\"absolute -left-[31px] top-5 h-3 w-3 rounded-full border border-zinc-950 {}\"></span>\
+         <div class=\"mb-2 flex flex-wrap items-center gap-2\">\
+         <span class=\"text-zinc-500\">{}</span>\
+         <h3 class=\"text-base text-zinc-100\">{}</h3>\
+         <span class=\"badge {}\">{}</span>",
+        indent,
+        goal_tree_dot_class(&status),
+        html_escape(&key),
+        html_escape(&title),
+        goal_tree_badge_class(&status),
+        html_escape(&status)
+    ));
+    if !worker.is_empty() {
+        body.push_str(&format!(
+            "<span class=\"text-xs text-zinc-500\">worker {}</span>",
+            html_escape(&worker)
+        ));
+    }
+    body.push_str(&format!(
+        "<span class=\"text-xs text-zinc-600\">{}</span></div>",
+        html_escape(kind_label)
+    ));
+
+    body.push_str("<dl class=\"grid gap-3 text-xs md:grid-cols-2\">");
+    body.push_str(&goal_tree_field("metric", &metric));
+    body.push_str(&goal_tree_field("blocked_by", &blocker));
+    body.push_str(&goal_tree_field("next_substep", &next_substep));
+    body.push_str(&goal_tree_field("done_when", &done_when));
+    body.push_str(&goal_tree_field("instruction", &instruction));
+    body.push_str(&goal_tree_field("stuck_guidance", &guidance));
+    body.push_str("</dl>");
+    if !detail.is_empty() {
+        body.push_str(&format!(
+            "<div class=\"mt-3 text-xs text-zinc-400\">{}</div>",
+            html_escape(&truncate_chars(&detail, 700))
+        ));
+    }
+    body.push_str("</article>");
+
+    for child in children {
+        body.push_str(&render_goal_tree_node(child, depth + 1));
+    }
+    body
+}
+
+fn goal_tree_node_count(node: &Value) -> usize {
+    1 + node
+        .get("children")
+        .and_then(Value::as_array)
+        .map(|children| children.iter().map(goal_tree_node_count).sum::<usize>())
+        .unwrap_or(0)
+}
+
+fn goal_tree_done_count(node: &Value) -> usize {
+    let self_done = matches!(
+        canonical_status(&value_display(node.get("status"))).as_str(),
+        "done" | "complete" | "verified"
+    ) as usize;
+    self_done
+        + node
+            .get("children")
+            .and_then(Value::as_array)
+            .map(|children| children.iter().map(goal_tree_done_count).sum::<usize>())
+            .unwrap_or(0)
 }
 
 fn goal_tree_field(label: &str, value: &str) -> String {
@@ -1753,130 +1903,28 @@ fn stall_counter_display(value: Option<&Value>) -> String {
     }
 }
 
-fn upsert_workstream(
-    state: &AppState,
-    goal_key: &str,
-    ws_id: &str,
-    patch: WorkstreamPatch,
-) -> Result<()> {
-    let current_tree = goal_tree_data(state, goal_key)
-        .unwrap_or_else(|_| json!({"goal": {"key": goal_key}, "workstreams": [], "facts": []}));
-    let current = current_tree
-        .get("workstreams")
+fn find_goal_node(tree: &Value, goal_key: &str) -> Option<Value> {
+    tree.get("roots")
         .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| value_display(item.get("id")) == ws_id)
-                .cloned()
-        })
-        .unwrap_or(Value::Null);
+        .and_then(|roots| roots.iter().find_map(|root| find_goal_node_in(root, goal_key)))
+}
 
-    let title = patch
-        .title
-        .or_else(|| nonempty_string(current.get("title")))
-        .unwrap_or_else(|| ws_id.to_string());
-    let status = patch
-        .status
-        .or_else(|| nonempty_string(current.get("status")))
-        .unwrap_or_else(|| "pending".to_string());
-    let stall = patch
-        .stall
-        .or_else(|| value_i64(current.get("stall")).and_then(|n| u32::try_from(n).ok()))
-        .unwrap_or(0);
-    let blocker = patch
-        .blocker
-        .or_else(|| nonempty_string(current.get("blocker")))
-        .unwrap_or_default();
-    let next_substep = patch
-        .next_substep
-        .or_else(|| nonempty_string(current.get("next_substep")))
-        .unwrap_or_default();
-    let metric = patch
-        .metric
-        .or_else(|| nonempty_string(current.get("metric")))
-        .unwrap_or_default();
-    let done_when = patch
-        .done_when
-        .or_else(|| nonempty_string(current.get("done_when")))
-        .unwrap_or_default();
-    let worker = patch
-        .worker
-        .or_else(|| nonempty_string(current.get("worker")))
-        .unwrap_or_else(|| "lean-loop".to_string());
-    let falsification = patch
-        .falsification
-        .or_else(|| nonempty_string(current.get("falsification")))
-        .unwrap_or_default();
-    let order = value_i64(current.get("order")).unwrap_or(9999);
-    let metadata = serde_json::to_string(&json!({
-        "source": "dashboard-http",
-        "metric": metric,
-        "stall": stall,
-        "order": order,
-    }))?;
-    let sub_status = run_harness_mutation(
-        state,
-        &[
-            "sub-goal-add",
-            ws_id,
-            goal_key,
-            &worker,
-            &title,
-            "--detail",
-            &done_when,
-            "--status",
-            &status,
-            "--priority",
-            &priority_from_order(order),
-            "--instruction-text",
-            &next_substep,
-            "--stuck-guidance-text",
-            &blocker,
-            "--metadata",
-            &metadata,
-        ],
-    );
-    sub_status?;
-    let path_metadata = serde_json::to_string(&json!({
-        "source": "dashboard-http",
-        "metric": metric,
-        "done_when": done_when,
-    }))?;
-    let path_name = first_nonempty(&[
-        nonempty_string(current.get("path_name")).unwrap_or_default(),
-        format!("{ws_id} {title}"),
-    ]);
-    run_harness_mutation(
-        state,
-        &[
-            "path-add",
-            &path_name,
-            "--goal",
-            goal_key,
-            "--sub-goal",
-            ws_id,
-            "--worker",
-            &worker,
-            "--hypothesis",
-            &next_substep,
-            "--falsification",
-            &falsification,
-            "--status",
-            &status,
-            "--stall-counter",
-            &stall.to_string(),
-            "--notes",
-            &blocker,
-            "--metadata",
-            &path_metadata,
-        ],
-    )
+fn find_goal_node_in(node: &Value, goal_key: &str) -> Option<Value> {
+    if value_display(node.get("type")) == "goal" && value_display(node.get("goal_key")) == goal_key {
+        return Some(node.clone());
+    }
+    node.get("children")
+        .and_then(Value::as_array)
+        .and_then(|children| {
+            children
+                .iter()
+                .find_map(|child| find_goal_node_in(child, goal_key))
+        })
 }
 
 fn increment_goal_tick(state: &AppState, goal_key: &str) -> Result<()> {
-    let current = goal_tree_data(state, goal_key)?;
-    let goal = current.get("goal").unwrap_or(&Value::Null);
+    let current = goal_tree_data(state, Some(goal_key))?;
+    let goal = find_goal_node(&current, goal_key).unwrap_or(Value::Null);
     let next_tick = value_i64(goal.get("tick")).unwrap_or(0) + 1;
     let title = value_display_or(goal.get("title"), goal_key);
     let status = value_display_or(goal.get("status"), "active");
@@ -1929,30 +1977,12 @@ fn run_harness_mutation(state: &AppState, args: &[&str]) -> Result<()> {
     ))
 }
 
-fn priority_from_order(order: i64) -> String {
-    let priority = if order >= 0 && order < 100 {
-        100 - order
-    } else {
-        1
-    };
-    priority.to_string()
-}
-
 fn first_nonempty(values: &[String]) -> String {
     values
         .iter()
         .find(|value| !value.is_empty() && value.as_str() != "(none)")
         .cloned()
         .unwrap_or_default()
-}
-
-fn nonempty_string(value: Option<&Value>) -> Option<String> {
-    let rendered = value_display(value);
-    if rendered.is_empty() || rendered == "(none)" {
-        None
-    } else {
-        Some(rendered)
-    }
 }
 
 fn adherence_data(state: &AppState) -> Value {
@@ -2065,6 +2095,14 @@ fn value_i64(value: Option<&Value>) -> Option<i64> {
     })
 }
 
+fn value_u128(value: Option<&Value>) -> Option<u128> {
+    value.and_then(|v| {
+        v.as_u64()
+            .map(u128::from)
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
 fn value_display(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(s)) => s.clone(),
@@ -2082,6 +2120,73 @@ fn value_display_or(value: Option<&Value>, default: &str) -> String {
         None | Some(Value::Null) => default.to_string(),
         Some(v) => value_display(Some(v)),
     }
+}
+
+fn optional_string_value(value: Option<&str>) -> Value {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn optional_u64_value(value: Option<u64>) -> Value {
+    value.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn reducer_optional_string(value: Option<&str>) -> Value {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(reducer_some_string)
+        .unwrap_or_else(reducer_none)
+}
+
+fn reducer_some_string(value: &str) -> Value {
+    json!({"some": value})
+}
+
+fn reducer_some_f64(value: f64) -> Value {
+    json!({"some": value})
+}
+
+fn reducer_none() -> Value {
+    json!({"none": []})
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let out: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = out.trim_matches('_').trim_matches('.');
+    if trimmed.is_empty() {
+        "upload.bin".to_string()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
+}
+
+fn header_escape(value: &str) -> String {
+    value.replace(['"', '\r', '\n'], "_")
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Truncate to `n` Unicode scalar values (matches Python `s[:n]` closely enough for display).
@@ -2270,111 +2375,719 @@ fn now_iso() -> String {
     Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
-fn talk_channel_path(state: &AppState, channel: &str) -> std::path::PathBuf {
-    let slug =
-        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
-    state.cfg.talk_channels_dir.join(format!("{slug}.jsonl"))
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
-fn ensure_talk_channels(state: &AppState) {
-    let _ = fs::create_dir_all(&state.cfg.talk_channels_dir);
-    let general = talk_channel_path(state, GENERAL_TALK_CHANNEL);
-    if general.exists() {
-        return;
-    }
-    if state.cfg.talk_log.exists() {
-        if let Ok(text) = fs::read_to_string(&state.cfg.talk_log) {
-            let _ = fs::write(&general, text);
-            return;
-        }
-    }
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&general);
+fn fact_set(
+    state: &AppState,
+    key: &str,
+    value: &Value,
+    source_type: &str,
+    source_ref: Option<&str>,
+    metadata: Value,
+) -> Result<()> {
+    state.data.call_reducer(
+        "fact_set",
+        vec![json!({
+            "fact_key": key,
+            "value_json": value.to_string(),
+            "confidence": reducer_some_f64(1.0),
+            "source_type": reducer_some_string(source_type),
+            "source_ref": reducer_optional_string(source_ref),
+            "metadata_json": reducer_some_string(&metadata.to_string()),
+        })],
+    )
 }
 
 fn list_talk_channels(state: &AppState) -> Vec<String> {
-    ensure_talk_channels(state);
-    let mut others: Vec<String> = Vec::new();
-    if let Ok(entries) = fs::read_dir(&state.cfg.talk_channels_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(slug) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|stem| sanitize_channel_slug(Some(stem)))
-            {
-                if slug != GENERAL_TALK_CHANNEL && !others.contains(&slug) {
-                    others.push(slug);
-                }
-            }
+    ensure_talk_conversation(state, GENERAL_TALK_CHANNEL, None, None);
+    let mut rows = talk_conversations_data(state);
+    rows.sort_by(|a, b| {
+        value_display(b.get("updated_at"))
+            .cmp(&value_display(a.get("updated_at")))
+            .then_with(|| value_display(a.get("slug")).cmp(&value_display(b.get("slug"))))
+    });
+    let mut channels = Vec::new();
+    if !rows
+        .iter()
+        .any(|row| value_display(row.get("slug")) == GENERAL_TALK_CHANNEL)
+    {
+        channels.push(GENERAL_TALK_CHANNEL.to_string());
+    }
+    for row in rows {
+        let slug = value_display(row.get("slug"));
+        if !slug.is_empty()
+            && value_display(row.get("status")) != "archived"
+            && !channels.contains(&slug)
+        {
+            channels.push(slug);
         }
     }
-    others.sort();
-    let mut out = vec![GENERAL_TALK_CHANNEL.to_string()];
-    out.extend(others);
-    out
+    channels
 }
 
 fn talk_entries(state: &AppState, channel: &str, limit: usize) -> Vec<Value> {
-    ensure_talk_channels(state);
-    let path = talk_channel_path(state, channel);
-    let _ = fs::OpenOptions::new().create(true).append(true).open(&path);
-    let Ok(text) = fs::read_to_string(&path) else {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    let clear_after = talk_conversation_data(state, &slug)
+        .and_then(|v| v.get("clear_after").cloned())
+        .and_then(|v| value_u128(Some(&v)))
+        .unwrap_or(0);
+    let Ok(rows) = state
+        .data
+        .sql_query("SELECT fact_key, value_json, source_ref, updated_at, metadata_json FROM facts WHERE source_type = 'dashboard-talk-message'")
+    else {
         return Vec::new();
     };
-    let mut rows: Vec<Value> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            if value.is_object() {
-                rows.push(value);
+    let mut rows: Vec<Value> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let payload = row
+                .get("value_json")
+                .and_then(Value::as_str)
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())?;
+            if payload.get("conversation_slug").and_then(Value::as_str) != Some(slug.as_str()) {
+                return None;
             }
-        }
-    }
+            if value_u128(payload.get("id")) <= Some(clear_after) {
+                return None;
+            }
+            let metadata = payload
+                .get("metadata_json")
+                .and_then(Value::as_str)
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or(Value::Null);
+            Some(json!({
+                "id": payload.get("id").cloned().unwrap_or(Value::Null),
+                "conversation_slug": payload.get("conversation_slug").cloned().unwrap_or(Value::Null),
+                "from": payload.get("sender").cloned().unwrap_or(Value::Null),
+                "text": payload.get("body").cloned().unwrap_or(Value::Null),
+                "reply_to": payload.get("reply_to").cloned().unwrap_or(Value::Null),
+                "ts": payload.get("created_at").cloned().unwrap_or_else(|| row.get("updated_at").cloned().unwrap_or(Value::Null)),
+                "metadata": metadata,
+            }))
+        })
+        .collect();
+    rows.sort_by(|a, b| value_display(a.get("id")).cmp(&value_display(b.get("id"))));
     if rows.len() > limit {
         rows = rows.split_off(rows.len() - limit);
     }
     rows
 }
 
-fn append_talk_entry(state: &AppState, channel: &str, sender: &str, text: &str) {
-    ensure_talk_channels(state);
-    let payload = json!({"ts": now_iso(), "from": sender, "text": text});
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(talk_channel_path(state, channel))
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&payload).unwrap_or_default()
+fn append_talk_entry(
+    state: &AppState,
+    channel: &str,
+    sender: &str,
+    text: &str,
+    reply_to: Option<u64>,
+) {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    ensure_talk_conversation(state, &slug, None, None);
+    let id = now_nanos();
+    let payload = json!({
+        "id": id.to_string(),
+        "conversation_slug": slug,
+        "sender": sender,
+        "body": text,
+        "reply_to": optional_u64_value(reply_to),
+        "created_at": now_iso(),
+        "metadata_json": "{}",
+    });
+    let _ = fact_set(
+        state,
+        &format!(
+            "talk.message.{}.{}",
+            sanitize_channel_slug(Some(channel))
+                .unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string()),
+            id
+        ),
+        &payload,
+        "dashboard-talk-message",
+        Some(channel),
+        json!({"source": "dashboard"}),
+    );
+}
+
+fn talk_conversations_data(state: &AppState) -> Vec<Value> {
+    let Ok(rows) = state.data.sql_query(
+        "SELECT fact_key, value_json, source_ref, updated_at, metadata_json FROM facts WHERE source_type = 'dashboard-talk-conversation'",
+    ) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|row| {
+            let value = row
+                .get("value_json")
+                .and_then(Value::as_str)
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())?;
+            let mut obj = value.as_object()?.clone();
+            if !obj.contains_key("updated_at") {
+                if let Some(updated_at) = row.get("updated_at") {
+                    obj.insert("updated_at".to_string(), updated_at.clone());
+                }
+            }
+            Some(Value::Object(obj))
+        })
+        .collect()
+}
+
+fn talk_conversation_data(state: &AppState, channel: &str) -> Option<Value> {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    talk_conversations_data(state)
+        .into_iter()
+        .find(|row| value_display(row.get("slug")) == slug)
+}
+
+fn ensure_talk_conversation(
+    state: &AppState,
+    channel: &str,
+    goal: Option<&str>,
+    context: Option<&str>,
+) {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    let title = if slug == GENERAL_TALK_CHANNEL {
+        "General".to_string()
+    } else {
+        slug.replace('-', " ")
+    };
+    let args = vec![json!({
+        "slug": slug.clone(),
+        "title": title.clone(),
+        "agent_name": talk_agent_name(channel),
+        "goal_key": optional_string_value(goal),
+        "context_md": optional_string_value(context),
+        "status": "active",
+        "metadata_json": json!({"source": "dashboard"}).to_string(),
+    })];
+    let mut payload = args.into_iter().next().unwrap_or_else(|| json!({}));
+    if let Some(existing) = talk_conversation_data(state, &slug) {
+        if payload.get("goal_key").is_none_or(Value::is_null) {
+            payload["goal_key"] = existing.get("goal_key").cloned().unwrap_or(Value::Null);
+        }
+        if payload.get("context_md").is_none_or(Value::is_null) {
+            payload["context_md"] = existing.get("context_md").cloned().unwrap_or(Value::Null);
+        }
+        payload["created_at"] = existing
+            .get("created_at")
+            .cloned()
+            .unwrap_or_else(|| Value::String(now_iso()));
+        payload["clear_after"] = existing.get("clear_after").cloned().unwrap_or(Value::Null);
+    } else {
+        payload["created_at"] = Value::String(now_iso());
+        payload["clear_after"] = Value::Null;
+    }
+    payload["updated_at"] = Value::String(now_iso());
+    let _ = fact_set(
+        state,
+        &format!("talk.conversation.{slug}"),
+        &payload,
+        "dashboard-talk-conversation",
+        Some(&slug),
+        json!({"source": "dashboard"}),
+    );
+}
+
+fn mark_talk_conversation_cleared(state: &AppState, channel: &str) {
+    ensure_talk_conversation(state, channel, None, None);
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    if let Some(mut payload) = talk_conversation_data(state, &slug) {
+        payload["clear_after"] = Value::String(now_nanos().to_string());
+        payload["updated_at"] = Value::String(now_iso());
+        let _ = fact_set(
+            state,
+            &format!("talk.conversation.{slug}"),
+            &payload,
+            "dashboard-talk-conversation",
+            Some(&slug),
+            json!({"source": "dashboard", "action": "clear"}),
         );
     }
 }
 
-fn notify_orchestrator_pane(state: &AppState, text: &str, channel: &str, prefix: Option<&str>) {
+fn mark_talk_conversation_archived(state: &AppState, channel: &str) {
+    ensure_talk_conversation(state, channel, None, None);
     let slug =
         sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
-    let payload = match prefix {
-        Some(p) if !text.is_empty() => format!("{p} {text}"),
-        Some(p) => p.to_string(),
-        None => format!("[/talk#{slug} @ {}] {text}", now_iso()),
-    };
+    if let Some(mut payload) = talk_conversation_data(state, &slug) {
+        payload["status"] = Value::String("archived".to_string());
+        payload["archived_at"] = Value::String(now_iso());
+        payload["updated_at"] = Value::String(now_iso());
+        let _ = fact_set(
+            state,
+            &format!("talk.conversation.{slug}"),
+            &payload,
+            "dashboard-talk-conversation",
+            Some(&slug),
+            json!({"source": "dashboard", "action": "archive"}),
+        );
+    }
+}
+
+fn talk_agent_name(channel: &str) -> String {
+    let slug =
+        sanitize_channel_slug(Some(channel)).unwrap_or_else(|| GENERAL_TALK_CHANNEL.to_string());
+    format!("talk-{slug}")
+}
+
+fn spawn_talk_worker(state: Arc<AppState>, channel: String) {
+    ensure_talk_conversation(&state, &channel, None, None);
+    let agent = talk_agent_name(&channel);
+    let metadata = json!({
+        "kind": "codex_app_server",
+        "role": "talk_worker",
+        "talk_slug": channel.clone(),
+        "spawned_by": "dashboard",
+    })
+    .to_string();
+    let default_task = format!(
+        "You are the dashboard talk worker for conversation #{channel}. \
+Respond directly to context packets from the dashboard. Your final assistant text is captured and appended to the conversation automatically."
+    );
+    let workdir = state.cfg.orchestrator_dir.display().to_string();
     let _ = std::process::Command::new(&state.cfg.harness_path)
-        .args(["send", "orchestrator", &payload])
+        .arg("--server")
+        .arg(&state.cfg.harness_server)
+        .arg("--database")
+        .arg(&state.cfg.harness_database)
+        .args([
+            "agent-add",
+            &agent,
+            "--kind",
+            "codex_app_server",
+            "--workdir",
+            &workdir,
+            "--default-task",
+            &default_task,
+            "--metadata",
+            &metadata,
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .status();
+}
+
+fn send_talk_worker_prompt(state: Arc<AppState>, channel: String, user_text: Option<String>) {
+    spawn_talk_worker(state.clone(), channel.clone());
+    std::thread::spawn(move || {
+        let agent = talk_agent_name(&channel);
+        let prompt = build_talk_worker_prompt(&state, &channel, user_text.as_deref());
+        let output = std::process::Command::new(&state.cfg.harness_path)
+            .arg("--server")
+            .arg(&state.cfg.harness_server)
+            .arg("--database")
+            .arg(&state.cfg.harness_database)
+            .args([
+                "send",
+                &agent,
+                &prompt,
+                "--wait",
+                "--timeout",
+                TALK_WORKER_TIMEOUT_SECONDS,
+            ])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let reply = stdout
+                    .lines()
+                    .rev()
+                    .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .and_then(|v| {
+                        v.get("last_assistant_text")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                if !reply.trim().is_empty() {
+                    append_talk_entry(&state, &channel, &agent, reply.trim(), None);
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                append_talk_entry(
+                    &state,
+                    &channel,
+                    "system",
+                    &format!(
+                        "worker send failed with status {}: {}",
+                        output.status,
+                        truncate_chars(stderr.trim(), 400)
+                    ),
+                    None,
+                );
+            }
+            Err(err) => append_talk_entry(
+                &state,
+                &channel,
+                "system",
+                &format!("worker send failed: {err}"),
+                None,
+            ),
+        }
+    });
+}
+
+fn build_talk_worker_prompt(state: &AppState, channel: &str, user_text: Option<&str>) -> String {
+    let conversation = talk_conversation_data(state, channel);
+    let context = conversation
+        .as_ref()
+        .and_then(|v| v.get("context_md"))
+        .map(|v| value_display(Some(v)))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(none)".to_string());
+    let goal_key = conversation
+        .as_ref()
+        .and_then(|v| v.get("goal_key"))
+        .map(|v| value_display(Some(v)))
+        .unwrap_or_default();
+    let recent_messages = talk_entries(state, channel, 30)
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "[{}] {}: {}",
+                value_display(entry.get("ts")),
+                value_display(entry.get("from")),
+                value_display(entry.get("text"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let goals = goals_data(state)
+        .into_iter()
+        .filter(|g| value_display(g.get("status")) == "active")
+        .take(8)
+        .map(|g| {
+            format!(
+                "- {}: {}",
+                value_display(g.get("goal_key")),
+                value_display(g.get("title"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let artifacts = artifacts_data(state, 25)
+        .into_iter()
+        .map(|a| {
+            let metadata = a.get("metadata_json").cloned().unwrap_or(Value::Null);
+            let original = metadata
+                .get("original_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let context = artifact_context_text(&metadata);
+            format!(
+                "- sha256:{} path:{} ({} bytes) {}{}",
+                value_display(a.get("sha256")),
+                value_display(a.get("path")),
+                value_display(a.get("size_bytes")),
+                original,
+                if context.is_empty() {
+                    String::new()
+                } else {
+                    format!(" context: {}", context.replace('\n', " "))
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let latest = user_text.unwrap_or("(conversation opened or artifacts changed)");
+    format!(
+        "Dashboard talk context packet for #{channel}\n\n\
+Conversation context:\n{context}\n\n\
+Linked goal: {}\n\n\
+Active goals:\n{}\n\n\
+Recent messages:\n{}\n\n\
+Uploaded artifacts:\n{}\n\n\
+Latest user/event:\n{}\n\n\
+Reply directly to the conversation. Be concise, concrete, and use the supplied context. \
+Do not ask how to access files; artifact paths above are local paths in the orchestrator workspace.",
+        if goal_key.is_empty() {
+            "(none)"
+        } else {
+            &goal_key
+        },
+        if goals.is_empty() { "(none)" } else { &goals },
+        if recent_messages.is_empty() {
+            "(none)"
+        } else {
+            &recent_messages
+        },
+        if artifacts.is_empty() {
+            "(none)"
+        } else {
+            &artifacts
+        },
+        latest
+    )
+}
+
+fn artifacts_data(state: &AppState, limit: usize) -> Vec<Value> {
+    let Ok(rows) = state.data.sql_query(
+        "SELECT path, sha256, size_bytes, mtime_ns, first_seen_at, last_seen_at, significance, indexed_state, metadata_json FROM artifacts",
+    ) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Value> = rows
+        .into_iter()
+        .map(|mut row| {
+            parse_json_field(&mut row, "metadata_json");
+            Value::Object(row.into_iter().collect())
+        })
+        .filter(|row| value_display(row.get("indexed_state")) != "deleted")
+        .collect();
+    rows.sort_by(|a, b| {
+        value_display(b.get("last_seen_at"))
+            .cmp(&value_display(a.get("last_seen_at")))
+            .then_with(|| value_display(a.get("path")).cmp(&value_display(b.get("path"))))
+    });
+    if rows.len() > limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+#[derive(Debug)]
+struct SavedArtifact {
+    sha256: String,
+}
+
+fn save_uploaded_artifact(
+    state: &AppState,
+    original_name: &str,
+    bytes: &[u8],
+    talk_slug: Option<&str>,
+    context: Option<&str>,
+) -> Result<SavedArtifact> {
+    fs::create_dir_all(&state.cfg.artifact_upload_dir)
+        .with_context(|| format!("create {}", state.cfg.artifact_upload_dir.display()))?;
+    let safe_name = sanitize_filename(original_name);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = state
+        .cfg
+        .artifact_upload_dir
+        .join(format!("{millis}_{safe_name}"));
+    fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+    let sha = {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    };
+    let metadata = fs::metadata(&path)?;
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|dur| dur.as_nanos() as i128)
+        .unwrap_or(0);
+    state.data.call_reducer(
+        "artifact_upsert",
+        vec![json!({
+            "path": path.display().to_string(),
+            "sha_256": reducer_some_string(&sha),
+            "size_bytes": metadata.len(),
+            "mtime_ns": mtime_ns,
+            "significance": reducer_some_string("uploaded"),
+            "indexed_state": reducer_some_string("uploaded"),
+            "metadata_json": reducer_some_string(&json!({
+                "original_name": original_name,
+                "context": optional_string_value(context),
+                "uploaded_via": "dashboard",
+                "talk_slug": talk_slug,
+                "stored_at": now_iso(),
+            }).to_string()),
+        })],
+    )?;
+    Ok(SavedArtifact { sha256: sha })
+}
+
+fn artifact_by_sha256(state: &AppState, sha256: &str) -> Option<Value> {
+    let hash = normalize_sha256(sha256)?;
+    artifacts_data(state, usize::MAX)
+        .into_iter()
+        .find(|artifact| value_display(artifact.get("sha256")).eq_ignore_ascii_case(&hash))
+}
+
+fn update_artifact_context(state: &AppState, artifact: &Value, context: &str) -> Result<()> {
+    let path = value_display(artifact.get("path"));
+    let sha256 = value_display(artifact.get("sha256"));
+    let size_bytes = value_display(artifact.get("size_bytes"))
+        .parse::<u64>()
+        .unwrap_or(0);
+    let mtime_ns = value_display(artifact.get("mtime_ns"))
+        .parse::<i128>()
+        .unwrap_or(0);
+    let significance = value_display(artifact.get("significance"));
+    let indexed_state = value_display(artifact.get("indexed_state"));
+    let mut metadata = artifact
+        .get("metadata_json")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    metadata["context"] = optional_string_value(Some(context));
+    metadata["context_updated_at"] = Value::String(now_iso());
+    state.data.call_reducer(
+        "artifact_upsert",
+        vec![json!({
+            "path": path,
+            "sha_256": reducer_optional_string(Some(&sha256)),
+            "size_bytes": size_bytes,
+            "mtime_ns": mtime_ns,
+            "significance": reducer_optional_string(Some(&significance)),
+            "indexed_state": reducer_optional_string(Some(&indexed_state)),
+            "metadata_json": reducer_some_string(&metadata.to_string()),
+        })],
+    )?;
+    Ok(())
+}
+
+fn artifact_context_text(metadata: &Value) -> String {
+    value_display(metadata.get("context"))
+}
+
+fn normalize_sha256(value: &str) -> Option<String> {
+    let hash = value
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| value.trim())
+        .to_ascii_lowercase();
+    if hash.len() == 64 && hash.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(hash)
+    } else {
+        None
+    }
+}
+
+fn artifact_path_allowed(state: &AppState, requested: &FsPath) -> bool {
+    let Ok(base) = state.cfg.artifact_upload_dir.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = requested.canonicalize() else {
+        return false;
+    };
+    path.starts_with(base)
+}
+
+fn render_artifact_upload_form(channel: Option<&str>) -> String {
+    let action = channel
+        .map(|c| format!("/artifacts/upload?c={}", url_encode(c)))
+        .unwrap_or_else(|| "/artifacts/upload".to_string());
+    format!(
+        "<section class=\"mb-4 rounded border border-zinc-800 bg-zinc-900 p-4\">\
+         <form method=\"post\" action=\"{}\" enctype=\"multipart/form-data\" class=\"flex flex-col gap-3\">\
+         <label class=\"block\"><span class=\"mb-2 block text-xs text-zinc-500\">Artifact context</span>\
+         <textarea name=\"context\" rows=\"3\" class=\"w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500 focus:outline-none\"></textarea></label>\
+         <div class=\"flex flex-col gap-3 sm:flex-row sm:items-end\">\
+         <label class=\"block min-w-0 flex-1\"><span class=\"mb-2 block text-xs text-zinc-500\">Upload artifact</span>\
+         <input type=\"file\" name=\"file\" multiple class=\"block w-full text-sm text-zinc-300 file:mr-3 file:rounded file:border-0 file:bg-zinc-800 file:px-3 file:py-2 file:text-zinc-100 hover:file:bg-zinc-700\"></label>\
+         <button type=\"submit\" class=\"rounded bg-zinc-800 px-4 py-2 text-sm text-zinc-100 hover:bg-zinc-700\">Upload</button>\
+         </div></form></section>",
+        html_escape(&action)
+    )
+}
+
+fn render_artifact_table(artifacts: &[Value], channel: Option<&str>) -> String {
+    if artifacts.is_empty() {
+        return "<div class=\"text-zinc-500\">(no artifacts indexed)</div>".to_string();
+    }
+    let mut body = String::from(
+        "<div class=\"overflow-x-auto rounded border border-zinc-800\"><table class=\"min-w-full text-left text-xs\">\
+         <thead class=\"bg-zinc-900 text-zinc-400\"><tr>\
+         <th class=\"px-3 py-2\">file</th><th class=\"px-3 py-2\">sha256</th><th class=\"px-3 py-2\">context</th>\
+         <th class=\"px-3 py-2\">size</th><th class=\"px-3 py-2\">state</th><th class=\"px-3 py-2\">seen</th></tr></thead><tbody>",
+    );
+    for artifact in artifacts {
+        let path = value_display(artifact.get("path"));
+        let sha = value_display(artifact.get("sha256"));
+        let metadata = artifact
+            .get("metadata_json")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let context = artifact_context_text(&metadata);
+        let original = metadata
+            .get("original_name")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                FsPath::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("artifact")
+            });
+        let href = normalize_sha256(&sha).map(|hash| format!("/artifacts/raw/{hash}"));
+        let linked_name = href
+            .as_ref()
+            .map(|href| {
+                format!(
+                    "<a class=\"text-sky-300 hover:underline\" href=\"{}\">{}</a>",
+                    html_escape(href),
+                    html_escape(original)
+                )
+            })
+            .unwrap_or_else(|| html_escape(original));
+        let hash_link = href
+            .as_ref()
+            .map(|href| {
+                format!(
+                    "<a class=\"font-mono text-sky-300 hover:underline\" href=\"{}\">{}</a>",
+                    html_escape(href),
+                    html_escape(&truncate_chars(&sha, 16))
+                )
+            })
+            .unwrap_or_else(|| html_escape(&truncate_chars(&sha, 16)));
+        let context_form = normalize_sha256(&sha)
+            .map(|hash| {
+                let channel_input = channel
+                    .map(|c| {
+                        format!(
+                            "<input type=\"hidden\" name=\"c\" value=\"{}\">",
+                            html_escape(c)
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "<form method=\"post\" action=\"/artifacts/context\" class=\"mt-2 flex min-w-64 flex-col gap-2\">\
+                     <input type=\"hidden\" name=\"sha256\" value=\"{}\">{}\
+                     <textarea name=\"context\" rows=\"2\" class=\"w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-100 focus:border-sky-500 focus:outline-none\">{}</textarea>\
+                     <button type=\"submit\" class=\"self-start rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-100 hover:bg-zinc-700\">Save context</button>\
+                     </form>",
+                    html_escape(&hash),
+                    channel_input,
+                    html_escape(&context)
+                )
+            })
+            .unwrap_or_default();
+        body.push_str(&format!(
+            "<tr class=\"border-t border-zinc-800 align-top\">\
+             <td class=\"px-3 py-2\">{}<div class=\"mt-1 max-w-sm truncate text-zinc-600\">{}</div></td>\
+             <td class=\"px-3 py-2\">{}</td>\
+             <td class=\"px-3 py-2\"><div class=\"max-w-xl whitespace-pre-wrap text-zinc-300\">{}</div>{}</td>\
+             <td class=\"px-3 py-2 text-zinc-400\">{}</td>\
+             <td class=\"px-3 py-2 text-zinc-400\">{}</td>\
+             <td class=\"px-3 py-2 text-zinc-500\">{}</td></tr>",
+            linked_name,
+            html_escape(&path),
+            hash_link,
+            html_escape(&context),
+            context_form,
+            html_escape(&value_display(artifact.get("size_bytes"))),
+            html_escape(&value_display(artifact.get("indexed_state"))),
+            html_escape(&truncate_chars(&value_display(artifact.get("last_seen_at")), 19)),
+        ));
+    }
+    body.push_str("</tbody></table></div>");
+    body
 }
 
 fn talk_admin_controls(channel: &str) -> String {
@@ -2404,18 +3117,39 @@ fn talk_admin_controls(channel: &str) -> String {
 }
 
 fn render_talk_page(state: &AppState, channel: &str) -> Response {
+    ensure_talk_conversation(state, channel, None, None);
     let channels = list_talk_channels(state);
-    let channel_store = format!("analysis/talk_channels/{channel}.jsonl");
+    let conversation = talk_conversation_data(state, channel);
+    let agent_name = conversation
+        .as_ref()
+        .and_then(|v| v.get("agent_name"))
+        .map(|v| value_display(Some(v)))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| talk_agent_name(channel));
+    let goal_key = conversation
+        .as_ref()
+        .and_then(|v| v.get("goal_key"))
+        .map(|v| value_display(Some(v)))
+        .unwrap_or_default();
+    let context_md = conversation
+        .as_ref()
+        .and_then(|v| v.get("context_md"))
+        .map(|v| value_display(Some(v)))
+        .unwrap_or_default();
     let mut body = String::from("<h1 class=\"text-2xl mb-4\">Talk</h1>");
     body.push_str("<div class=\"flex flex-col gap-4 lg:flex-row\">");
     // sidebar
     body.push_str("<aside class=\"w-full shrink-0 lg:w-48\">");
     body.push_str("<section class=\"bg-zinc-900 border border-zinc-800 rounded p-4\">");
     body.push_str(&format!(
-        "<form action=\"/talk/new?c={}\" method=\"post\" class=\"mb-4 flex gap-2\">\
-         <input type=\"text\" name=\"name\" maxlength=\"64\" placeholder=\"new channel\" \
-         class=\"min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500 focus:outline-none\">\
-         <button type=\"submit\" class=\"rounded bg-zinc-800 px-3 py-2 text-sm text-zinc-100 hover:bg-zinc-700\">+</button>\
+        "<form action=\"/talk/new?c={}\" method=\"post\" class=\"mb-4 space-y-2\">\
+         <input type=\"text\" name=\"name\" maxlength=\"64\" placeholder=\"new conversation\" \
+         class=\"w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500 focus:outline-none\">\
+         <input type=\"text\" name=\"goal\" maxlength=\"96\" placeholder=\"goal key\" \
+         class=\"w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500 focus:outline-none\">\
+         <textarea name=\"context\" rows=\"3\" placeholder=\"context for worker\" \
+         class=\"w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-500 focus:outline-none\"></textarea>\
+         <button type=\"submit\" class=\"w-full rounded bg-zinc-800 px-3 py-2 text-sm text-zinc-100 hover:bg-zinc-700\">New worker chat</button>\
          </form>",
         html_escape(channel)
     ));
@@ -2443,12 +3177,25 @@ fn render_talk_page(state: &AppState, channel: &str) -> Response {
     body.push_str(&format!(
         "<div class=\"mb-4 flex flex-wrap items-center justify-between gap-3\"><div>\
          <div class=\"flex items-center\"><h2 class=\"text-lg text-zinc-100\">#{}</h2>{}</div>\
-         <div class=\"text-xs text-zinc-500\">Channel thread backed by {}.</div></div>\
+         <div class=\"text-xs text-zinc-500\">DB conversation. Worker: {}{}.</div></div>\
          <div class=\"text-xs text-zinc-500\">Ctrl+Enter sends. Enter inserts a newline.</div></div>",
         html_escape(channel),
         talk_admin_controls(channel),
-        html_escape(&channel_store)
+        html_escape(&agent_name),
+        if goal_key.is_empty() {
+            String::new()
+        } else {
+            format!("; goal {}", html_escape(&goal_key))
+        }
     ));
+    if !context_md.is_empty() {
+        body.push_str(&format!(
+            "<details class=\"mb-4 rounded border border-zinc-800 bg-zinc-950/70 p-3\">\
+             <summary class=\"cursor-pointer text-xs text-zinc-400\">conversation context</summary>\
+             <pre class=\"mt-2 text-xs text-zinc-300\">{}</pre></details>",
+            html_escape(&context_md)
+        ));
+    }
     let entries = talk_entries(state, channel, 200);
     let initial_count = entries.len();
     let empty_cls = if entries.is_empty() { "" } else { " hidden" };
@@ -2504,6 +3251,14 @@ fn render_talk_page(state: &AppState, channel: &str) -> Response {
          </div></form>",
         html_escape(channel)
     ));
+    body.push_str("<div class=\"mt-5 border-t border-zinc-800 pt-4\">");
+    body.push_str(&render_artifact_upload_form(Some(channel)));
+    body.push_str("<h3 class=\"mb-2 text-sm text-zinc-300\">Recent artifacts</h3>");
+    body.push_str(&render_artifact_table(
+        &artifacts_data(state, 25),
+        Some(channel),
+    ));
+    body.push_str("</div>");
     body.push_str("</section></div>");
     let script = TALK_SCRIPT
         .replace(
@@ -2577,7 +3332,7 @@ fn render_page(title: &str, body: &str, refresh: u64) -> Html<String> {
          <a href=\"/goals\" class=\"hover:text-white\">goals</a><a href=\"/goaltree\" class=\"hover:text-white\">goal tree</a><a href=\"/paths\" class=\"hover:text-white\">paths</a>\
          <a href=\"/agents\" class=\"hover:text-white\">agents</a><a href=\"/facts\" class=\"hover:text-white\">facts</a>\
          <a href=\"/services\" class=\"hover:text-white\">services</a><a href=\"/memory\" class=\"hover:text-white\">memory</a>\
-         <a href=\"/briefings\" class=\"hover:text-white\">briefings</a><a href=\"/talk\" class=\"hover:text-white\">talk</a>\
+         <a href=\"/briefings\" class=\"hover:text-white\">briefings</a><a href=\"/artifacts\" class=\"hover:text-white\">artifacts</a><a href=\"/talk\" class=\"hover:text-white\">talk</a>\
          <a href=\"/logout\" class=\"hover:text-white\">logout</a>\
          <span class=\"ml-auto text-zinc-500 text-xs\">{}</span></nav>\
          <main class=\"p-4 max-w-7xl mx-auto\">{}</main></body></html>",
