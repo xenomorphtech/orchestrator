@@ -1116,13 +1116,24 @@ async fn talk_post(
     let sender = sender.trim();
     let sender = if sender.is_empty() { "user" } else { sender };
     let text = form.text.unwrap_or_default().trim().to_string();
+    let async_submit = headers
+        .get("x-dashboard-talk-async")
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
     if !text.is_empty() {
         ensure_talk_conversation(&state, &channel, None, None);
         append_talk_entry(&state, &channel, sender, &text, None);
         if sender == "user" {
             send_talk_worker_prompt(state.clone(), channel.clone(), Some(text));
         }
+        if async_submit {
+            let count = talk_entries(&state, &channel, 100_000).len();
+            return axum::Json(json!({"ok": true, "count": count})).into_response();
+        }
         return Redirect::to(&format!("/talk?c={channel}")).into_response();
+    }
+    if async_submit {
+        return axum::Json(json!({"ok": false, "empty": true})).into_response();
     }
     render_talk_page(&state, &channel)
 }
@@ -2288,8 +2299,50 @@ const TALK_SCRIPT: &str = r#"<script>
               }
             });
             if (ta.form) {
-              ta.form.addEventListener('submit', function () {
-                sessionStorage.removeItem(KEY);
+              const form = ta.form;
+              form.addEventListener('submit', async function (e) {
+                if (!window.fetch || !window.FormData) {
+                  sessionStorage.removeItem(KEY);
+                  return;
+                }
+                e.preventDefault();
+                if (!ta.value.trim()) {
+                  ta.value = '';
+                  sessionStorage.removeItem(KEY);
+                  return;
+                }
+                const button = form.querySelector('button[type="submit"]');
+                if (button) button.disabled = true;
+                const wasNearBottom = nearBottom();
+                try {
+                  const res = await fetch(form.action, {
+                    method: 'POST',
+                    body: new FormData(form),
+                    headers: {
+                      'Accept': 'application/json',
+                      'X-Dashboard-Talk-Async': '1',
+                    },
+                    credentials: 'same-origin',
+                  });
+                  if (res.redirected) {
+                    const next = new URL(res.url, window.location.href);
+                    if (next.pathname === '/login') {
+                      window.location.assign(next.href);
+                      return;
+                    }
+                  }
+                  if (!res.ok) throw new Error('talk post failed');
+                  await res.json();
+                  ta.value = '';
+                  sessionStorage.removeItem(KEY);
+                  await poll();
+                  if (wasNearBottom) window.scrollTo(0, document.documentElement.scrollHeight);
+                  ta.focus();
+                } catch (err) {
+                  sessionStorage.setItem(KEY, ta.value);
+                } finally {
+                  if (button) button.disabled = false;
+                }
               });
             }
           }
@@ -3196,8 +3249,11 @@ fn render_talk_page(state: &AppState, channel: &str) -> Response {
             html_escape(&context_md)
         ));
     }
-    let entries = talk_entries(state, channel, 200);
+    let mut entries = talk_entries(state, channel, 100_000);
     let initial_count = entries.len();
+    if entries.len() > 200 {
+        entries = entries.split_off(entries.len() - 200);
+    }
     let empty_cls = if entries.is_empty() { "" } else { " hidden" };
     body.push_str(&format!(
         "<div id=\"talk-empty\" class=\"text-zinc-500 mb-4{empty_cls}\">(no messages yet)</div>"
